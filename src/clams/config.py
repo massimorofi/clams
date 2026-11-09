@@ -67,6 +67,10 @@ class ExecutorSettings(BaseSettings):
     request_timeout: float = 120.0
     executor_id: str = "executor-1"
     lease_seconds: int = 900
+    # How often the executor refreshes its heartbeat file. Must stay comfortably
+    # below watchdog.heartbeat_max_age or the watchdog flags a live executor.
+    heartbeat_interval: float = 20.0
+    poll_interval: float = 1.0
 
 
 class LlmSettings(BaseSettings):

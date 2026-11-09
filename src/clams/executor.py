@@ -280,11 +280,49 @@ class ExecutorService:
 
     # -- loop -----------------------------------------------------------
     async def run_once(self) -> Optional[ExecutionResult]:
+        # Refresh the heartbeat on every poll so an idle-but-healthy executor is
+        # still distinguishable from a dead one.
+        self.write_heartbeat("poll")
         brief = await read_task(self.bus, "executors", self.executor_id,
                                count=1, block_ms=1000)
         if brief is None:
             return None
         return await self.process_brief(brief)
+
+    async def run_forever(self) -> None:
+        """Poll for tasks indefinitely, keeping the heartbeat fresh.
+
+        A background task refreshes the heartbeat on ``heartbeat_interval`` so
+        the watchdog sees a live executor even while a long-running task is in
+        flight (a task may legitimately run for ``max_wall_seconds``).
+        """
+        import asyncio
+
+        stop = asyncio.Event()
+
+        async def beat() -> None:
+            while not stop.is_set():
+                try:
+                    self.write_heartbeat("loop")
+                except Exception:  # noqa: BLE001 - heartbeat must never kill the loop
+                    pass
+                try:
+                    await asyncio.wait_for(stop.wait(),
+                                         timeout=self.settings.executor.heartbeat_interval)
+                except asyncio.TimeoutError:
+                    pass
+
+        hb_task = asyncio.create_task(beat())
+        try:
+            while True:
+                try:
+                    await self.run_once()
+                except Exception as exc:  # noqa: BLE001 - keep the loop alive
+                    print(f"executor cycle error: {exc}")
+                await asyncio.sleep(self.settings.executor.poll_interval)
+        finally:
+            stop.set()
+            await hb_task
 
     def write_heartbeat(self, detail: str = "") -> Path:
         from datetime import datetime, timezone

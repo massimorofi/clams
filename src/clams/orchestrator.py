@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -28,6 +29,8 @@ from .db import Store, WorkItem
 from .outbox import OutboxWorker
 
 DISPATCH_PREFIX = "dispatch-task-"
+
+_log = logging.getLogger("clams.orchestrator")
 
 
 def _now_iso() -> str:
@@ -107,6 +110,8 @@ class Orchestrator:
                 await step(report)
             except Exception as exc:  # noqa: BLE001
                 report.errors.append(f"{step.__name__}: {exc}")
+                _log.warning("%s failed: %s", step.__name__, exc)
+        _log.info("cycle done: %s", report.summary())
         return report
 
     # -- steps ---------------------------------------------------------

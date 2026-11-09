@@ -26,6 +26,7 @@ dev = [
 [project.scripts]
 clams = "clams.cli:main"
 wdctl = "clams.watchdog:main"
+clamsctl = "clams.ctl:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

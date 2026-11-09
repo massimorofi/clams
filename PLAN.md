@@ -56,7 +56,7 @@ clams/
 ├── PLAN.md                   # this file
 ├── .env.example
 ├── docker-compose.yml        # planner, executor, watchdog, redis, gateway
-├── config/nginx.conf         # :8100 → planner:8000, SSE-safe
+├── config/nginx.conf         # :8100 → planner:8080, SSE-safe
 ├── docker/{planner,executor,watchdog}/Dockerfile
 ├── src/clams/
 │   ├── config.py             # Settings, limits (HW-4), engine caps (HW-1/2)

@@ -17,3 +17,7 @@ work/
 *.db-wal
 *.db-shm
 .DS_Store
+
+# scratch / one-off artifacts
+issue5_body.md
+FINAL_UPDATE_5.md

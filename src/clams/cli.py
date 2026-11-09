@@ -4,11 +4,28 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import sys
 from typing import Any, Optional
 
 from .config import Settings
 from .db import open_store
+
+
+def _setup_logging(level: str = "INFO") -> None:
+    """Send logs to stderr.
+
+    stdout is block-buffered when redirected, so ``print`` output is lost if the
+    process is killed before the buffer flushes. stderr is line-buffered, so logs
+    survive a SIGTERM and are visible under ``docker logs`` / ``>> file``.
+    """
+    logging.basicConfig(
+        level=getattr(logging, level.upper(), logging.INFO),
+        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
+        stream=sys.stderr,
+        force=True,
+    )
 
 
 def _settings() -> Settings:
@@ -137,13 +154,17 @@ def cmd_watch(args) -> int:
     store = open_store(s.paths.db_path)
     from .bus import RedisBus
 
+    log = logging.getLogger("clams.watch")
     bus = RedisBus(s.redis.url, s.redis.namespace)
     orch = _orchestrator(s, store, bus)
-    print("clams orchestrator running (Ctrl-C to stop)")
+    print("clams orchestrator running (Ctrl-C to stop)", flush=True)
+    log.info("orchestrator started: poll_interval=%.1fs db=%s",
+            s.poll_interval, s.paths.db_path)
     try:
         asyncio.run(orch.run_forever())
     except KeyboardInterrupt:
-        print("stopped")
+        print("stopped", flush=True)
+        log.info("orchestrator stopped by user")
     return 0
 
 
@@ -182,6 +203,9 @@ def cmd_doctor(args) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="clams", description="Clams orchestrator CLI")
+    p.add_argument("--log-level", default="INFO",
+                   choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+                   help="log verbosity (default: INFO)")
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("init-db", help="create/migrate the local SQLite database")
     sub.add_parser("intake", help="sweep GitHub for Ready requirements")
@@ -213,6 +237,7 @@ HANDLERS = {
 def main(argv: Optional[list[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    _setup_logging(getattr(args, "log_level", "INFO"))
     handler = HANDLERS[args.cmd]
     return handler(args)
 

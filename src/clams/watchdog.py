@@ -525,7 +525,17 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.cmd in ("run", "check"):
         settings = Settings.load()
         store = open_store_for(settings)
-        svc = WatchdogService(store, settings)
+        # The queue and GitHub checks need real dependencies. Without them
+        # check_queue() and check_github() take their "not configured" branch and
+        # report OK, so a Redis backlog or a GitHub outage becomes invisible to
+        # the one component whose job is to catch both.
+        from .bus import RedisBus
+        from .gh import GitHubClient
+
+        bus = RedisBus(settings.redis.url, settings.redis.namespace)
+        gh = GitHubClient(settings.github.owner, settings.github.repo,
+                         settings.github.token, settings.github.api_base)
+        svc = WatchdogService(store, settings, bus=bus, gh=gh)
         if args.cmd == "check":
             report = __import__("asyncio").run(svc.run_checks())
             print(report.to_text())

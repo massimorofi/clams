@@ -317,3 +317,45 @@ def test_verify_commands_prefers_explicit_callable():
 def test_verify_commands_parses_run_prefix():
     runner = ClaudioTaskRunner(None)
     assert runner.verify_commands(brief(criterion="run: pytest -q tests")) == ["pytest -q tests"]
+
+
+# -- heartbeat (issue #2) ---------------------------------------------------
+
+def test_write_heartbeat_creates_valid_file(settings):
+    from clams.contracts import Heartbeat
+
+    svc = ExecutorService(Store(settings.paths.db_path), InMemoryBus(), settings,
+                         task_runner=lambda b, w: None)
+    path = svc.write_heartbeat("hello")
+    assert path.exists()
+    hb = Heartbeat.model_validate_json(path.read_text())
+    assert hb.service == "executor"
+    assert hb.detail == "hello"
+
+
+async def test_run_once_refreshes_heartbeat_even_when_idle(settings):
+    """The watchdog requires executor.json; an idle poll must still write it."""
+    svc = ExecutorService(Store(settings.paths.db_path), InMemoryBus(), settings,
+                         task_runner=lambda b, w: None)
+    hb = Path(settings.paths.heartbeat_dir) / "executor.json"
+    assert not hb.exists()
+    await svc.run_once()
+    assert hb.exists(), "run_once() must refresh the executor heartbeat"
+
+
+async def test_run_forever_keeps_beating(settings):
+    """A long-lived loop must rewrite the heartbeat, not write it once."""
+    import json
+
+    svc = ExecutorService(Store(settings.paths.db_path), InMemoryBus(), settings,
+                         task_runner=lambda b, w: None)
+    hb = Path(settings.paths.heartbeat_dir) / "executor.json"
+
+    task = asyncio.create_task(svc.run_forever())
+    await asyncio.sleep(0.2)
+    assert hb.exists()
+    first = json.loads(hb.read_text())["timestamp"]
+    await asyncio.sleep(1.2)
+    second = json.loads(hb.read_text())["timestamp"]
+    task.cancel()
+    assert first != second, "heartbeat timestamp must advance between beats"
