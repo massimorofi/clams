@@ -77,6 +77,19 @@ def resolve_llm_base_url(base_url: str, *, inside_container: bool | None = None,
     return target, True
 
 
+class ApiSettings(BaseSettings):
+    """HTTP + SSE backend serving the web frontend (issue #14)."""
+
+    model_config = SettingsConfigDict(env_prefix="CLAMS__API__", extra="ignore")
+
+    host: str = "0.0.0.0"
+    port: int = 8200
+    # Max seconds a CLI command triggered from the UI may run.
+    command_timeout: float = 300.0
+    # Seconds between telemetry:update SSE frames.
+    telemetry_interval: float = 2.0
+
+
 class ProjectSettings(BaseSettings):
     """GitHub Projects (V2) board sync (issue #5).
 
@@ -299,6 +312,7 @@ class Settings(BaseSettings):
     paths: PathsSettings = Field(default_factory=PathsSettings)
     watchdog: WatchdogSettings = Field(default_factory=WatchdogSettings)
     project: ProjectSettings = Field(default_factory=ProjectSettings)
+    api: ApiSettings = Field(default_factory=ApiSettings)
     poll_interval: float = 20.0
     intake_label: str = "status:Ready"
     inprogress_label: str = "status:In Progress"

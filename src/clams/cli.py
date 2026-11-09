@@ -250,6 +250,20 @@ async def svc_report(store, s, bus, gh):
     return await svc.run_checks()
 
 
+def cmd_serve(args) -> int:
+    """Run the Clams HTTP + SSE backend for the web frontend."""
+    s = _settings()
+    import uvicorn
+
+    from .api import create_app
+
+    host = args.host or s.api.host
+    port = args.port or s.api.port
+    print(f"clams api listening on http://{host}:{port}", flush=True)
+    uvicorn.run(create_app(s), host=host, port=port, log_level="info")
+    return 0
+
+
 def cmd_healthcheck(args) -> int:
     """Docker HEALTHCHECK probe for a Clams daemon.
 
@@ -298,6 +312,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("watch", help="run the orchestrator loop")
     sub.add_parser("status", help="show orchestrator status")
     sub.add_parser("doctor", help="run the health check matrix once")
+    sv = sub.add_parser("serve", help="run the HTTP + SSE backend for the web UI")
+    sv.add_argument("--host", default=None, help="bind address (default 0.0.0.0)")
+    sv.add_argument("--port", type=int, default=None, help="bind port (default 8200)")
     hc = sub.add_parser("healthcheck", help="liveness probe for a daemon (Docker HEALTHCHECK)")
     hc.add_argument("--service", required=True,
                     help="heartbeat name to probe (orchestrator|executor|watchdog)")
@@ -318,6 +335,7 @@ HANDLERS = {
     "status": cmd_status,
     "doctor": cmd_doctor,
     "healthcheck": cmd_healthcheck,
+    "serve": cmd_serve,
 }
 
 
