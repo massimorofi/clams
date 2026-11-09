@@ -34,11 +34,12 @@ COMPOSE_FILE = "docker-compose.yml"
 # Four Clams roles (planner web UI, agent, orchestrator loop, executor driver)
 # plus redis/watchdog/gateway -- see issue #10.
 SERVICES = ("redis", "watchdog", "planner", "agent", "orchestrator",
-            "executor", "gateway")
+            "executor", "frontend", "gateway")
 # HTTP probes for `health`: (service, url, expected status).
 HTTP_PROBES = (
     ("planner", "http://127.0.0.1:8100/healthz", 200),
     ("gateway", "http://127.0.0.1:8100/", 200),
+    ("frontend", "http://127.0.0.1:8200/healthz", 200),
 )
 
 

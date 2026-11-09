@@ -156,6 +156,27 @@ services:
       start_period: 60s
       retries: 3
 
+  # ------------------------------------------------ frontend (web UI) -----
+  # Serves the built React SPA and the Clams REST/SSE API on one origin.
+  frontend:
+    <<: *clams-base
+    build:
+      context: .
+      dockerfile: docker/frontend/Dockerfile
+    env_file: [.env.orchestrator]
+    ports: ["8200:8200"]
+    volumes:
+      - orchestrator-db:/app/data
+      - heartbeat-data:/app/data/heartbeats
+    depends_on:
+      redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8200/healthz"]
+      interval: 15s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+
   # ------------------------------------------------ watchdog (zero-LLM) -----
   watchdog:
     <<: *clams-base

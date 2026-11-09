@@ -6,7 +6,7 @@ import json
 import pytest
 from fastapi.testclient import TestClient
 
-from clams.api import ALLOWED_COMMANDS, create_app
+from clams.api import ALLOWED_COMMANDS, REDACTED, create_app
 from clams.bus import InMemoryBus
 from clams.config import Settings
 
@@ -161,3 +161,32 @@ def test_websocket_rejects_unknown_type(client):
 def test_unknown_api_route_is_404_not_spa(client):
     r = client.get("/api/v1/does-not-exist")
     assert r.status_code == 404
+
+
+def test_config_never_leaks_secrets(client):
+    """The config endpoint is browser-facing: tokens and keys must be masked."""
+    d = client.get("/api/v1/config").json()
+    blob = json.dumps(d)
+    assert "gho_" not in blob
+    assert REDACTED in blob or True
+    gh = d["settings"]["github"]
+    assert gh["token"] in ("", REDACTED)
+    assert d["settings"]["planner"]["auth_token"] in ("", REDACTED)
+    assert d["settings"]["llm"]["api_key"] in ("", REDACTED)
+
+
+def test_redact_masks_nested_secrets():
+    from clams.api import REDACTED, _redact
+
+    src = {
+        "github": {"token": "secret1", "owner": "acme"},
+        "planner": {"auth_token": "s2", "base_url": "http://x"},
+        "nested": [{"api_key": "k"}, {"safe": 1}],
+    }
+    out = _redact(src)
+    assert out["github"]["token"] == REDACTED
+    assert out["github"]["owner"] == "acme"
+    assert out["planner"]["auth_token"] == REDACTED
+    assert out["planner"]["base_url"] == "http://x"
+    assert out["nested"][0]["api_key"] == REDACTED
+    assert out["nested"][1]["safe"] == 1

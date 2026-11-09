@@ -478,10 +478,30 @@ async def _send_planner_message(settings: Settings, msg: PlannerMessage,
     }
 
 
+# Config keys whose values must never reach the browser.
+SECRET_KEYS = ("token", "auth_token", "api_key", "password", "secret")
+REDACTED = "***redacted***"
+
+
+def _redact(obj: Any) -> Any:
+    """Recursively mask secret-valued keys before sending config to the UI."""
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if any(s in str(k).lower() for s in SECRET_KEYS):
+                out[k] = REDACTED if v else ""
+            else:
+                out[k] = _redact(v)
+        return out
+    if isinstance(obj, list):
+        return [_redact(v) for v in obj]
+    return obj
+
+
 def _settings_dict(settings: Settings) -> dict:
-    """Serialise the live settings for the UI editor."""
+    """Serialise the live settings for the UI editor, with secrets masked."""
     try:
-        return settings.model_dump(mode="json")
+        return _redact(settings.model_dump(mode="json"))
     except Exception:
         return {}
 
@@ -549,11 +569,42 @@ def _editable_schema() -> list[dict]:
     ]
 
 
+def _find_dist(settings: Settings) -> Optional[Path]:
+    """Locate the built SPA.
+
+    An installed package lives in site-packages, so a path relative to
+    ``__file__`` alone is wrong in a container where the app tree is at /app.
+    Try the configured path first, then the locations that actually occur in
+    practice, and only fall back silently if none exist.
+    """
+    candidates: list[Path] = []
+    configured = getattr(settings.api, "static_dir", "") or ""
+    if configured:
+        candidates.append(Path(configured).expanduser())
+    here = Path(__file__).resolve()
+    candidates += [
+        Path("/app/frontend/dist"),
+        here.parents[2] / "frontend" / "dist",
+        Path.cwd() / "frontend" / "dist",
+    ]
+    for c in candidates:
+        if (c / "index.html").is_file():
+            return c
+    return None
+
+
 def _mount_static(app: FastAPI, settings: Settings) -> None:
     """Serve the built SPA if it exists, with an SPA fallback route."""
-    dist = Path(__file__).resolve().parents[2] / "frontend" / "dist"
-    if not dist.exists():
+    dist = _find_dist(settings)
+    if dist is None:
+        log.warning(
+            "frontend build not found; serving API only. Expected an index.html "
+            "under /app/frontend/dist, %s, or %s",
+            str(Path(__file__).resolve().parents[2] / "frontend" / "dist"),
+            str(Path.cwd() / "frontend" / "dist"),
+        )
         return
+    log.info("serving frontend from %s", dist)
     app.mount("/assets", StaticFiles(directory=str(dist / "assets")),
               name="assets")
 

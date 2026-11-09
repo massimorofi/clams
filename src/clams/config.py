@@ -84,6 +84,8 @@ class ApiSettings(BaseSettings):
 
     host: str = "0.0.0.0"
     port: int = 8200
+    # Absolute path to the built SPA. Empty = auto-detect (see _find_dist).
+    static_dir: str = ""
     # Max seconds a CLI command triggered from the UI may run.
     command_timeout: float = 300.0
     # Seconds between telemetry:update SSE frames.
