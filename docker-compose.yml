@@ -107,6 +107,15 @@ services:
     ports: ["8100:80"]
     volumes:
       - ./config/nginx.conf:/etc/nginx/nginx.conf:ro
+    # Probes the proxied path, not just the process: nginx can be up while its
+    # upstream config is broken (this bit us with "host not found in upstream").
+    # nginx:alpine ships busybox wget, not curl.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider -T 5 http://127.0.0.1/healthz || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     depends_on:
       - planner
       - executor

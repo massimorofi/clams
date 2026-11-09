@@ -11,6 +11,18 @@ Implementation plan: [PLAN.md](./PLAN.md).
 
 ## Quick start
 
+**Prerequisite — GitHub token scopes.** Clams reads and writes the GitHub
+Project board, which needs the **`project`** scope. Set it up with:
+
+```bash
+gh auth refresh -s project
+gh auth status    # scope list must include 'project'
+```
+
+Full walkthrough, including the browser method, how to propagate the token
+into Clams' own `.env` files, and troubleshooting every failure mode:
+**[docs/github-project-permissions.md](./docs/github-project-permissions.md)**.
+
 ```bash
 python3 -m venv .venv && . .venv/bin/activate
 pip install -e ".[dev]"

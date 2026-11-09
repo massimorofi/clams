@@ -61,10 +61,15 @@ def fresh_heartbeat(dirpath, name="planner"):
 
 
 def make_svc(store, settings, **kw):
+    from clams.bus import InMemoryBus
+
     defaults = dict(
         llm_probe=lambda url, timeout: True,
         strixper_probe=lambda url, path: (True, "ok"),
         github_probe=lambda gh: True,
+        # A real bus so check_queue actually runs. Without it the check is
+        # skipped, and a skipped check no longer counts as a healthy sweep.
+        bus=InMemoryBus(),
     )
     defaults.update(kw)
     return WatchdogService(store, settings, **defaults)
@@ -288,6 +293,7 @@ async def test_remediation_recovers_and_resumes(store, settings):
                          llm_probe=lambda u, t: True,
                          strixper_probe=strixper,
                          github_probe=lambda g: True,
+                         bus=InMemoryBus(),
                          engine_restart=engine_restart)
     # The first sweep detects the failure, restarts the engine, and returns the
     # verified (recovered) report.
@@ -346,3 +352,55 @@ def test_wdctl_check_command(tmp_path, monkeypatch):
     # heartbeats missing -> unhealthy -> exit 1
     rc = main(["check"])
     assert rc == 1
+
+
+# ---- skipped checks must never look healthy (issue #11) -------------------
+
+async def test_skipped_check_makes_sweep_unhealthy(store, settings):
+    """A check that could not run is not a passing check."""
+    d = settings.paths.heartbeat_dir
+    for name in ("planner", "executor"):
+        fresh_heartbeat(d, name)
+
+    # No bus passed -> check_queue is skipped.
+    svc = WatchdogService(store, settings,
+                         llm_probe=lambda u, t: True,
+                         strixper_probe=lambda u, p: (True, "ok"),
+                         github_probe=lambda g: True)
+    report = await svc.run_checks()
+    assert report.skipped_names, "expected at least one skipped check"
+    assert report.healthy is False, (
+        "a sweep with skipped checks must not report healthy")
+
+
+async def test_skipped_check_is_printed_as_skip_not_ok(store, settings):
+    d = settings.paths.heartbeat_dir
+    for name in ("planner", "executor"):
+        fresh_heartbeat(d, name)
+
+    svc = WatchdogService(store, settings,
+                         llm_probe=lambda u, t: True,
+                         strixper_probe=lambda u, p: (True, "ok"),
+                         github_probe=lambda g: True)
+    report = await svc.run_checks()
+    text = report.to_text()
+    assert "[SKIP]" in text, "skipped checks must render as [SKIP], not [OK]"
+    assert "skipped:" in text
+
+
+async def test_fully_wired_sweep_has_no_skips(store, settings):
+    """With every dependency injected, nothing should be skipped."""
+    from clams.bus import InMemoryBus
+
+    d = settings.paths.heartbeat_dir
+    for name in ("planner", "executor"):
+        fresh_heartbeat(d, name)
+
+    svc = WatchdogService(store, settings,
+                         llm_probe=lambda u, t: True,
+                         strixper_probe=lambda u, p: (True, "ok"),
+                         github_probe=lambda g: True,
+                         bus=InMemoryBus())
+    report = await svc.run_checks()
+    assert report.skipped_names == []
+    assert report.healthy is True

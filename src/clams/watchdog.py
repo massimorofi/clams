@@ -49,6 +49,10 @@ class CheckResult:
     ok: bool
     severity: str = "info"
     detail: str = ""
+    # A check that could not run is NOT a passing check. Without this flag the
+    # "not configured" paths returned ok=True, so a missing dependency looked
+    # identical to a healthy system.
+    skipped: bool = False
 
     @property
     def critical(self) -> bool:
@@ -210,15 +214,29 @@ class SweepReport:
 
     @property
     def healthy(self) -> bool:
-        return not self.criticals
+        """A sweep is healthy only if nothing failed AND nothing was skipped.
+
+        A skipped check means a whole class of failure went undetected, so it
+        must not be reported as a healthy system.
+        """
+        return not self.criticals and not self.skipped_names
+
+    @property
+    def skipped_names(self) -> list[str]:
+        return [r.name for r in self.results if r.skipped]
 
     def to_text(self) -> str:
         lines = [f"Watchdog sweep @ {self.timestamp}"]
         for r in self.results:
-            mark = "OK  " if r.ok else "FAIL"
+            if r.skipped:
+                mark = "SKIP"
+            else:
+                mark = "OK  " if r.ok else "FAIL"
             lines.append(f"  [{mark}] {r.name}: {r.detail}")
         if self.criticals:
             lines.append(f"  critical: {', '.join(self.criticals)}")
+        if self.skipped_names:
+            lines.append(f"  skipped: {', '.join(self.skipped_names)}")
         if self.escalated:
             lines.append("  ESCALATED TO HUMAN")
         return "\n".join(lines)
@@ -316,7 +334,8 @@ class WatchdogService:
 
     async def check_queue(self) -> CheckResult:
         if self.bus is None:
-            return CheckResult(CHECK_QUEUE, True, "info", "no bus configured, skipped")
+            return CheckResult(CHECK_QUEUE, False, "warning",
+                              "no bus configured", skipped=True)
         ok, detail = await probe_queue(self.bus, self.settings.watchdog.queue_max_pending_age)
         if ok:
             return CheckResult(CHECK_QUEUE, True, "info", detail)
@@ -324,7 +343,8 @@ class WatchdogService:
 
     async def check_github(self) -> CheckResult:
         if self.gh is None and self._github_probe is probe_github:
-            return CheckResult(CHECK_GITHUB, True, "info", "no github client, skipped")
+            return CheckResult(CHECK_GITHUB, False, "warning",
+                              "no github client configured", skipped=True)
         ok = await _resolve(self._github_probe(self.gh))
         if ok:
             self._github_failures = 0
