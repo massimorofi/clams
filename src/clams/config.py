@@ -77,6 +77,44 @@ def resolve_llm_base_url(base_url: str, *, inside_container: bool | None = None,
     return target, True
 
 
+class ProjectSettings(BaseSettings):
+    """GitHub Projects (V2) board sync (issue #5).
+
+    ``enabled`` defaults to False because the sync needs ``read:project`` and
+    ``update:project`` token scopes that a plain ``repo`` token does not have.
+    When enabled, the board is resolved at startup and a misconfigured board
+    stops the run instead of failing per-item.
+    """
+
+    model_config = SettingsConfigDict(env_prefix="CLAMS__PROJECT__", extra="ignore")
+
+    enabled: bool = False
+    owner: str = ""
+    number: int = 0
+    status_field: str = "Status"
+    # Comma-separated "status:Label=Column" overrides merged over the defaults.
+    status_map: str = ""
+
+    @property
+    def effective_owner(self) -> str:
+        return self.owner or ""
+
+    def parsed_status_map(self, base: dict[str, str]) -> dict[str, str]:
+        out = dict(base)
+        for chunk in self.status_map.split(","):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            if "=" not in chunk:
+                raise ValueError(
+                    f"CLAMS__PROJECT__STATUS_MAP entry {chunk!r} must be "
+                    f"'status:Label=Column'"
+                )
+            key, value = chunk.split("=", 1)
+            out[key.strip()] = value.strip()
+        return out
+
+
 class GitHubSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="CLAMS__GITHUB__", extra="ignore")
 
@@ -260,6 +298,7 @@ class Settings(BaseSettings):
     limits: Limits = Field(default_factory=Limits)
     paths: PathsSettings = Field(default_factory=PathsSettings)
     watchdog: WatchdogSettings = Field(default_factory=WatchdogSettings)
+    project: ProjectSettings = Field(default_factory=ProjectSettings)
     poll_interval: float = 20.0
     intake_label: str = "status:Ready"
     inprogress_label: str = "status:In Progress"

@@ -93,12 +93,18 @@ def _orchestrator(s: Settings, store, bus):
     from .gh import GitHubClient
     from .intake import IntakeService
     from .planner import PlannerService
+    from .projects import board_from_settings
     from .review import ReviewService
     from .steering import SteeringService
     from .claudio_client import ClaudioClient
     from .orchestrator import Orchestrator
 
-    gh = GitHubClient(s.github.owner, s.github.repo, s.github.token, s.github.api_base)
+    # Resolve the Projects V2 board before anything else: a board that Clams
+    # cannot drive must stop startup, not fail per-item mid-run.
+    board = asyncio.run(board_from_settings(s))
+
+    gh = GitHubClient(s.github.owner, s.github.repo, s.github.token,
+                     s.github.api_base, board=board)
     claudio = ClaudioClient(s.planner.base_url, s.planner.auth_token,
                            s.planner.request_timeout)
 
@@ -225,15 +231,23 @@ def cmd_doctor(args) -> int:
     store = open_store(s.paths.db_path)
     from .bus import RedisBus
     from .gh import GitHubClient
+    from .projects import board_from_settings
     from .watchdog import WatchdogService
 
     bus = RedisBus(s.redis.url, s.redis.namespace)
-    gh = GitHubClient(s.github.owner, s.github.repo, s.github.token, s.github.api_base)
-    svc = WatchdogService(store, s, bus=bus, gh=gh)
-    report = asyncio.run(svc.run_checks())
+    board = asyncio.run(board_from_settings(s))
+    gh = GitHubClient(s.github.owner, s.github.repo, s.github.token,
+                     s.github.api_base, board=board)
+    report = asyncio.run(svc_report(store, s, bus, gh))
     print(report.to_text())
     store.db.close()
     return 0 if report.healthy else 1
+
+
+async def svc_report(store, s, bus, gh):
+    from .watchdog import WatchdogService
+    svc = WatchdogService(store, s, bus=bus, gh=gh)
+    return await svc.run_checks()
 
 
 def cmd_healthcheck(args) -> int:

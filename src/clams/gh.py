@@ -97,12 +97,16 @@ class GitHubClient:
         token: str,
         api_base: str = "https://api.github.com",
         transport: Optional[httpx.AsyncBaseTransport] = None,
+        board=None,
     ):
         self.owner = owner
         self.repo = repo
         self.token = token
         self.api_base = api_base.rstrip("/")
         self._transport = transport
+        # Optional Projects V2 board. When set, every status label change also
+        # moves the card, so the label and the column cannot diverge.
+        self.board = board
 
     # -- transport -------------------------------------------------------
     def _client(self) -> httpx.AsyncClient:
@@ -246,11 +250,20 @@ class GitHubClient:
 
     async def set_status(self, number: int, status_label: str,
                         keep: Optional[list[str]] = None) -> list[str]:
-        """Replace the status:* label with ``status_label`` keeping non-status labels."""
+        """Replace the status:* label with ``status_label`` keeping non-status labels.
+
+        When a Projects V2 board is attached the card is moved in the same call,
+        so the label and the board column are written from one transition and
+        cannot drift apart.
+        """
         issue = await self.get_issue(number)
         non_status = [l for l in issue.labels if not l.startswith("status:")]
         wanted = list(dict.fromkeys((keep or []) + non_status + [status_label]))
-        return await self.replace_labels(number, wanted)
+        result = await self.replace_labels(number, wanted)
+        if self.board is not None:
+            content_id = await self.issue_node_id(number)
+            await self.board.move(content_id, status_label)
+        return result
 
     async def ensure_labels(self, labels: Optional[list[tuple[str, str, str]]] = None) -> None:
         """Create any missing labels from the canonical set."""
