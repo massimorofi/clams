@@ -1,3 +1,17 @@
+# Clams deployment (spec issue #5, topology fixed in issue #10).
+#
+# Four distinct Clams/Claudio roles, previously collapsed into three services:
+#
+#   planner      claudio/web:latest    stock Web UI + chat            :8080
+#   agent        claudio/agent:latest  stock headless agent (executor side) :8100
+#   orchestrator built (docker/orchestrator)  `clams watch` loop
+#   executor     built (docker/executor)       `clams execute` driver
+#
+# plus the infrastructure services redis, watchdog and gateway.
+#
+# The previous file pointed planner/executor at stock Claudio images, so no
+# container ever ran the Clams loop -- the root cause of the heartbeat
+# failures reported in #2 and #10.
 name: claudio-orchestrator
 
 x-claudio-base: &claudio-base
@@ -10,8 +24,36 @@ x-claudio-base: &claudio-base
       max-size: "20m"
       max-file: "5"
 
+x-clams-base: &clams-base
+  init: true
+  restart: unless-stopped
+  stop_grace_period: 30s
+  logging:
+    driver: json-file
+    options:
+      max-size: "20m"
+      max-file: "5"
+  extra_hosts: ["host.docker.internal:host-gateway"]
+  security_opt: ["no-new-privileges:true"]
+
 services:
+  # ------------------------------------------------ redis event bus --------
+  redis:
+    image: redis:7-alpine
+    command: >
+      redis-server --appendonly yes --appendfsync everysec
+                 --maxmemory 256mb --maxmemory-policy noeviction
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
   # ------------------------------------------------ planner (Web UI + chat) --
+  # Stock Claudio web instance: the user-facing planner UI. NOT the Clams
+  # control loop (that is the `orchestrator` service below).
   planner:
     <<: *claudio-base
     image: claudio/web:latest
@@ -31,7 +73,6 @@ services:
     security_opt: ["no-new-privileges:true"]
     extra_hosts: ["host.docker.internal:host-gateway"]
     depends_on:
-      watchdog: { condition: service_healthy }
       redis: { condition: service_healthy }
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
@@ -40,36 +81,84 @@ services:
       start_period: 120s
       retries: 5
 
-  # ------------------------------------------------ executor (headless) -----
-  executor:
+  # ------------------------------------------------ agent (executor side) ---
+  # Stock Claudio headless agent. The `executor` service below drives this over
+  # HTTP. The `claudio-agent` network alias is required: the planner's bundled
+  # nginx.conf proxies to upstream claudio-agent:8100.
+  agent:
     <<: *claudio-base
     image: claudio/agent:latest
-    env_file: [.env.executor]
-    # The Claudio agent entrypoint seeds config/config.yaml on first run, so this
-    # path must be writable even though the rootfs is read-only.
-    # The alias `claudio-agent` is required: the planner's bundled nginx.conf
-    # proxies to upstream claudio-agent:8100.
+    env_file: [.env.agent]
     volumes:
-      - executor-data:/app/data
-      - claudio-work:/work
-      - executor-config:/srv/claudio/claudio-backend/config
-      - executor-srv-data:/srv/claudio/claudio-backend/data
+      - agent-data:/srv/claudio/claudio-backend/data
+      - agent-config:/srv/claudio/claudio-backend/config
+      - claudio-work:/workspace
       - heartbeat-data:/app/data/heartbeats
     networks:
       default:
         aliases:
           - claudio-agent
-    read_only: true
-    tmpfs: [/tmp]
-    cap_drop: [ALL]
-    security_opt: ["no-new-privileges:true"]
-    extra_hosts: ["host.docker.internal:host-gateway"]
     depends_on:
       redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8100/healthz"]
+      interval: 15s
+      timeout: 5s
+      start_period: 60s
+      retries: 5
+
+  # ------------------------------------------------ orchestrator loop -------
+  # `clams watch`: polls GitHub, plans, dispatches, reviews. This is the Clams
+  # control loop, previously mislabelled "planner".
+  orchestrator:
+    <<: *clams-base
+    build:
+      context: .
+      dockerfile: docker/orchestrator/Dockerfile
+    env_file: [.env.orchestrator]
+    volumes:
+      - orchestrator-db:/app/data
+      - heartbeat-data:/app/data/heartbeats
+      # git worktree add writes into the source repo's .git, so this must be
+      # writable -- a :ro mount here fails at dispatch time, not at startup.
+      - ${CLAMS_TARGET_REPO:-../claudio}:/repo
+    depends_on:
+      redis: { condition: service_healthy }
+      planner: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "clams", "healthcheck", "--service", "orchestrator"]
+      interval: 20s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
+
+  # ------------------------------------------------ executor driver --------
+  # `clams execute`: claims task briefs off the bus and drives the `agent`
+  # service over HTTP. Distinct process from the agent itself.
+  executor:
+    <<: *clams-base
+    build:
+      context: .
+      dockerfile: docker/executor/Dockerfile
+    env_file: [.env.executor]
+    volumes:
+      - orchestrator-db:/app/data
+      - heartbeat-data:/app/data/heartbeats
+      - ${CLAMS_TARGET_REPO:-../claudio}:/repo
+      - claudio-work:/work
+    depends_on:
+      redis: { condition: service_healthy }
+      agent: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "clams", "healthcheck", "--service", "executor"]
+      interval: 20s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
 
   # ------------------------------------------------ watchdog (zero-LLM) -----
   watchdog:
-    <<: *claudio-base
+    <<: *clams-base
     build:
       context: .
       dockerfile: docker/watchdog/Dockerfile
@@ -77,29 +166,8 @@ services:
     volumes:
       - orchestrator-db:/app/data
       - heartbeat-data:/app/data/heartbeats
-    extra_hosts: ["host.docker.internal:host-gateway"]
-    read_only: true
-    tmpfs: [/tmp]
-    cap_drop: [ALL]
-    healthcheck:
-      test: ["CMD", "wdctl", "selfcheck"]
-      interval: 15s
-      timeout: 3s
-      retries: 3
-
-  # ------------------------------------------------ redis event bus --------
-  redis:
-    image: redis:7-alpine
-    command: >
-      redis-server --appendonly yes --appendfsync everysec
-                 --maxmemory 256mb --maxmemory-policy noeviction
-    volumes:
-      - redis-data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 3
+    depends_on:
+      redis: { condition: service_healthy }
 
   # ------------------------------------------------ nginx gateway ---------
   gateway:
@@ -117,16 +185,14 @@ services:
       retries: 3
       start_period: 10s
     depends_on:
-      - planner
-      - executor
+      planner: { condition: service_healthy }
 
 volumes:
+  redis-data: {}
   planner-data: {}
   planner-nginx-log: {}
-  executor-data: {}
-  executor-config: {}
-  executor-srv-data: {}
-  heartbeat-data: {}
+  agent-data: {}
+  agent-config: {}
   orchestrator-db: {}
+  heartbeat-data: {}
   claudio-work: {}
-  redis-data: {}

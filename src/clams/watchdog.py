@@ -8,6 +8,7 @@ supervisor depends on a model it stops being able to supervise the model.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -18,7 +19,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from .bus import Bus, publish_alert
-from .config import Settings
+from .config import Settings, in_container
 from .contracts import AlertEvent, Heartbeat
 from .db import Store
 
@@ -263,7 +264,18 @@ class WatchdogService:
         self.settings = settings
         self.bus = bus
         self.gh = gh
-        self.llm_base_url = llm_base_url or "http://127.0.0.1:8731"
+        # Never hard-code a loopback default here: inside a container 127.0.0.1 is
+        # the container itself, so the probe could never reach a host-run engine
+        # and the LLM check stayed permanently red (issue #13). The effective URL
+        # is resolved from config, which already accounts for containerisation.
+        if llm_base_url:
+            self.llm_base_url = llm_base_url
+        else:
+            self.llm_base_url = settings.llm.resolved_base_url
+        logging.getLogger("clams.watchdog").info(
+            "llm probe target: %s (configured base_url=%s, container=%s)",
+            self.llm_base_url, settings.llm.base_url, in_container(),
+        )
         self.cache_paths = cache_paths or {}
         self._llm_probe = llm_probe or probe_llm_engine
         self._strixper_probe = strixper_probe or probe_strixper

@@ -12,4 +12,6 @@ RUN pip install --no-cache-dir .
 # The executor writes into /work (task worktrees) and /tmp only.
 RUN mkdir -p /work && chown 65534:65534 /work
 
-CMD ["clams", "execute"]
+# `clams worker`, not `clams execute`: the latter is a one-shot that exits 1 on
+# an empty queue, which under a restart policy looks exactly like a crash loop.
+CMD ["clams", "worker"]

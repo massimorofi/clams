@@ -31,7 +31,10 @@ from typing import Optional
 
 COMPOSE_FILE = "docker-compose.yml"
 # Services in dependency order, used for status/health reporting.
-SERVICES = ("redis", "watchdog", "executor", "planner", "gateway")
+# Four Clams roles (planner web UI, agent, orchestrator loop, executor driver)
+# plus redis/watchdog/gateway -- see issue #10.
+SERVICES = ("redis", "watchdog", "planner", "agent", "orchestrator",
+            "executor", "gateway")
 # HTTP probes for `health`: (service, url, expected status).
 HTTP_PROBES = (
     ("planner", "http://127.0.0.1:8100/healthz", 200),

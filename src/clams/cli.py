@@ -135,6 +135,41 @@ def cmd_execute(args) -> int:
     return 0 if result and result.status == "completed" else 1
 
 
+def cmd_worker(args) -> int:
+    """Run the executor as a long-lived daemon.
+
+    `clams execute` is a one-shot: it claims a single task and exits non-zero
+    when the queue is empty. Using it as a container CMD therefore puts the
+    container into a restart loop whenever there is simply no work -- the
+    restart looks like a crash but is just an empty queue. The daemon form
+    keeps polling and never exits on idleness.
+    """
+    s = _settings()
+    store = open_store(s.paths.db_path)
+    from .bus import RedisBus
+    from .executor import ExecutorService, ClaudioTaskRunner
+    from .claudio_client import ClaudioClient
+    from .gh import GitHubClient
+
+    log = logging.getLogger("clams.worker")
+    bus = RedisBus(s.redis.url, s.redis.namespace)
+    claudio = ClaudioClient(s.executor.base_url, s.executor.auth_token,
+                           s.executor.request_timeout)
+    gh = GitHubClient(s.github.owner, s.github.repo, s.github.token, s.github.api_base)
+    svc = ExecutorService(store, bus, s,
+                         task_runner=ClaudioTaskRunner(claudio), gh=gh,
+                         executor_id=s.executor.executor_id)
+    print(f"clams executor daemon running (id={s.executor.executor_id})", flush=True)
+    log.info("executor daemon started: agent=%s db=%s",
+            s.executor.base_url, s.paths.db_path)
+    try:
+        asyncio.run(svc.run_forever())
+    except KeyboardInterrupt:
+        print("stopped", flush=True)
+        log.info("executor daemon stopped by user")
+    return 0
+
+
 def cmd_review(args) -> int:
     s = _settings()
     store = open_store(s.paths.db_path)
@@ -201,6 +236,36 @@ def cmd_doctor(args) -> int:
     return 0 if report.healthy else 1
 
 
+def cmd_healthcheck(args) -> int:
+    """Docker HEALTHCHECK probe for a Clams daemon.
+
+    Each daemon refreshes a heartbeat file while it loops, so file freshness is a
+    cheap, dependency-free liveness signal: it needs no Redis, no GitHub and no
+    model, and it catches a wedged loop that a process-alive check would miss.
+    """
+    from datetime import datetime, timezone
+    from pathlib import Path
+
+    s = _settings()
+    path = Path(s.paths.heartbeat_dir) / f"{args.service}.json"
+    max_age = args.max_age if args.max_age is not None else 90.0
+    if not path.exists():
+        print(f"unhealthy: {path} missing")
+        return 1
+    try:
+        data = json.loads(path.read_text())
+        ts = datetime.fromisoformat(str(data["timestamp"]).replace("Z", "+00:00"))
+    except Exception as exc:  # noqa: BLE001
+        print(f"unhealthy: {path} unreadable: {exc}")
+        return 1
+    age = (datetime.now(timezone.utc) - ts).total_seconds()
+    if age > max_age:
+        print(f"unhealthy: heartbeat {age:.0f}s old (> {max_age:.0f}s)")
+        return 1
+    print(f"healthy: heartbeat {age:.0f}s old")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="clams", description="Clams orchestrator CLI")
     p.add_argument("--log-level", default="INFO",
@@ -213,11 +278,17 @@ def build_parser() -> argparse.ArgumentParser:
     pl.add_argument("requirement", type=int)
     sub.add_parser("dispatch", help="dispatch planned tasks")
     sub.add_parser("execute", help="run one task from the queue")
+    sub.add_parser("worker", help="run the executor as a long-lived daemon")
     rv = sub.add_parser("review", help="run the evidence gate on a requirement")
     rv.add_argument("requirement", type=int)
     sub.add_parser("watch", help="run the orchestrator loop")
     sub.add_parser("status", help="show orchestrator status")
     sub.add_parser("doctor", help="run the health check matrix once")
+    hc = sub.add_parser("healthcheck", help="liveness probe for a daemon (Docker HEALTHCHECK)")
+    hc.add_argument("--service", required=True,
+                    help="heartbeat name to probe (orchestrator|executor|watchdog)")
+    hc.add_argument("--max-age", type=float, default=None,
+                    help="max heartbeat age in seconds (default 90)")
     return p
 
 
@@ -227,10 +298,12 @@ HANDLERS = {
     "plan": cmd_plan,
     "dispatch": cmd_dispatch,
     "execute": cmd_execute,
+    "worker": cmd_worker,
     "review": cmd_review,
     "watch": cmd_watch,
     "status": cmd_status,
     "doctor": cmd_doctor,
+    "healthcheck": cmd_healthcheck,
 }
 
 

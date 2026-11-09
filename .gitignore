@@ -21,3 +21,9 @@ work/
 # scratch / one-off artifacts
 issue5_body.md
 FINAL_UPDATE_5.md
+todo/
+
+
+# role env files (contain secrets; create from .env.example)
+.env.agent
+.env.orchestrator

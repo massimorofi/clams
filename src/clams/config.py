@@ -6,12 +6,75 @@ specification; they are enforced in code, not merely documented.
 """
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Hostnames that always resolve to "this machine". Inside a container that means
+# the container itself, never the host -- so a loopback URL is a bug there.
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "0.0.0.0", "[::1]"})
+
+# Host alias Docker's built-in DNS resolves to the host's gateway IP when paired
+# with `extra_hosts: ["host.docker.internal:host-gateway"]`.
+CONTAINER_HOST_ALIAS = "host.docker.internal"
+
+
+def detect_in_container() -> bool:
+    """Best-effort "am I inside a container?" probe.
+
+    Checks the two markers that actually exist in practice: Docker's
+    ``/.dockerenv`` sentinel and a cgroup that names a container runtime.
+    Never raises -- an unreadable /proc just means "no evidence".
+    """
+    if os.path.exists("/.dockerenv"):
+        return True
+    if os.path.exists("/run/.containerenv"):  # podman
+        return True
+    try:
+        cgroup = Path("/proc/1/cgroup").read_text()
+    except OSError:
+        return False
+    return any(tok in cgroup for tok in ("docker", "containerd", "kubepods", "lxc"))
+
+
+@lru_cache(maxsize=1)
+def in_container() -> bool:
+    """Cached container detection (the answer cannot change mid-process)."""
+    return detect_in_container()
+
+
+def _is_loopback_url(url: str) -> bool:
+    try:
+        host = (urlsplit(url).hostname or "").strip("[]")
+    except ValueError:
+        return False
+    return host in LOOPBACK_HOSTS
+
+
+def resolve_llm_base_url(base_url: str, *, inside_container: bool | None = None,
+                        container_base_url: str | None = None
+                        ) -> tuple[str, bool]:
+    """Return ``(effective_url, rewrote)`` for an LLM endpoint.
+
+    A loopback base URL is correct when Clams runs natively and wrong inside a
+    container, where ``127.0.0.1`` is the container itself and the engine runs
+    on the host. When both conditions hold -- containerised *and* loopback --
+    the host part is swapped for ``host.docker.internal`` so the probe can
+    actually reach the engine.
+
+    An explicitly non-loopback URL is always used verbatim.
+    """
+    if inside_container is None:
+        inside_container = in_container()
+    if not inside_container or not _is_loopback_url(base_url):
+        return base_url, False
+    target = container_base_url or f"http://{CONTAINER_HOST_ALIAS}:8731"
+    return target, True
 
 
 class GitHubSettings(BaseSettings):
@@ -79,9 +142,30 @@ class LlmSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="CLAMS__LLM__", extra="ignore")
 
     base_url: str = "http://127.0.0.1:8731"
+    # Where the engine lives when Clams runs inside a container: the loopback
+    # default above points at the container itself there, so it is rewritten to
+    # this value (see resolve_llm_base_url).
+    container_base_url: str = f"http://{CONTAINER_HOST_ALIAS}:8731"
     api_key: str = ""
     model: str = ""
     timeout: float = 300.0
+
+    @field_validator("base_url", "container_base_url")
+    @classmethod
+    def _require_url(cls, v: str) -> str:
+        v = (v or "").strip()
+        parts = urlsplit(v)
+        if parts.scheme not in ("http", "https") or not parts.netloc:
+            raise ValueError(f"llm base_url must be an absolute http(s) URL, got {v!r}")
+        return v
+
+    @property
+    def resolved_base_url(self) -> str:
+        """The URL to actually dial from this process."""
+        url, _ = resolve_llm_base_url(
+            self.base_url, container_base_url=self.container_base_url
+        )
+        return url
 
 
 class StrixperSettings(BaseSettings):
