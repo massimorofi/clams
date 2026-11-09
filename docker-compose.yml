@@ -1,0 +1,123 @@
+name: claudio-orchestrator
+
+x-claudio-base: &claudio-base
+  init: true
+  restart: unless-stopped
+  stop_grace_period: 120s
+  logging:
+    driver: json-file
+    options:
+      max-size: "20m"
+      max-file: "5"
+
+services:
+  # ------------------------------------------------ planner (Web UI + chat) --
+  planner:
+    <<: *claudio-base
+    image: claudio/web:latest
+    env_file: [.env.planner]
+    # No host port published: the nginx gateway on :8100 routes to planner:8080.
+    # (Host :8000 is occupied by strixper on this machine.)
+    volumes:
+      - planner-data:/app/data
+      - ./repo-ro:/repo:ro
+      - planner-nginx-log:/var/log/nginx
+    read_only: true
+    tmpfs: [/tmp]
+    # nginx needs these: CHOWN for client-body temp files, SETUID/SETGID to drop
+    # to the `nginx` worker user (uid/gid 101). All three are removed by cap_drop.
+    cap_add: [CHOWN, SETGID, SETUID]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    depends_on:
+      watchdog: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+      interval: 15s
+      timeout: 5s
+      start_period: 120s
+      retries: 5
+
+  # ------------------------------------------------ executor (headless) -----
+  executor:
+    <<: *claudio-base
+    image: claudio/agent:latest
+    env_file: [.env.executor]
+    # The Claudio agent entrypoint seeds config/config.yaml on first run, so this
+    # path must be writable even though the rootfs is read-only.
+    # The alias `claudio-agent` is required: the planner's bundled nginx.conf
+    # proxies to upstream claudio-agent:8100.
+    volumes:
+      - executor-data:/app/data
+      - claudio-work:/work
+      - executor-config:/srv/claudio/claudio-backend/config
+      - executor-srv-data:/srv/claudio/claudio-backend/data
+      - heartbeat-data:/app/data/heartbeats
+    networks:
+      default:
+        aliases:
+          - claudio-agent
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    depends_on:
+      redis: { condition: service_healthy }
+
+  # ------------------------------------------------ watchdog (zero-LLM) -----
+  watchdog:
+    <<: *claudio-base
+    build:
+      context: .
+      dockerfile: docker/watchdog/Dockerfile
+    env_file: [.env.watchdog]
+    volumes:
+      - orchestrator-db:/app/data
+      - heartbeat-data:/app/data/heartbeats
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    healthcheck:
+      test: ["CMD", "wdctl", "selfcheck"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+
+  # ------------------------------------------------ redis event bus --------
+  redis:
+    image: redis:7-alpine
+    command: >
+      redis-server --appendonly yes --appendfsync everysec
+                 --maxmemory 256mb --maxmemory-policy noeviction
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  # ------------------------------------------------ nginx gateway ---------
+  gateway:
+    image: nginx:alpine
+    ports: ["8100:80"]
+    volumes:
+      - ./config/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - planner
+      - executor
+
+volumes:
+  planner-data: {}
+  planner-nginx-log: {}
+  executor-data: {}
+  executor-config: {}
+  executor-srv-data: {}
+  heartbeat-data: {}
+  orchestrator-db: {}
+  claudio-work: {}
+  redis-data: {}
