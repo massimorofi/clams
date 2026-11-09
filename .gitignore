@@ -27,3 +27,7 @@ todo/
 # role env files (contain secrets; create from .env.example)
 .env.agent
 .env.orchestrator
+
+# frontend build output & deps
+frontend/node_modules/
+frontend/dist/
