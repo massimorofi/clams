@@ -215,11 +215,17 @@ class AgentRegistry:
 
     # -- construction / persistence -------------------------------------
     @classmethod
-    def load(cls, path: str | Path) -> "AgentRegistry":
-        """Load from ``path``; seed and persist defaults when absent."""
+    def load(cls, path: str | Path,
+            defaults: Optional[list[AgentConfig]] = None) -> "AgentRegistry":
+        """Load from ``path``; seed and persist defaults when absent.
+
+        ``defaults`` lets the caller seed from its own configuration (the
+        API passes the ``CLAMS__AGENTS__*`` settings) instead of the
+        built-in constants. When omitted, :func:`default_agents` is used.
+        """
         p = Path(path)
         if not p.exists():
-            reg = cls(p, default_agents())
+            reg = cls(p, defaults if defaults is not None else default_agents())
             reg.save()
             return reg
         try:

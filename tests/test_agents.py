@@ -326,6 +326,34 @@ def test_api_probe_unknown_agent_404(client):
     assert client.post("/api/v1/agents/ghost/probe").status_code == 404
 
 
+def test_load_uses_supplied_defaults(tmp_path):
+    """A caller-supplied default list wins over the built-in constants."""
+    custom = [AgentConfig(id="planner", role="planner",
+                         base_url="http://10.0.0.1:9001/api/v1")]
+    p = tmp_path / "agents.json"
+    r = AgentRegistry.load(p, defaults=custom)
+    assert len(r) == 1
+    assert r.get("planner").base_url == "http://10.0.0.1:9001/api/v1"
+
+
+def test_app_seeds_registry_from_settings(tmp_path):
+    """CLAMS__AGENTS__* must actually drive the seeded addresses."""
+    settings = Settings.load()
+    settings.paths.agents_file = str(tmp_path / "agents.json")
+    settings.agents.host = "10.5.5.5"
+    settings.agents.planner_port = 1201
+    settings.agents.executor_port = 1202
+    settings.agents.auth_token = "seeded-token"
+    with TestClient(create_app(settings=settings)) as c:
+        agents = c.get("/api/v1/agents").json()["agents"]
+    assert agents[0]["base_url"] == "http://10.5.5.5:1201/api/v1"
+    assert agents[1]["base_url"] == "http://10.5.5.5:1202/api/v1"
+    assert agents[0]["has_auth_token"] is True
+    # And the seeded file on disk agrees.
+    on_disk = json.loads((tmp_path / "agents.json").read_text())
+    assert on_disk[0]["base_url"] == "http://10.5.5.5:1201/api/v1"
+
+
 def test_registry_persists_across_app_rebuild(tmp_path):
     settings = Settings.load()
     settings.paths.agents_file = str(tmp_path / "agents.json")

@@ -46,6 +46,7 @@ from .agents import (
     AgentConfig,
     AgentError,
     AgentRegistry,
+    default_agents,
     probe_agent,
 )
 
@@ -261,7 +262,18 @@ def create_app(settings: Optional[Settings] = None,
     runtime: dict[str, Any] = {}
 
     # Agent registry (issue #19): role -> address, persisted as JSON.
-    agents = AgentRegistry.load(settings.paths.agents_file)
+    # Seeded from the CLAMS__AGENTS__* settings so .env actually drives the
+    # initial addresses rather than the built-in constants.
+    agents = AgentRegistry.load(
+        settings.paths.agents_file,
+        defaults=default_agents(
+            host=settings.agents.host,
+            planner_port=settings.agents.planner_port,
+            executor_port=settings.agents.executor_port,
+            auth_token=settings.agents.auth_token,
+            request_timeout=settings.agents.request_timeout,
+        ),
+    )
 
     # ---- health -----------------------------------------------------
     @app.get("/healthz")
