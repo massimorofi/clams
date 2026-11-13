@@ -77,3 +77,26 @@ export interface ChatMessage {
   text: string
   ts: string
 }
+
+export interface ProjectRow {
+  id: number
+  name: string
+  url: string
+  status: string
+  progress: number
+  created_at?: string
+  updated_at?: string
+  updated?: string
+}
+
+export interface ProjectCreateResult {
+  ok: boolean
+  project: ProjectRow
+}
+
+export interface AlertAckResult {
+  ok: boolean
+  acknowledged?: number
+  id?: number
+  unacked_alerts: number
+}

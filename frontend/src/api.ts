@@ -6,6 +6,9 @@ import type {
   StatusPayload,
   AlertRow,
   WorkItemRow,
+  ProjectRow,
+  ProjectCreateResult,
+  AlertAckResult,
 } from './types'
 
 const BASE = '/api/v1'
@@ -59,6 +62,20 @@ export const api = {
       `/alerts?limit=${limit}${severity ? `&severity=${severity}` : ''}`,
     ),
   getTasks: () => req<{ tasks: WorkItemRow[] }>('/tasks'),
+  // --- issue #15 additions ---
+  listProjects: () => req<{ projects: ProjectRow[] }>('/projects'),
+  createProject: (name: string, url: string) =>
+    req<ProjectCreateResult>('/projects', {
+      method: 'POST',
+      body: JSON.stringify({ name, url }),
+    }),
+  ackAlert: (id: number) =>
+    req<AlertAckResult>(`/alerts/${id}/ack`, { method: 'POST' }),
+  ackAllAlerts: (severity?: string) =>
+    req<AlertAckResult>('/alerts/ack', {
+      method: 'POST',
+      body: JSON.stringify(severity ? { severity } : {}),
+    }),
 }
 
 /**

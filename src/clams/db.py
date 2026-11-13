@@ -62,6 +62,16 @@ CREATE TABLE IF NOT EXISTS outbox (
   sent_at             TEXT
 );
 
+CREATE TABLE IF NOT EXISTS projects (
+  id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+  name                TEXT NOT NULL,
+  url                 TEXT NOT NULL UNIQUE,
+  status              TEXT NOT NULL DEFAULT 'Queued',
+  progress            INTEGER NOT NULL DEFAULT 0,
+  created_at          TEXT NOT NULL,
+  updated_at          TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_work_items_status ON work_items(status);
 CREATE INDEX IF NOT EXISTS idx_work_items_gh_status ON work_items(gh_status);
 CREATE INDEX IF NOT EXISTS idx_task_claims_expiry ON task_claims(lease_expires_at);
@@ -443,8 +453,89 @@ class AlertRepo:
             "UPDATE alerts SET acknowledged = 1 WHERE id = ?", (alert_id,)
         )
 
+    def ack_all(self, severity: Optional[str] = None) -> int:
+        """Acknowledge all unacknowledged alerts, optionally filtered by severity.
+
+        Returns the number of rows updated.
+        """
+        if severity:
+            cur = self.db.conn.execute(
+                "UPDATE alerts SET acknowledged = 1 "
+                "WHERE acknowledged = 0 AND severity = ?",
+                (severity,),
+            )
+        else:
+            cur = self.db.conn.execute(
+                "UPDATE alerts SET acknowledged = 1 WHERE acknowledged = 0"
+            )
+        return int(cur.rowcount or 0)
+
     def count(self) -> int:
         return int(self.db.conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0])
+
+    def count_unacked(self) -> int:
+        return int(
+            self.db.conn.execute(
+                "SELECT COUNT(*) FROM alerts WHERE acknowledged = 0"
+            ).fetchone()[0]
+        )
+
+
+class ProjectRepo:
+    """Multi-project registry backing the Projects page (issue #15 / §6.1).
+
+    Each row is a GitHub repository the operator has registered with Clams.
+    ``progress`` is a 0-100 integer maintained by the system (or 0 until work
+    is computed for that project).
+    """
+
+    STATUSES = ("Queued", "Running", "In review", "Paused", "Done")
+
+    def __init__(self, db: Database):
+        self.db = db
+
+    def add(self, name: str, url: str, status: str = "Queued",
+            progress: int = 0) -> sqlite3.Row:
+        now = iso()
+        cur = self.db.conn.execute(
+            """INSERT INTO projects (name, url, status, progress, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (name, url, status, int(progress), now, now),
+        )
+        return self.get(int(cur.lastrowid))  # type: ignore[arg-type]
+
+    def get(self, project_id: int) -> Optional[sqlite3.Row]:
+        return self.db.conn.execute(
+            "SELECT * FROM projects WHERE id = ?", (project_id,)
+        ).fetchone()
+
+    def find_by_url(self, url: str) -> Optional[sqlite3.Row]:
+        return self.db.conn.execute(
+            "SELECT * FROM projects WHERE url = ?", (url,)
+        ).fetchone()
+
+    def url_exists(self, url: str) -> bool:
+        return self.find_by_url(url) is not None
+
+    def all(self) -> list[sqlite3.Row]:
+        return self.db.conn.execute(
+            "SELECT * FROM projects ORDER BY id DESC"
+        ).fetchall()
+
+    def set_status(self, project_id: int, status: str) -> None:
+        self.db.conn.execute(
+            "UPDATE projects SET status = ?, updated_at = ? WHERE id = ?",
+            (status, iso(), project_id),
+        )
+
+    def set_progress(self, project_id: int, progress: int) -> None:
+        self.db.conn.execute(
+            "UPDATE projects SET progress = ?, updated_at = ? WHERE id = ?",
+            (int(progress), iso(), project_id),
+        )
+
+    def count(self) -> int:
+        return int(self.db.conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0])
 
 
 class OutboxRepo:
@@ -527,12 +618,14 @@ class Store:
     task_claims: TaskClaimRepo = field(init=False)
     alerts: AlertRepo = field(init=False)
     outbox: OutboxRepo = field(init=False)
+    projects: ProjectRepo = field(init=False)
 
     def __post_init__(self) -> None:
         self.work_items = WorkItemRepo(self.db)
         self.task_claims = TaskClaimRepo(self.db)
         self.alerts = AlertRepo(self.db)
         self.outbox = OutboxRepo(self.db)
+        self.projects = ProjectRepo(self.db)
 
     def migrate(self) -> None:
         self.db.migrate()

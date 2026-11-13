@@ -39,7 +39,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .config import Settings
-from .db import Store, open_store
+from .db import Store, open_store, AlertRepo
 
 log = logging.getLogger("clams.api")
 
@@ -76,6 +76,53 @@ class PlannerMessage(BaseModel):
     requirement_number: Optional[int] = None
 
 
+class ProjectCreate(BaseModel):
+    """Payload for registering a new project (issue #15 / §6.1)."""
+
+    name: str
+    url: str
+
+
+class AlertAckAll(BaseModel):
+    """Bulk-acknowledge alerts, optionally filtered by severity (§6.3)."""
+
+    severity: Optional[str] = None
+
+
+def normalize_github_url(raw: str) -> tuple[Optional[str], Optional[str]]:
+    """Validate and normalize a GitHub repository URL.
+
+    Returns ``(normalized_url, error)``. On success ``error`` is ``None`` and
+    ``normalized_url`` is ``https://github.com/owner/repo`` (``.git`` suffix
+    stripped). On failure ``normalized_url`` is ``None`` and ``error`` is a
+    human-readable message safe to surface to the UI.
+    """
+    from urllib.parse import urlsplit
+
+    candidate = (raw or "").strip()
+    if not candidate:
+        return None, "Repository URL is required."
+    try:
+        parts = urlsplit(candidate)
+    except ValueError:
+        return None, "Enter a valid repository URL."
+    if parts.scheme not in ("http", "https"):
+        return None, "URL must use http or https."
+    host = (parts.hostname or "").lower()
+    if host not in ("github.com", "www.github.com"):
+        return None, "Only github.com repository URLs are supported."
+    segs = [s for s in parts.path.split("/") if s]
+    if len(segs) < 2:
+        return None, "URL should look like https://github.com/owner/repository"
+    owner = segs[0]
+    repo = segs[1]
+    if repo.endswith(".git"):
+        repo = repo[: -len(".git")]
+    if not owner or not repo:
+        return None, "URL should look like https://github.com/owner/repository"
+    return f"https://github.com/{owner}/{repo}", None
+
+
 # ---------------------------------------------------------------- helpers ----
 def _read_heartbeat(heartbeat_dir: str, name: str) -> Optional[dict]:
     p = Path(heartbeat_dir) / f"{name}.json"
@@ -99,11 +146,19 @@ def _heartbeat_age(hb: Optional[dict]) -> Optional[float]:
     return (datetime.now(timezone.utc) - ts).total_seconds()
 
 
-def compute_state(store: Store, settings: Settings) -> str:
-    """Derive the global badge state: Idle | Executing | Paused | Error."""
+def compute_state(store: Store, settings: Settings,
+                 global_paused: bool = False) -> str:
+    """Derive the global badge state: Idle | Executing | Paused | Error.
+
+    ``global_paused`` is the operator-controlled flag (topbar Pause / Emergency
+    stop). When set it overrides the derived Executing state so the badge shows
+    Paused even while claims are still live.
+    """
     alerts = store.alerts.list_unacked(severity="critical")
     if alerts:
         return "Error"
+    if global_paused:
+        return "Paused"
     paused = 0
     total = 0
     for item in store.work_items.all():
@@ -259,12 +314,34 @@ def create_app(settings: Optional[Settings] = None,
     # ---- planner ----------------------------------------------------
     @app.post("/api/v1/planner/action")
     async def planner_action(req: PlannerActionRequest):
-        valid = {"retry", "pause", "resume", "alter", "approve", "reject"}
+        valid = {"retry", "pause", "resume", "alter", "approve", "reject", "stop"}
         if req.action not in valid:
             raise HTTPException(
                 status_code=400,
                 detail=f"unknown action {req.action!r}; valid: {sorted(valid)}",
             )
+        # Apply the local store effect FIRST so the header controls take effect
+        # even if the bus is unavailable. The bus publish is best-effort after.
+        if req.requirement_number is not None:
+            if req.action == "pause":
+                store.work_items.set_paused(req.requirement_number, True)
+            elif req.action == "resume":
+                store.work_items.set_paused(req.requirement_number, False)
+        else:
+            # Global (no requirement scoped) control from the topbar.
+            if req.action in ("pause", "stop"):
+                runtime["global_paused"] = True
+                if req.action == "stop":
+                    runtime["stopped"] = True
+                    # Pause every work item so the stop survives a state recompute.
+                    for it in store.work_items.all():
+                        store.work_items.set_paused(it.requirement_number, True)
+            elif req.action == "resume":
+                runtime["global_paused"] = False
+                runtime["stopped"] = False
+                for it in store.work_items.all():
+                    store.work_items.set_paused(it.requirement_number, False)
+
         payload = {
             "action": req.action,
             "requirement_number": req.requirement_number,
@@ -272,19 +349,13 @@ def create_app(settings: Optional[Settings] = None,
             "detail": req.detail,
             "timestamp": _now_iso(),
         }
+        bus_error: Optional[str] = None
         try:
             await bus.publish("clams:planner-actions", payload)
-        except Exception as exc:
-            raise HTTPException(status_code=502,
-                               detail=f"bus publish failed: {exc}")
-        # Pause/resume also drive the store directly: the header controls must
-        # take effect even if nothing is consuming the stream yet.
-        if req.requirement_number is not None:
-            if req.action == "pause":
-                store.work_items.set_paused(req.requirement_number, True)
-            elif req.action == "resume":
-                store.work_items.set_paused(req.requirement_number, False)
-        return {"ok": True, **payload}
+        except Exception as exc:  # noqa: BLE001 - local effect already applied
+            bus_error = str(exc)
+            log.warning("planner action bus publish failed: %s", exc)
+        return {"ok": True, **payload, "bus_error": bus_error}
 
     @app.post("/api/v1/planner/message")
     async def planner_message(msg: PlannerMessage):
@@ -302,11 +373,14 @@ def create_app(settings: Optional[Settings] = None,
             }
         active = store.task_claims.active()
         return {
-            "state": compute_state(store, settings),
+            "state": compute_state(
+                store, settings,
+                global_paused=bool(runtime.get("global_paused")),
+            ),
             "repository": settings.github.full_name,
             "active_agents": len(active),
             "heartbeats": hb,
-            "unacked_alerts": store.alerts.count(),
+            "unacked_alerts": store.alerts.count_unacked(),
             "outbox": store.outbox.stats(),
             "timestamp": _now_iso(),
         }
@@ -325,6 +399,69 @@ def create_app(settings: Optional[Settings] = None,
         if severity:
             out = [r for r in out if r.get("severity") == severity]
         return {"alerts": out}
+
+    # ---- alert acknowledgement (issue #15 / §6.3) -------------------
+    @app.post("/api/v1/alerts/ack")
+    async def ack_all_alerts(body: AlertAckAll):
+        """Bulk-acknowledge alerts, optionally filtered by severity.
+
+        Declared BEFORE the /{alert_id} route so the literal ``ack`` path is not
+        swallowed by the integer path parameter.
+        """
+        if body.severity is not None and body.severity not in AlertRepo.SEVERITIES:
+            raise HTTPException(
+                status_code=422,
+                detail=f"invalid severity {body.severity!r}; "
+                       f"valid: {list(AlertRepo.SEVERITIES)}",
+            )
+        updated = store.alerts.ack_all(severity=body.severity)
+        return {"ok": True, "acknowledged": updated,
+                "unacked_alerts": store.alerts.count_unacked()}
+
+    @app.post("/api/v1/alerts/{alert_id}/ack")
+    async def ack_alert(alert_id: int):
+        row = store.db.conn.execute(
+            "SELECT * FROM alerts WHERE id = ?", (alert_id,)
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404,
+                               detail=f"alert {alert_id} not found")
+        store.alerts.ack(alert_id)
+        return {"ok": True, "id": alert_id,
+                "unacked_alerts": store.alerts.count_unacked()}
+
+    # ---- projects registry (issue #15 / §6.1) -----------------------
+    @app.get("/api/v1/projects")
+    async def list_projects():
+        rows = store.projects.all()
+        projects = []
+        for r in rows:
+            d = dict(r)
+            d["updated"] = _relative_time(d.get("updated_at"))
+            projects.append(d)
+        return {"projects": projects}
+
+    @app.post("/api/v1/projects")
+    async def create_project(body: ProjectCreate):
+        name = (body.name or "").strip()
+        if not name:
+            raise HTTPException(status_code=422, detail="Project name is required.")
+        if len(name) > 80:
+            raise HTTPException(
+                status_code=422, detail="Project name must be 80 characters or fewer."
+            )
+        normalized, err = normalize_github_url(body.url)
+        if err:
+            raise HTTPException(status_code=422, detail=err)
+        if store.projects.url_exists(normalized):  # type: ignore[arg-type]
+            raise HTTPException(
+                status_code=409,
+                detail="That repository is already registered.",
+            )
+        row = store.projects.add(name=name, url=normalized)  # type: ignore[arg-type]
+        d = dict(row)
+        d["updated"] = _relative_time(d.get("updated_at"))
+        return {"ok": True, "project": d}
 
     # ---- SSE --------------------------------------------------------
     @app.get("/api/v1/events")
@@ -417,6 +554,38 @@ def create_app(settings: Optional[Settings] = None,
 def _now_iso() -> str:
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _relative_time(value: Optional[str]) -> str:
+    """Render an ISO timestamp as a short human 'x ago' string.
+
+    Falls back to the raw value (or 'unknown') if it cannot be parsed, so a
+    missing/odd timestamp never breaks the UI.
+    """
+    if not value:
+        return "unknown"
+    try:
+        from datetime import datetime, timezone
+
+        ts = value[:-1] + "+00:00" if value.endswith("Z") else value
+        dt = datetime.fromisoformat(ts)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return str(value)
+    delta = (datetime.now(timezone.utc) - dt).total_seconds()
+    if delta < 0:
+        delta = 0
+    if delta < 60:
+        return "just now"
+    if delta < 3600:
+        return f"{int(delta // 60)} min ago"
+    if delta < 86400:
+        return f"{int(delta // 3600)} hr ago"
+    days = int(delta // 86400)
+    if days == 1:
+        return "Yesterday"
+    return f"{days} days ago"
 
 
 def _sse(event: str, data: Any) -> str:

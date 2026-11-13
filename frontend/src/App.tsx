@@ -1,164 +1,199 @@
 import { useCallback, useEffect, useState } from 'react'
-import { api, subscribeEvents } from './api'
-import type { BadgeState, StatusPayload } from './types'
-import ProjectConfigTab from './tabs/ProjectConfig'
-import CliRunnerTab from './tabs/CliRunner'
-import MonitoringTab from './tabs/Monitoring'
-import PlannerChatTab from './tabs/PlannerChat'
+import { AppProvider, useApp } from './app-state'
+import { api } from './api'
+import OverviewPage from './pages/Overview'
+import ProjectsPage from './pages/Projects'
+import ActivityPage from './pages/Activity'
+import CliRunnerPage from './pages/CliRunner'
+import ConfigPage from './pages/Config'
+import ChatPage from './pages/Chat'
+import AgentsPage from './pages/Agents'
 
-const TABS = [
-  { id: 'project', label: 'Project & Config' },
-  { id: 'cli', label: 'CLI Runner' },
-  { id: 'monitor', label: 'Activity & Agents' },
-  { id: 'chat', label: 'Planner Chat' },
-] as const
+type PageId =
+  | 'overview'
+  | 'projects'
+  | 'activity'
+  | 'cli'
+  | 'config'
+  | 'chat'
+  | 'agents'
 
-type TabId = (typeof TABS)[number]['id']
-
-const BADGE: Record<BadgeState, string> = {
-  Idle: 'bg-ink-700 text-slate-300 border-ink-600',
-  Executing: 'bg-blue-950 text-blue-300 border-blue-700',
-  Paused: 'bg-amber-950 text-amber-300 border-amber-700',
-  Error: 'bg-red-950 text-red-300 border-red-700',
+const PAGE_TITLES: Record<PageId, string> = {
+  overview: 'Overview',
+  projects: 'Projects',
+  activity: 'Activity & alerts',
+  cli: 'CLI runner',
+  config: 'Configuration',
+  chat: 'Planner chat',
+  agents: 'Agents & health',
 }
 
-export default function App() {
-  const [tab, setTab] = useState<TabId>('project')
-  const [status, setStatus] = useState<StatusPayload | null>(null)
-  const [live, setLive] = useState(false)
+const VALID: PageId[] = [
+  'overview',
+  'projects',
+  'activity',
+  'cli',
+  'config',
+  'chat',
+  'agents',
+]
+
+function parseHash(): PageId {
+  const raw = window.location.hash.replace(/^#/, '') as PageId
+  return VALID.includes(raw) ? raw : 'overview'
+}
+
+function Shell() {
+  const { status, sseOk, wsOk, refresh, toast } = useApp()
+  const [page, setPage] = useState<PageId>(parseHash())
+  const [menuOpen, setMenuOpen] = useState(false)
   const [busy, setBusy] = useState(false)
 
-  const refresh = useCallback(async () => {
-    try {
-      setStatus(await api.getStatus())
-    } catch {
-      /* header degrades gracefully if the API is briefly unavailable */
+  const go = useCallback((id: PageId) => {
+    if (window.location.hash !== `#${id}`) {
+      window.location.hash = id
     }
+    setPage(id)
+    setMenuOpen(false)
   }, [])
 
   useEffect(() => {
-    refresh()
-    const off = subscribeEvents({
-      'telemetry:update': (d) => {
-        setStatus(d as StatusPayload)
-        setLive(true)
-      },
-    })
-    return off
-  }, [refresh])
+    const onHash = () => setPage(parseHash())
+    window.addEventListener('hashchange', onHash)
+    return () => window.removeEventListener('hashchange', onHash)
+  }, [])
 
-  async function control(action: 'pause' | 'resume') {
+  async function control(action: 'pause' | 'resume' | 'stop') {
+    if (action === 'stop' && !window.confirm('Emergency stop the planner?')) return
     setBusy(true)
     try {
-      await api.plannerAction({ action })
+      await api.plannerAction({
+        action,
+        detail: action === 'stop' ? 'emergency stop' : '',
+      })
       await refresh()
+      toast(action === 'stop' ? 'Emergency stop issued.' : `${action} issued.`)
     } catch (e) {
-      console.error(e)
+      toast(e instanceof Error ? e.message : 'Control action failed.')
     } finally {
       setBusy(false)
     }
   }
 
-  async function emergencyStop() {
-    setBusy(true)
-    try {
-      await api.plannerAction({ action: 'pause', detail: 'emergency stop' })
-      await refresh()
-    } catch (e) {
-      console.error(e)
-    } finally {
-      setBusy(false)
-    }
-  }
+  const stateLabel = status?.state ?? 'Idle'
+  const stateClass =
+    stateLabel === 'Error'
+      ? 'status err'
+      : stateLabel === 'Paused'
+        ? 'status warn'
+        : 'status'
 
-  const state: BadgeState = status?.state ?? 'Idle'
+  const nav = (id: PageId, ico: string, label: string) => (
+    <button
+      className={`nav${page === id ? ' active' : ''}`}
+      onClick={() => go(id)}
+      aria-current={page === id ? 'page' : undefined}
+    >
+      <span className="ico">{ico}</span>
+      {label}
+    </button>
+  )
 
   return (
-    <div className="min-h-screen flex flex-col bg-ink-950">
-      <header className="border-b border-ink-700 bg-ink-900 px-4 py-3">
-        <div className="flex flex-wrap items-center gap-3">
-          <div className="flex items-center gap-2 mr-2">
-            <span className="text-lg font-semibold tracking-tight text-white">Clams</span>
-            <span className="text-xs text-slate-500 hidden sm:inline">Multi-Agent System</span>
-          </div>
-
-          <span
-            className={`px-3 py-1 rounded-full text-xs font-medium border ${BADGE[state]}`}
-            data-testid="state-badge"
-          >
-            {state}
-          </span>
-
-          <a
-            href={`https://github.com/${status?.repository ?? ''}`}
-            target="_blank"
-            rel="noreferrer"
-            className="text-xs text-accent hover:underline"
-          >
-            {status?.repository ?? '—'}
-          </a>
-
-          <span className="text-xs text-slate-400">
-            <span className="text-slate-200 font-medium">{status?.active_agents ?? 0}</span> active
-            agents
-          </span>
-
-          <span
-            className={`text-xs ${live ? 'text-ok' : 'text-slate-500'}`}
-            title={live ? 'receiving SSE telemetry' : 'no telemetry yet'}
-          >
-            ● {live ? 'live' : 'offline'}
-          </span>
-
-          <div className="ml-auto flex items-center gap-2">
-            <button
-              onClick={() => control('pause')}
-              disabled={busy}
-              className="px-3 py-2 rounded-md bg-ink-700 hover:bg-ink-600 text-xs font-medium disabled:opacity-50"
-            >
-              Pause
-            </button>
-            <button
-              onClick={() => control('resume')}
-              disabled={busy}
-              className="px-3 py-2 rounded-md bg-ink-700 hover:bg-ink-600 text-xs font-medium disabled:opacity-50"
-            >
-              Resume
-            </button>
-            <button
-              onClick={emergencyStop}
-              disabled={busy}
-              className="px-3 py-2 rounded-md bg-red-900 hover:bg-red-800 text-red-100 text-xs font-semibold disabled:opacity-50"
-            >
-              Emergency Stop
-            </button>
+    <div className="shell">
+      <aside className={`sidebar${menuOpen ? ' open' : ''}`} id="sidebar">
+        <div className="brand">
+          <span className="logo">◈</span> clams <span className="tiny">control</span>
+        </div>
+        <div className="workspace">
+          <div className="avatar">CL</div>
+          <div>
+            <div className="worklabel">
+              {status?.repository ? status.repository : 'Clams workspace'}
+            </div>
+            <div className="tiny">
+              {sseOk ? 'SSE live' : 'SSE offline'} ·{' '}
+              {wsOk ? 'WS live' : 'WS offline'}
+            </div>
           </div>
         </div>
+        <div className="navtitle">Workspace</div>
+        {nav('overview', '▦', 'Overview')}
+        {nav('projects', '◇', 'Projects')}
+        {nav('activity', '▯', 'Activity & alerts')}
+        <div className="navtitle">Operations</div>
+        {nav('cli', '⌘', 'CLI runner')}
+        {nav('config', '⚙', 'Configuration')}
+        {nav('chat', '✧', 'Planner chat')}
+        {nav('agents', '◉', 'Agents & health')}
+        <div className="sidebottom">
+          <div className="livebadge">
+            <b>◈ System {stateLabel.toLowerCase()}</b>
+            <span>
+              {sseOk ? 'SSE live' : 'SSE offline'} ·{' '}
+              {wsOk ? 'WS live' : 'WS offline'}
+            </span>
+          </div>
+          <div className="navtitle">Control room</div>
+        </div>
+      </aside>
 
-        <nav className="flex gap-1 mt-3 overflow-x-auto">
-          {TABS.map((t) => (
+      <main className="main">
+        <header className="topbar">
+          <div className="inlinebar">
             <button
-              key={t.id}
-              onClick={() => setTab(t.id)}
-              aria-current={tab === t.id ? 'page' : undefined}
-              className={`px-4 py-2 rounded-t-md text-sm whitespace-nowrap transition-colors ${
-                tab === t.id
-                  ? 'bg-ink-950 text-white border-b-2 border-accent'
-                  : 'text-slate-400 hover:text-slate-200'
-              }`}
+              className="btn mobilemenu"
+              aria-label="Open navigation"
+              aria-expanded={menuOpen}
+              onClick={() => setMenuOpen((v) => !v)}
             >
-              {t.label}
+              ☰
             </button>
-          ))}
-        </nav>
-      </header>
+            <div className="crumb">
+              Clams / <b>{PAGE_TITLES[page]}</b>
+            </div>
+          </div>
+          <div className="topright">
+            <span className={stateClass}>
+              <i className="dot" />
+              {stateLabel}
+            </span>
+            <span className={`status ${sseOk ? '' : 'err'}`}>
+              SSE: {sseOk ? 'connected' : 'offline'}
+            </span>
+            <span className={`status ${wsOk ? '' : 'err'}`}>
+              WS: {wsOk ? 'connected' : 'offline'}
+            </span>
+            <button className="btn" disabled={busy} onClick={() => control('pause')}>
+              Pause
+            </button>
+            <button className="btn" disabled={busy} onClick={() => control('resume')}>
+              Resume
+            </button>
+            <button className="btn danger" disabled={busy} onClick={() => control('stop')}>
+              Emergency stop
+            </button>
+          </div>
+        </header>
 
-      <main className="flex-1 p-4 overflow-auto">
-        {tab === 'project' && <ProjectConfigTab />}
-        {tab === 'cli' && <CliRunnerTab />}
-        {tab === 'monitor' && <MonitoringTab />}
-        {tab === 'chat' && <PlannerChatTab />}
+        <div className="content">
+          {page === 'overview' && <OverviewPage go={go} />}
+          {page === 'projects' && <ProjectsPage />}
+          {page === 'activity' && <ActivityPage />}
+          {page === 'cli' && <CliRunnerPage />}
+          {page === 'config' && <ConfigPage />}
+          {page === 'chat' && <ChatPage />}
+          {page === 'agents' && <AgentsPage />}
+        </div>
       </main>
     </div>
+  )
+}
+
+export default function App() {
+  return (
+    <AppProvider>
+      <Shell />
+    </AppProvider>
   )
 }
