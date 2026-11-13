@@ -31,3 +31,6 @@ todo/
 # frontend build output & deps
 frontend/node_modules/
 frontend/dist/
+
+# dev supervisor runtime (pids + logs)
+.dev/
