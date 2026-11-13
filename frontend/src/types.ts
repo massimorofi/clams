@@ -100,3 +100,43 @@ export interface AlertAckResult {
   id?: number
   unacked_alerts: number
 }
+
+/** The four Clams roles. Only planner and executor are Claudio agent instances. */
+export type AgentRole = 'planner' | 'executor' | 'orchestrator' | 'watchdog'
+
+/** One configured agent as returned by the API (secrets masked). */
+export interface AgentRow {
+  id: string
+  role: AgentRole
+  base_url: string
+  effective_base_url: string
+  enabled: boolean
+  request_timeout: number
+  has_auth_token: boolean
+}
+
+export interface AgentsResponse {
+  agents: AgentRow[]
+  roles: AgentRole[]
+  claudio_roles: string[]
+  defaults: {
+    host: string
+    planner_port: number
+    executor_port: number
+    request_timeout: number
+  }
+}
+
+export interface AgentMutationResponse {
+  ok: boolean
+  agent?: AgentRow
+  agents: AgentRow[]
+}
+
+export interface AgentProbeResult {
+  ok: boolean
+  agent_id: string
+  status: number | null
+  url: string
+  detail: string
+}

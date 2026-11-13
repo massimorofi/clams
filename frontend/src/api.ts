@@ -1,4 +1,7 @@
 import type {
+  AgentMutationResponse,
+  AgentProbeResult,
+  AgentsResponse,
   CliResult,
   ConfigPutResponse,
   ConfigResponse,
@@ -75,6 +78,42 @@ export const api = {
     req<AlertAckResult>('/alerts/ack', {
       method: 'POST',
       body: JSON.stringify(severity ? { severity } : {}),
+    }),
+  // --- issue #19: agent registry ---
+  listAgents: () => req<AgentsResponse>('/agents'),
+  createAgent: (body: {
+    id: string
+    role: string
+    base_url: string
+    auth_token?: string
+    enabled?: boolean
+    request_timeout?: number
+  }) =>
+    req<AgentMutationResponse>('/agents', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  updateAgent: (
+    id: string,
+    body: {
+      role?: string
+      base_url?: string
+      auth_token?: string
+      enabled?: boolean
+      request_timeout?: number
+    },
+  ) =>
+    req<AgentMutationResponse>(`/agents/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      body: JSON.stringify(body),
+    }),
+  deleteAgent: (id: string) =>
+    req<AgentMutationResponse>(`/agents/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    }),
+  probeAgent: (id: string) =>
+    req<AgentProbeResult>(`/agents/${encodeURIComponent(id)}/probe`, {
+      method: 'POST',
     }),
 }
 

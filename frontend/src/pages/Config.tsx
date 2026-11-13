@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { api } from '../api'
 import type { ConfigResponse, EditableField } from '../types'
 import { useApp } from '../app-state'
+import AgentsConfig from '../components/AgentsConfig'
 
 function getIn(obj: unknown, path: string): unknown {
   return path
@@ -190,6 +191,9 @@ export default function ConfigPage() {
           </div>
         </section>
       </div>
+
+      {/* Agent address + role configuration (issue #19) */}
+      <AgentsConfig />
     </section>
   )
 }

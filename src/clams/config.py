@@ -15,6 +15,12 @@ from urllib.parse import urlsplit, urlunsplit
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from .agents import (
+    DEFAULT_AUTH_TOKEN,
+    DEFAULT_EXECUTOR_PORT,
+    DEFAULT_PLANNER_PORT,
+)
+
 # Hostnames that always resolve to "this machine". Inside a container that means
 # the container itself, never the host -- so a loopback URL is a bug there.
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "0.0.0.0", "[::1]"})
@@ -273,8 +279,10 @@ class PathsSettings(BaseSettings):
     work_root: str = "./work"
     repo_path: str = "."
     heartbeat_dir: str = "./data/heartbeats"
+    # Where the agent registry (issue #19) is persisted.
+    agents_file: str = "./data/agents.json"
 
-    @field_validator("db_path", "work_root", "data_dir")
+    @field_validator("db_path", "work_root", "data_dir", "agents_file")
     @classmethod
     def _abs(cls, v: str) -> str:
         return str(Path(v).expanduser().resolve())
@@ -291,6 +299,30 @@ class WatchdogSettings(BaseSettings):
     llm_failures_critical: int = 3
     github_failures_critical: int = 3
     max_recovery_attempts: int = 3
+
+
+class AgentsSettings(BaseSettings):
+    """Agent registry defaults (issue #19).
+
+    The registry itself lives in ``paths.agents_file``; these settings only
+    seed it on first run and supply the defaults the UI offers when adding a
+    new agent.
+    """
+
+    model_config = SettingsConfigDict(env_prefix="CLAMS__AGENTS__", extra="ignore")
+
+    host: str = "127.0.0.1"
+    planner_port: int = DEFAULT_PLANNER_PORT
+    executor_port: int = DEFAULT_EXECUTOR_PORT
+    auth_token: str = DEFAULT_AUTH_TOKEN
+    request_timeout: float = 120.0
+
+    @field_validator("planner_port", "executor_port")
+    @classmethod
+    def _valid_port(cls, v: int) -> int:
+        if not (1 <= v <= 65535):
+            raise ValueError("port must be between 1 and 65535")
+        return v
 
 
 class Settings(BaseSettings):
@@ -315,6 +347,7 @@ class Settings(BaseSettings):
     watchdog: WatchdogSettings = Field(default_factory=WatchdogSettings)
     project: ProjectSettings = Field(default_factory=ProjectSettings)
     api: ApiSettings = Field(default_factory=ApiSettings)
+    agents: AgentsSettings = Field(default_factory=AgentsSettings)
     poll_interval: float = 20.0
     intake_label: str = "status:Ready"
     inprogress_label: str = "status:In Progress"

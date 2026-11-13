@@ -43,6 +43,12 @@ services:
     command: >
       redis-server --appendonly yes --appendfsync everysec
                  --maxmemory 256mb --maxmemory-policy noeviction
+    # Published on loopback only. The default CLAMS__REDIS__URL is
+    # redis://127.0.0.1:6379/0, so a host-run `clams` (dev.sh) and the
+    # containerised services must both be able to reach it. Never exposed
+    # beyond 127.0.0.1 -- the bus carries unauthenticated task briefs.
+    ports:
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis-data:/data
     healthcheck:

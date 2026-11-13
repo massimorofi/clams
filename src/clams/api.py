@@ -36,10 +36,18 @@ from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconn
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from .config import Settings
 from .db import Store, open_store, AlertRepo
+from .agents import (
+    AGENT_ROLES,
+    CLAUDIO_ROLES,
+    AgentConfig,
+    AgentError,
+    AgentRegistry,
+    probe_agent,
+)
 
 log = logging.getLogger("clams.api")
 
@@ -87,6 +95,47 @@ class AlertAckAll(BaseModel):
     """Bulk-acknowledge alerts, optionally filtered by severity (§6.3)."""
 
     severity: Optional[str] = None
+
+
+class AgentCreate(BaseModel):
+    """Register a new agent (issue #19)."""
+
+    id: str
+    role: str
+    base_url: str
+    auth_token: str = ""
+    enabled: bool = True
+    request_timeout: float = 120.0
+
+
+class AgentUpdate(BaseModel):
+    """Patch an existing agent. Omitted/None fields are left untouched.
+
+    ``id`` is immutable — it is the registry key, and changing it is a
+    delete + add, not an edit.
+    """
+
+    role: Optional[str] = None
+    base_url: Optional[str] = None
+    auth_token: Optional[str] = None
+    enabled: Optional[bool] = None
+    request_timeout: Optional[float] = None
+
+
+def _agent_error_text(exc: Exception) -> str:
+    """Turn a validation failure into one clean line for the UI.
+
+    Pydantic wraps the ``AgentError`` raised inside a field validator in a
+    ``ValidationError``; surfacing the raw object is unreadable, so flatten
+    it to the first human-readable message.
+    """
+    if isinstance(exc, ValidationError):
+        errs = exc.errors()
+        if errs:
+            first = errs[0]
+            loc = ".".join(str(p) for p in first.get("loc", ())) or "agent"
+            return f"{loc}: {first.get('msg', 'invalid value')}"
+    return str(exc)
 
 
 def normalize_github_url(raw: str) -> tuple[Optional[str], Optional[str]]:
@@ -211,6 +260,9 @@ def create_app(settings: Optional[Settings] = None,
     # Settings object so a running loop picks changes up without a restart.
     runtime: dict[str, Any] = {}
 
+    # Agent registry (issue #19): role -> address, persisted as JSON.
+    agents = AgentRegistry.load(settings.paths.agents_file)
+
     # ---- health -----------------------------------------------------
     @app.get("/healthz")
     async def healthz():
@@ -276,6 +328,88 @@ def create_app(settings: Optional[Settings] = None,
             "changed": _diff_dicts(before, after),
             "settings": after,
         }
+
+    # ---- agents (issue #19) ----------------------------------------
+    # The registry is persisted separately from the hot-edit settings blob,
+    # because the generic config path redacts secrets on the way out and
+    # round-tripping a masked auth_token through PUT would clobber it.
+    def _sync_settings_from_registry() -> None:
+        """Mirror the planner/executor agents into the live Settings.
+
+        Existing code dials ``settings.planner.base_url`` and
+        ``settings.executor.base_url`` directly, so any registry change has
+        to be reflected there or the running loop keeps using the old address.
+        """
+        changed = False
+        for role, section in (("planner", settings.planner),
+                            ("executor", settings.executor)):
+            agent = agents.primary_for_role(role)
+            if agent is None:
+                continue
+            if section.base_url != agent.effective_base_url():
+                section.base_url = agent.effective_base_url()
+                changed = True
+            if agent.auth_token and section.auth_token != agent.auth_token:
+                section.auth_token = agent.auth_token
+                changed = True
+        if changed:
+            runtime["agents_synced_at"] = _now_iso()
+
+    _sync_settings_from_registry()
+
+    @app.get("/api/v1/agents")
+    async def list_agents():
+        return {
+            "agents": [a.public_dict() for a in agents.all()],
+            "roles": list(AGENT_ROLES),
+            "claudio_roles": sorted(CLAUDIO_ROLES),
+            "defaults": {
+                "host": settings.agents.host,
+                "planner_port": settings.agents.planner_port,
+                "executor_port": settings.agents.executor_port,
+                "request_timeout": settings.agents.request_timeout,
+            },
+        }
+
+    @app.post("/api/v1/agents", status_code=201)
+    async def create_agent(req: AgentCreate):
+        try:
+            agent = AgentConfig(**req.model_dump())
+            agents.add(agent)
+        except (AgentError, ValidationError) as exc:
+            raise HTTPException(status_code=422, detail=_agent_error_text(exc))
+        _sync_settings_from_registry()
+        return {"ok": True, "agent": agent.public_dict(),
+                "agents": [a.public_dict() for a in agents.all()]}
+
+    @app.put("/api/v1/agents/{agent_id}")
+    async def update_agent(agent_id: str, req: AgentUpdate):
+        changes = {k: v for k, v in req.model_dump().items() if v is not None}
+        try:
+            agent = agents.update(agent_id, changes)
+        except (AgentError, ValidationError) as exc:
+            raise HTTPException(status_code=422, detail=_agent_error_text(exc))
+        _sync_settings_from_registry()
+        return {"ok": True, "agent": agent.public_dict(),
+                "agents": [a.public_dict() for a in agents.all()]}
+
+    @app.delete("/api/v1/agents/{agent_id}")
+    async def delete_agent(agent_id: str):
+        try:
+            agents.remove(agent_id)
+        except AgentError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        _sync_settings_from_registry()
+        return {"ok": True, "agents": [a.public_dict() for a in agents.all()]}
+
+    @app.post("/api/v1/agents/{agent_id}/probe")
+    async def probe_agent_endpoint(agent_id: str):
+        agent = agents.get(agent_id)
+        if agent is None:
+            raise HTTPException(status_code=404,
+                               detail=f"no agent with id {agent_id!r}")
+        result = await asyncio.to_thread(probe_agent, agent)
+        return {"ok": result["ok"], "agent_id": agent_id, **result}
 
     # ---- CLI --------------------------------------------------------
     @app.post("/api/v1/cli/exec")
