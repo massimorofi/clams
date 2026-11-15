@@ -188,7 +188,14 @@ class ExecutorSettings(BaseSettings):
     auth_token: str = ""
     request_timeout: float = 120.0
     executor_id: str = "executor-1"
-    lease_seconds: int = 900
+    # Issue #122: the lease used to be 900s while a task may run 1800s, so a
+    # legitimate long task lost its lease mid-run, a second executor could
+    # steal and double-run it, and /api/v1/status reported "Idle" during work.
+    # It must exceed limits.max_wall_seconds (enforced in Settings.load) and is
+    # additionally renewed while the task runs (see ExecutorService).
+    lease_seconds: int = 2100
+    # How often the executor pushes its lease out while a task is in flight.
+    lease_renew_interval: float = 120.0
     # How often the executor refreshes its heartbeat file. Must stay comfortably
     # below watchdog.heartbeat_max_age or the watchdog flags a live executor.
     heartbeat_interval: float = 20.0
@@ -387,7 +394,21 @@ class Settings(BaseSettings):
     def load(cls, **overrides: Any) -> "Settings":
         s = cls(**overrides)
         s.limits.validate_against_device()
+        s.validate_lease_vs_wall()
         return s
+
+    def validate_lease_vs_wall(self) -> None:
+        """Issue #122: a task must not be able to outlive its lease.
+
+        Raised at start-up rather than discovered at 3 a.m. as a double-run.
+        """
+        if self.executor.lease_seconds <= self.limits.max_wall_seconds:
+            raise ValueError(
+                f"CLAMS__EXECUTOR__LEASE_SECONDS ({self.executor.lease_seconds})"
+                f" must exceed CLAMS__LIMITS__MAX_WALL_SECONDS "
+                f"({self.limits.max_wall_seconds}): a task that outlives its "
+                f"lease is stolen and double-run by another executor"
+            )
 
 
 @lru_cache(maxsize=1)

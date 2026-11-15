@@ -221,12 +221,17 @@ class ExecutorService:
         if not won:
             claim = self.store.task_claims.get(task_number, project_id)
             holder = claim["executor_id"] if claim else "unknown"
-            return ExecutionResult(
+            result = ExecutionResult(
                 task_issue=task_number,
                 status="blocked",
                 summary=f"task already claimed by {holder}",
                 project_id=project_id,
             )
+            # Issue #118: this result used to be returned and discarded by the
+            # caller, so the task never reported and the review gate could
+            # never close the requirement. Publish it like any other outcome.
+            await publish_result(self.bus, result)
+            return result
 
         worktree_path = (Path(self.settings.paths.work_root)
                         / f"p{project_id}-task-{task_number}")
@@ -239,9 +244,15 @@ class ExecutorService:
                 base_sha=brief.git.base_sha or "HEAD",
             )
             created = True
-            outcome = await asyncio.wait_for(
-                self._run(brief, worktree_path), timeout=max_wall
-            )
+            # Issue #122: push the lease out while the task runs so a long but
+            # legitimate run cannot be declared dead and stolen mid-flight.
+            renew = asyncio.ensure_future(self._renew_lease(task_number, project_id))
+            try:
+                outcome = await asyncio.wait_for(
+                    self._run(brief, worktree_path), timeout=max_wall
+                )
+            finally:
+                renew.cancel()
         except asyncio.TimeoutError:
             if created:
                 remove_worktree(base_repo, worktree_path)
@@ -303,6 +314,19 @@ class ExecutorService:
         if created:
             remove_worktree(base_repo, worktree_path)
         return result
+
+    async def _renew_lease(self, task_number: int, project_id: int) -> None:
+        """Extend the claim until the task finishes (issue #122)."""
+        interval = max(1.0, float(self.settings.executor.lease_renew_interval))
+        lease = self.settings.executor.lease_seconds
+        executor_id = self.executor_id
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                self.store.task_claims.renew(task_number, executor_id, lease,
+                                             project_id)
+            except Exception:  # noqa: BLE001 - renewal is best-effort
+                return
 
     async def _run(self, brief: TaskBrief, worktree_path: Path) -> TaskRunOutcome:
         out = self.task_runner(brief, worktree_path)
