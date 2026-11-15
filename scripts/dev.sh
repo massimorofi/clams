@@ -2,15 +2,21 @@
 #
 # Clams dev supervisor (issue #19)
 # -------------------------------
-# Starts the five components of a Clams deployment:
+# Starts every component of a Clams deployment:
 #
-#   1. backend      Clams HTTP + SSE API   (clams serve)      127.0.0.1:8200
-#   2. frontend   Vite dev server        (npm run dev)      0.0.0.0:5173
-#   3. planner    Claudio agent, planner role              127.0.0.1:1072
-#   4. executor   Claudio agent, executor role             127.0.0.1:1073
-#   5. orchestrator  Clams control loop  (clams watch)     (no port)
+#   1. redis           event bus everything depends on       127.0.0.1:6379
+#   2. planner_agent   Claudio agent, planner role          127.0.0.1:1072
+#   3. executor_agent  Claudio agent, executor role         127.0.0.1:1073
+#   4. backend         Clams HTTP + SSE API (clams serve)  127.0.0.1:8200
+#   5. orchestrator    Clams control loop   (clams watch)  (no port)
+#   6. worker          Clams executor daemon (clams worker) (no port)
+#   7. watchdog        zero-LLM supervisor    (wdctl run)    (no port)
+#   8. frontend        Vite dev server        (npm run dev)  0.0.0.0:5173
 #
-# plus redis, the event bus everything depends on.
+# The worker and the watchdog are NOT optional. The watchdog's agent_heartbeats
+# check requires a fresh executor.json heartbeat, and only `clams worker` writes
+# it. Omitting the worker is exactly what made the watchdog fire
+# "Critical condition detected; dispatching paused. agent_heartbeats".
 #
 # The two Claudio agents run as Docker containers because Claudio is not
 # installed natively here. Their ports are 1072/1073 by deliberate choice:
@@ -49,6 +55,10 @@ EXECUTOR_PORT="${CLAMS_EXECUTOR_AGENT_PORT:-1073}"
 AGENT_IMAGE="${CLAMS_AGENT_IMAGE:-claudio/agent:latest}"
 AGENT_TOKEN="${CLAMS_AGENT_AUTH_TOKEN:-dev-token-change-me}"
 REDIS_PORT="${CLAMS_REDIS_PORT:-6379}"
+# Heartbeat location + freshness threshold the watchdog enforces. Must match
+# CLAMS__PATHS__HEARTBEAT_DIR / CLAMS__WATCHDOG__HEARTBEAT_MAX_AGE.
+HEARTBEAT_DIR="${CLAMS_HEARTBEAT_DIR:-./data/heartbeats}"
+HEARTBEAT_MAX_AGE="${CLAMS_WATCHDOG_HEARTBEAT_MAX_AGE:-60}"
 
 PY=".venv/bin/python"
 FRONTEND_DIR="frontend"
@@ -58,8 +68,8 @@ RUN_DIR=".dev"
 BACKEND_URL="http://${BACKEND_HOST}:${BACKEND_PORT}"
 FRONTEND_URL="http://127.0.0.1:${FRONTEND_PORT}"
 
-# The five managed components, in start order.
-COMPONENTS="backend frontend planner_agent executor_agent orchestrator"
+# The managed components, in start order.
+COMPONENTS="redis planner_agent executor_agent backend orchestrator worker watchdog frontend"
 
 # Container names for the two Claudio agent instances.
 PLANNER_CONTAINER="clams-agent-planner"
@@ -111,6 +121,43 @@ wait_http() {
   local url="$1" timeout="${2:-20}" waited=0
   while [ "$waited" -lt "$timeout" ]; do
     if http_ok "$url"; then return 0; fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  return 1
+}
+
+# heartbeat_fresh <name> [max_age] -> 0 if <heartbeat_dir>/<name>.json exists
+# and its timestamp is within max_age seconds. Mirrors watchdog.probe_heartbeats.
+heartbeat_fresh() {
+  local name="$1" max_age="${2:-$HEARTBEAT_MAX_AGE}"
+  "$PY" - "$HEARTBEAT_DIR" "$name" "$max_age" <<'PYEOF' 2>/dev/null
+import json, sys
+from datetime import datetime, timezone
+from pathlib import Path
+hb_dir, name, max_age = sys.argv[1], sys.argv[2], float(sys.argv[3])
+p = Path(hb_dir) / f"{name}.json"
+if not p.exists():
+    sys.exit(1)
+try:
+    d = json.loads(p.read_text())
+    ts = datetime.fromisoformat(str(d["timestamp"]).replace("Z", "+00:00"))
+except Exception:
+    sys.exit(1)
+age = (datetime.now(timezone.utc) - ts).total_seconds()
+sys.exit(0 if age <= max_age else 1)
+PYEOF
+}
+
+# wait_heartbeats [timeout] -> 0 once BOTH planner and executor heartbeats are
+# fresh. Used before starting the watchdog so a cold start never trips a false
+# agent_heartbeats critical.
+wait_heartbeats() {
+  local timeout="${1:-30}" waited=0
+  while [ "$waited" -lt "$timeout" ]; do
+    if heartbeat_fresh planner && heartbeat_fresh executor; then
+      return 0
+    fi
     sleep 1
     waited=$((waited + 1))
   done
@@ -216,6 +263,45 @@ start_claudio_agent() {
   workdir="$(pwd)/.dev/agents/${role}"
   mkdir -p "$workdir"
 
+  # issue #116: the agent config asked for host execution over a unix socket
+  # dev.sh never mounted. run_command then failed for essentially every task
+  # ("host executor unavailable") and the task died. Either mount a real
+  # host-exec socket (CLAMS_HOST_EXEC_SOCKET) or force the setting off so
+  # commands run sandboxed in the container, where the task worktree is
+  # already bind-mounted.
+  local -a exec_mount=()
+  if [ -n "${CLAMS_HOST_EXEC_SOCKET:-}" ] && [ -S "${CLAMS_HOST_EXEC_SOCKET}" ]; then
+    exec_mount=(-v "${CLAMS_HOST_EXEC_SOCKET}:/run/claudio-host/host-exec.sock")
+    ok "host-exec socket mounted from ${CLAMS_HOST_EXEC_SOCKET}"
+  else
+    local agent_cfg="${workdir}/config.yaml"
+    if [ -f "$agent_cfg" ] \
+       && grep -qE '^[[:space:]]*host_execution_enabled:[[:space:]]*true' "$agent_cfg"; then
+      warn "host_execution_enabled: true in ${agent_cfg} but no host-exec socket is mounted."
+      warn "Forcing sandboxed in-container execution (issue #116)."
+      warn "Export CLAMS_HOST_EXEC_SOCKET=/path/to/host-exec.sock to use real host execution."
+      sed -i -E 's/^([[:space:]]*)host_execution_enabled:[[:space:]]*true/\1host_execution_enabled: false/' "$agent_cfg"
+    fi
+  fi
+
+  # The agent seeds config/config.yaml from the shipped example on first boot,
+  # and that file — not the environment — is what sets llm.timeout_seconds (300).
+  # /chat waits timeout_seconds * 2, so every Clams task was cancelled at
+  # exactly 600s with a 500 "Run failed". Mounting a real config lets the run
+  # outlive the task budget instead.
+  local -a config_mount=()
+  if [ -f "${workdir}/config.yaml" ]; then
+    config_mount=(-v "${workdir}/config.yaml:/srv/claudio/claudio-backend/config/config.yaml:ro")
+  fi
+
+  # The repo is also bind-mounted at its own *resolved* path. Clams hands the
+  # agent a task brief naming a worktree under CLAMS__PATHS__WORK_ROOT, and
+  # those paths are resolved (they live under /run/media/... even when the repo
+  # was entered through the /home/... symlink). Without this mount the agent can
+  # only see /workspace and every write into the worktree fails with
+  # "Permission denied: '/run/media'", so a task can run for ten minutes and
+  # still produce no artifact.
+
   docker run -d \
     --name "$name" \
     --restart unless-stopped \
@@ -225,8 +311,12 @@ start_claudio_agent() {
     -e "CLAUDIO__SERVER__PORT=${port}" \
     -e "CLAUDIO__SERVER__AUTH_TOKEN=${AGENT_TOKEN}" \
     -e "CLAUDIO__AGENT__DEFAULT_WORKSPACE_DIR=/workspace" \
+    -e "CLAUDIO__LLM__TIMEOUT_SECONDS=${AGENT_LLM_TIMEOUT:-900}" \
     -e "CLAMS_AGENT_ROLE=${role}" \
     -v "${workdir}:/workspace" \
+    -v "$(pwd -P):$(pwd -P)" \
+    "${config_mount[@]}" \
+    "${exec_mount[@]}" \
     "$AGENT_IMAGE" >/dev/null || {
       err "Failed to start ${role} agent container."
       exit 1
@@ -304,6 +394,77 @@ start_orchestrator() {
   fi
 }
 
+# start_worker — the Clams executor daemon (`clams worker`).
+# This is the process that writes the executor.json heartbeat the watchdog's
+# agent_heartbeats check requires. Without it the watchdog permanently reports
+# "executor (missing)" and pauses all dispatch.
+start_worker() {
+  local pidfile; pidfile="$(pid_file worker)"
+  local pid
+  pid="$(read_pid "$pidfile" || true)"
+  if [ -n "$pid" ] && pid_alive "$pid"; then
+    ok "Executor worker already running (pid $pid)"
+    return 0
+  fi
+  if [ ! -x "$PY" ]; then
+    err "Python not found at $PY."
+    exit 1
+  fi
+  mkdir -p "$RUN_DIR"
+  info "Starting executor worker (clams worker)…"
+  pid="$(launch_detached "$(log_file worker)" "$PY" -m clams.cli worker)"
+  printf '%s' "$pid" > "$pidfile"
+  # The worker writes its first heartbeat on the first poll; wait for it so the
+  # watchdog we start next never sees a missing executor heartbeat.
+  local waited=0
+  while [ "$waited" -lt 15 ]; do
+    if heartbeat_fresh executor; then
+      ok "Executor worker running (pid $pid), heartbeat fresh"
+      return 0
+    fi
+    if ! pid_alive "$pid"; then
+      err "Executor worker exited immediately. Check $(log_file worker)"
+      exit 1
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  warn "Executor worker up but its heartbeat is not fresh yet. Check $(log_file worker)"
+}
+
+# start_watchdog — the zero-LLM supervisor (`wdctl run`).
+# Started last: it fires a critical 'agent_heartbeats' alert the moment it runs
+# if the planner/executor heartbeats are not yet fresh, which pauses dispatch.
+# So we wait for both heartbeats before handing over supervision.
+start_watchdog() {
+  local pidfile; pidfile="$(pid_file watchdog)"
+  local pid
+  pid="$(read_pid "$pidfile" || true)"
+  if [ -n "$pid" ] && pid_alive "$pid"; then
+    ok "Watchdog already running (pid $pid)"
+    return 0
+  fi
+  if [ ! -x "$PY" ]; then
+    err "Python not found at $PY."
+    exit 1
+  fi
+  mkdir -p "$RUN_DIR"
+  info "Waiting for planner + executor heartbeats before starting the watchdog…"
+  if ! wait_heartbeats 30; then
+    warn "Heartbeats not fresh after 30s; starting the watchdog anyway."
+  fi
+  info "Starting watchdog (wdctl run)…"
+  pid="$(launch_detached "$(log_file watchdog)" "$PY" -m clams.watchdog run)"
+  printf '%s' "$pid" > "$pidfile"
+  sleep 1
+  if pid_alive "$pid"; then
+    ok "Watchdog running (pid $pid)"
+  else
+    err "Watchdog exited immediately. Check $(log_file watchdog)"
+    exit 1
+  fi
+}
+
 start_frontend() {
   local pidfile; pidfile="$(pid_file frontend)"
   local pid
@@ -333,28 +494,36 @@ start_frontend() {
 # --- commands --------------------------------------------------------------
 
 cmd_start() {
-  info "Starting the Clams stack (5 components)…"
+  info "Starting the Clams stack (all components)…"
   echo
   start_redis
   start_claudio_agent "$PLANNER_CONTAINER"   "$PLANNER_PORT"  "planner"
   start_claudio_agent "$EXECUTOR_CONTAINER"  "$EXECUTOR_PORT" "executor"
   start_backend
   start_orchestrator
+  start_worker
+  start_watchdog
   start_frontend
   echo
-  ok "All five components started."
+  ok "All components started."
   echo "  Frontend     ${FRONTEND_URL}"
   echo "  Backend      ${BACKEND_URL}"
   echo "  Planner      http://127.0.0.1:${PLANNER_PORT}/api/v1"
   echo "  Executor     http://127.0.0.1:${EXECUTOR_PORT}/api/v1"
   echo "  Orchestrator clams watch (pid $(read_pid "$(pid_file orchestrator)" || echo '?'))"
+  echo "  Worker       clams worker (pid $(read_pid "$(pid_file worker)" || echo '?'))"
+  echo "  Watchdog     wdctl run (pid $(read_pid "$(pid_file watchdog)" || echo '?'))"
   echo "  Logs         ${RUN_DIR}/*.log"
 }
 
 cmd_stop() {
-  stop_pid "frontend"     "$(pid_file frontend)"
+  # Stop the supervisor first so it never raises a critical alert while the
+  # daemons it watches are being torn down.
+  stop_pid "watchdog"     "$(pid_file watchdog)"
+  stop_pid "worker"      "$(pid_file worker)"
+  stop_pid "frontend"    "$(pid_file frontend)"
   stop_pid "orchestrator" "$(pid_file orchestrator)"
-  stop_pid "backend"      "$(pid_file backend)"
+  stop_pid "backend"     "$(pid_file backend)"
   stop_container "$EXECUTOR_CONTAINER"
   stop_container "$PLANNER_CONTAINER"
 }
@@ -426,6 +595,20 @@ cmd_status() {
     down=1
   fi
 
+  if [ "$(component_state worker)" = up ]; then
+    printf '  %s\n' "${C_GREEN}● executor worker${C_RESET}  clams worker"
+  else
+    printf '  %s\n' "${C_RED}○ executor worker stopped${C_RESET}"
+    down=1
+  fi
+
+  if [ "$(component_state watchdog)" = up ]; then
+    printf '  %s\n' "${C_GREEN}● watchdog${C_RESET}       wdctl run"
+  else
+    printf '  %s\n' "${C_RED}○ watchdog stopped${C_RESET}"
+    down=1
+  fi
+
   if (echo > "/dev/tcp/127.0.0.1/${REDIS_PORT}") >/dev/null 2>&1; then
     printf '  %s  %s\n' "${C_GREEN}● redis${C_RESET}         127.0.0.1:${REDIS_PORT}"
   else
@@ -463,13 +646,14 @@ usage() {
   cat <<EOF
 Clams dev supervisor
 
-  start             Start all 5 components (redis, 2 Claudio agents, backend,
-                    orchestrator, frontend). Idempotent.
+  start             Start every component: redis, planner + executor Claudio
+                    agents, backend, orchestrator, executor worker, watchdog,
+                    frontend. Idempotent.
   stop              Stop everything.
   status            Per-component status.
   restart           Stop then start.
   logs              Follow backend + frontend + orchestrator logs.
-  logs <component>  Follow one log: backend | frontend | orchestrator
+  logs <component>  Follow one log: backend | frontend | orchestrator | worker | watchdog
   agents            Show the configured agent registry.
 
 Ports (env-overridable):
