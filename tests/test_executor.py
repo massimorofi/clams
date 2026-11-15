@@ -278,7 +278,9 @@ async def test_claudio_task_runner_runs_verification(repo, tmp_path):
     runner = ClaudioTaskRunner(FakeClaudio())
     target = tmp_path / "wt-runner"
     create_worktree(repo, target, branch="task/50", base_sha="HEAD")
-    out = await runner(brief(task=50, criterion="python -c \"print('ok')\""), target)
+    # Issue #119: only an explicitly marked line is executed.
+    out = await runner(brief(task=50, criterion='run: python -c "print(\'ok\')"'),
+                       target)
     assert out.ok is True
     assert out.commands[0].exit_code == 0
     assert "task #50" in calls[0]
@@ -294,7 +296,7 @@ async def test_claudio_task_runner_detects_failing_verification(repo, tmp_path):
     runner = ClaudioTaskRunner(FakeClaudio())
     target = tmp_path / "wt-runner2"
     create_worktree(repo, target, branch="task/51", base_sha="HEAD")
-    out = await runner(brief(task=51, criterion="exit 1"), target)
+    out = await runner(brief(task=51, criterion="run: exit 1"), target)
     assert out.ok is False
 
 
@@ -311,12 +313,58 @@ async def test_claudio_task_runner_handles_claudio_error():
 
 def test_verify_commands_prefers_explicit_callable():
     runner = ClaudioTaskRunner(None, verification_cmd=lambda b: ["make test"])
-    assert runner.verify_commands(brief()) == ["make test"]
+    assert runner.verify_commands(brief()) == (["make test"], [])
 
 
 def test_verify_commands_parses_run_prefix():
     runner = ClaudioTaskRunner(None)
-    assert runner.verify_commands(brief(criterion="run: pytest -q tests")) == ["pytest -q tests"]
+    assert runner.verify_commands(
+        brief(criterion="run: pytest -q tests")) == (["pytest -q tests"], [])
+
+
+# -- issue #119: prose must never be executed -------------------------------
+
+def test_prose_criterion_is_not_executed():
+    runner = ClaudioTaskRunner(None)
+    crit = ("The Board model includes a nullable string field 'status_field_id' "
+            "and a migration script exists for it.")
+    cmds, prose = runner.verify_commands(brief(criterion=crit))
+    assert cmds == []
+    assert prose == [crit]
+
+
+def test_mixed_criterion_splits_commands_and_prose():
+    runner = ClaudioTaskRunner(None)
+    crit = ("- Form submission adds a backend to the store.\n"
+            "- run: pytest tests/test_board.py -q\n")
+    cmds, prose = runner.verify_commands(brief(criterion=crit))
+    assert cmds == ["pytest tests/test_board.py -q"]
+    assert prose == ["Form submission adds a backend to the store."]
+
+
+def test_prose_only_task_is_not_failed_by_the_evidence_gate(tmp_path):
+    """Acceptance: a task with prose-only criteria must not be rejected."""
+    import asyncio
+
+    class Resp:
+        final_output = "implemented the field and the migration"
+
+    class FakeClaudio:
+        async def chat(self, *a, **kw):
+            return Resp()
+
+    runner = ClaudioTaskRunner(FakeClaudio())
+    out = asyncio.run(runner(brief(criterion="The field exists and works"),
+                             tmp_path))
+    assert out.ok is True
+    assert out.commands == []
+    assert out.unverified == ["The field exists and works"]
+    assert "No machine-verifiable command" in out.summary
+
+
+def test_empty_criterion_yields_nothing():
+    runner = ClaudioTaskRunner(None)
+    assert runner.verify_commands(brief(criterion="")) == ([], [])
 
 
 # -- heartbeat (issue #2) ---------------------------------------------------

@@ -18,7 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .contracts import Scope
 from .db import Store
-from .gh import GitHubClient, STATUS_READY, parent_label
+from .gh import GitHubClient, STATUS_IN_PROGRESS, parent_label
 
 MIN_TASKS = 3
 MAX_TASKS = 7
@@ -78,7 +78,10 @@ Return ONLY a JSON object, no prose, no markdown fences, shaped exactly like:
     {{
       "title": "short imperative title",
       "objective": "exactly what the worker must change and why",
-      "acceptance_criterion": "a concrete, machine-checkable condition",
+      "acceptance_criterion": "one line per condition. A line the reviewer can
+      execute MUST be prefixed with 'run: ' (e.g. 'run: pytest tests/test_x.py -q').
+      Any other line is prose and is left for human review -- it is never
+      executed (issue #119).",
       "writable": ["paths the worker may modify"],
       "read_only": ["paths the worker may read but not modify"],
       "forbidden": ["paths the worker must not touch"]
@@ -198,10 +201,16 @@ async def create_sub_issues(
     created: list[int] = []
     for idx, spec in enumerate(plan.tasks, start=1):
         body = _child_body(requirement_number, idx, spec)
+        # Tasks must NOT carry ``status:Ready``. That label is intake's trigger
+        # for "unclaimed requirement", so labelling a task Ready made every
+        # generated sub-task look like work intake was refusing to pick up --
+        # the board showed 83 "Ready" issues while intake correctly skipped all
+        # of them. A fresh task is part of an already-claimed requirement, so it
+        # starts In Progress and moves to Review / Done like before.
         issue = await gh.create_issue(
             title=spec.title,
             body=body,
-            labels=[STATUS_READY],
+            labels=[STATUS_IN_PROGRESS],
         )
         await gh.add_sub_issue(requirement_number, issue.number)
         created.append(issue.number)
