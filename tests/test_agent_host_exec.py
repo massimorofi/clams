@@ -57,3 +57,26 @@ def test_agent_worktree_path_is_writable_for_the_agent():
         assert any(root != "/workspace" for root in roots), (
             f"{cfg} only allows /workspace; the executor cannot write its worktree"
         )
+
+
+# ---- issue #121: the container healthcheck must probe the real port -------
+
+def test_dev_sh_overrides_the_agent_healthcheck_port():
+    """The image HEALTHCHECK hardcodes 127.0.0.1:8100.
+
+    dev.sh runs the agents on 1072/1073, so the baked-in probe always failed and
+    every agent container reported "unhealthy" while serving traffic fine.
+    """
+    text = DEV_SH.read_text()
+    assert "--health-cmd" in text
+    # The probe must use the agent's own port variable, not a literal 8100.
+    assert re.search(r'--health-cmd "curl -fsS http://127\.0\.0\.1:\$\{port\}'
+                     r'/healthz \|\| exit 1"', text)
+    assert "8100" not in text.split("docker run -d")[1].split(" \"$AGENT_IMAGE\"")[0]
+
+
+def test_agent_ports_are_not_the_stock_8100():
+    """The ports are deliberately 1072/1073 so a stock instance cannot collide."""
+    text = DEV_SH.read_text()
+    assert 'CLAMS_PLANNER_AGENT_PORT:-1072' in text
+    assert 'CLAMS_EXECUTOR_AGENT_PORT:-1073' in text

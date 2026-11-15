@@ -307,6 +307,9 @@ start_claudio_agent() {
     --restart unless-stopped \
     --init \
     -p "127.0.0.1:${port}:${port}" \
+    --health-cmd "curl -fsS http://127.0.0.1:${port}/healthz || exit 1" \
+    --health-interval 15s --health-timeout 5s --health-retries 5 \
+    --health-start-period 30s \
     -e "CLAUDIO__SERVER__HOST=0.0.0.0" \
     -e "CLAUDIO__SERVER__PORT=${port}" \
     -e "CLAUDIO__SERVER__AUTH_TOKEN=${AGENT_TOKEN}" \
