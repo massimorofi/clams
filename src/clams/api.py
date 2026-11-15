@@ -519,13 +519,12 @@ def create_app(settings: Optional[Settings] = None,
             "detail": req.detail,
             "timestamp": _now_iso(),
         }
-        bus_error: Optional[str] = None
-        try:
-            await bus.publish("clams:planner-actions", payload)
-        except Exception as exc:  # noqa: BLE001 - local effect already applied
-            bus_error = str(exc)
-            log.warning("planner action bus publish failed: %s", exc)
-        return {"ok": True, **payload, "bus_error": bus_error}
+        # Issue #123: this used to publish to ``clams:planner-actions``, a
+        # stream nothing ever consumed -- the pause looked applied but the
+        # pipeline ignored it. The effects are now applied here *and* read by
+        # the orchestrator (projects.paused / the persisted operator pause),
+        # so the dead publish is gone. bus_error is kept for API compatibility.
+        return {"ok": True, **payload, "bus_error": None}
 
     @app.post("/api/v1/planner/message")
     async def planner_message(msg: PlannerMessage):

@@ -185,14 +185,26 @@ class Orchestrator:
                 await delivery.ack()
             report.commands += 1
 
+    def project_paused(self, project_id: int) -> bool:
+        """True when the operator paused this project (issue #123).
+
+        ``POST /api/v1/projects/{id}/pause`` only wrote a flag nothing read, so
+        intake, planning and dispatch kept running for a project the operator
+        had explicitly stopped.
+        """
+        if not project_id:
+            return False
+        row = self.store.projects.get(project_id)
+        return bool(row and row["paused"])
+
     async def step_intake(self, report: CycleReport) -> None:
         # The default project's intake (single-repo path) plus every additional
         # registered project's intake (issue #18).
-        if self.intake is not None:
+        if self.intake is not None and not self.project_paused(self.default_project_id):
             result = await self.intake.sweep()
             report.intake.extend(result.claimed)
         for ctx in self.project_contexts:
-            if ctx.intake is None:
+            if ctx.intake is None or self.project_paused(ctx.project_id):
                 continue
             result = await ctx.intake.sweep()
             report.intake.extend(result.claimed)
@@ -200,14 +212,14 @@ class Orchestrator:
     async def step_plan(self, report: CycleReport) -> None:
         # Default project first (single-repo path), then each additional project
         # with its own planner bound to that project's repo (issue #18).
-        if self.planner is not None:
+        if self.planner is not None and not self.project_paused(self.default_project_id):
             for item in self.store.work_items.list_by_status(
                     "claimed", self.default_project_id):
                 if item.user_paused:
                     continue
                 await self._plan_one(self.planner, item, report)
         for ctx in self.project_contexts:
-            if ctx.planner is None:
+            if ctx.planner is None or self.project_paused(ctx.project_id):
                 continue
             for item in self.store.work_items.list_by_status(
                     "claimed", ctx.project_id):
@@ -285,6 +297,8 @@ class Orchestrator:
         """
         already = self.dispatched_tasks()
         for project_id, worktree_path, base_branch in self.dispatch_scopes():
+            if self.project_paused(project_id):
+                continue          # operator paused this project (#123)
             if not worktree_path:
                 if self.store.work_items.list_by_status("planned", project_id):
                     msg = (f"project {project_id} has planned work but no "
@@ -355,6 +369,8 @@ class Orchestrator:
                           + self.settings.limits.max_wall_seconds
                           + self.settings.limits.stale_task_grace_seconds)
         for project_id, worktree_path, base_branch in self.dispatch_scopes():
+            if self.project_paused(project_id):
+                continue
             if not worktree_path:
                 continue
             reported = self.reported_tasks(project_id)
