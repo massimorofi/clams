@@ -49,6 +49,16 @@ from .agents import (
     default_agents,
     probe_agent,
 )
+from .provision import (
+    ProvisionError,
+    clone_repo,
+    detect_default_branch,
+    is_git_repo,
+    project_worktree_path,
+    provision_project,
+    sync_repo,
+)
+from .project_state import compute_project_status, refresh_project_status
 
 log = logging.getLogger("clams.api")
 
@@ -260,6 +270,13 @@ def create_app(settings: Optional[Settings] = None,
     # Runtime-mutable config overlay. Hot-apply writes here and rebuilds the
     # Settings object so a running loop picks changes up without a restart.
     runtime: dict[str, Any] = {}
+    # Issue #124: the operator's stop/pause used to live only in this dict, so a
+    # restart silently resumed dispatching something a human had deliberately
+    # halted. Restore it from the durable copy.
+    if store.runtime.get_bool("operator_paused"):
+        runtime["global_paused"] = True
+        if store.runtime.get_bool("operator_stopped"):
+            runtime["stopped"] = True
 
     # Agent registry (issue #19): role -> address, persisted as JSON.
     # Seeded from the CLAMS__AGENTS__* settings so .env actually drives the
@@ -470,23 +487,30 @@ def create_app(settings: Optional[Settings] = None,
         # even if the bus is unavailable. The bus publish is best-effort after.
         if req.requirement_number is not None:
             if req.action == "pause":
-                store.work_items.set_paused(req.requirement_number, True)
+                store.work_items.set_paused_for_requirement(req.requirement_number, True)
             elif req.action == "resume":
-                store.work_items.set_paused(req.requirement_number, False)
+                store.work_items.set_paused_for_requirement(req.requirement_number, False)
         else:
-            # Global (no requirement scoped) control from the topbar.
+            # Global (no requirement scoped) control from the topbar. These must
+            # touch every project's rows: the old per-row loop passed the default
+            # project_id=0, so a "stop" paused nothing outside the legacy project
+            # and a "resume" could never undo a stop issued by the steering
+            # channel (which pauses all rows). The pipeline then sat at
+            # planned=0 dispatched=0 forever with no UI affordance to fix it.
             if req.action in ("pause", "stop"):
                 runtime["global_paused"] = True
+                store.runtime.set("operator_paused", "1")
                 if req.action == "stop":
                     runtime["stopped"] = True
+                    store.runtime.set("operator_stopped", "1")
                     # Pause every work item so the stop survives a state recompute.
-                    for it in store.work_items.all():
-                        store.work_items.set_paused(it.requirement_number, True)
+                    store.work_items.set_paused_all(True)
             elif req.action == "resume":
                 runtime["global_paused"] = False
                 runtime["stopped"] = False
-                for it in store.work_items.all():
-                    store.work_items.set_paused(it.requirement_number, False)
+                store.runtime.set("operator_paused", "0")
+                store.runtime.set("operator_stopped", "0")
+                store.work_items.set_paused_all(False)
 
         payload = {
             "action": req.action,
@@ -539,12 +563,36 @@ def create_app(settings: Optional[Settings] = None,
         return {"tasks": items}
 
     @app.get("/api/v1/alerts")
-    async def get_alerts(limit: int = 100, severity: Optional[str] = None):
+    async def get_alerts(limit: int = 100, severity: Optional[str] = None,
+                         acknowledged: Optional[bool] = None):
         rows = store.alerts.list_all(limit=limit)
         out = [dict(r) for r in rows]
         if severity:
             out = [r for r in out if r.get("severity") == severity]
+        if acknowledged is not None:
+            out = [r for r in out if bool(r.get("acknowledged")) == acknowledged]
         return {"alerts": out}
+
+    @app.delete("/api/v1/alerts")
+    async def purge_alerts(severity: Optional[str] = None,
+                           before: Optional[str] = None,
+                           acknowledged_only: bool = True):
+        """Delete alert rows out of the Activity feed.
+
+        Acknowledging only marks an alert read, so a resolved incident kept its
+        rows in the feed forever. Defaults to acknowledged rows only; pass
+        ``acknowledged_only=false`` to also drop untriaged ones.
+        """
+        if severity is not None and severity not in AlertRepo.SEVERITIES:
+            raise HTTPException(
+                status_code=422,
+                detail=f"invalid severity {severity!r}; "
+                       f"valid: {list(AlertRepo.SEVERITIES)}",
+            )
+        removed = store.alerts.purge(acknowledged_only=acknowledged_only,
+                                     severity=severity, before=before)
+        return {"ok": True, "removed": removed,
+                "remaining": store.alerts.count_all()}
 
     # ---- alert acknowledgement (issue #15 / §6.3) -------------------
     @app.post("/api/v1/alerts/ack")
@@ -576,19 +624,28 @@ def create_app(settings: Optional[Settings] = None,
         return {"ok": True, "id": alert_id,
                 "unacked_alerts": store.alerts.count_unacked()}
 
-    # ---- projects registry (issue #15 / §6.1) -----------------------
+    # ---- projects registry (issue #15 / #18) ------------------------
+    def _project_dict(row) -> dict:
+        d = dict(row)
+        d["updated"] = _relative_time(d.get("updated_at"))
+        d["paused"] = bool(d.get("paused", 0))
+        return d
+
     @app.get("/api/v1/projects")
     async def list_projects():
         rows = store.projects.all()
-        projects = []
-        for r in rows:
-            d = dict(r)
-            d["updated"] = _relative_time(d.get("updated_at"))
-            projects.append(d)
+        projects = [_project_dict(r) for r in rows]
         return {"projects": projects}
 
     @app.post("/api/v1/projects")
     async def create_project(body: ProjectCreate):
+        """Register a project AND provision its working tree (issue #18).
+
+        The clone is the point of the operation: a registered project must have
+        an addressable working tree the pipeline can operate on. If the clone
+        fails the registration is rolled back so the invariant holds and the
+        operator sees the error instead of a half-provisioned project.
+        """
         name = (body.name or "").strip()
         if not name:
             raise HTTPException(status_code=422, detail="Project name is required.")
@@ -599,15 +656,79 @@ def create_app(settings: Optional[Settings] = None,
         normalized, err = normalize_github_url(body.url)
         if err:
             raise HTTPException(status_code=422, detail=err)
-        if store.projects.url_exists(normalized):  # type: ignore[arg-type]
+        if store.projects.url_exists(normalized):
             raise HTTPException(
                 status_code=409,
                 detail="That repository is already registered.",
             )
-        row = store.projects.add(name=name, url=normalized)  # type: ignore[arg-type]
-        d = dict(row)
-        d["updated"] = _relative_time(d.get("updated_at"))
-        return {"ok": True, "project": d}
+        row = store.projects.add(name=name, url=normalized)
+        pid = int(row["id"])
+        try:
+            result = provision_project(
+                name, normalized, settings.paths.work_root,
+                project_id=pid, token=settings.github.token,
+            )
+        except ProvisionError as exc:
+            # Roll back: a registered project must have a working tree.
+            store.db.conn.execute("DELETE FROM projects WHERE id = ?", (pid,))
+            raise HTTPException(
+                status_code=502,
+                detail=f"Registered name but could not clone the repository: {exc}",
+            )
+        store.projects.set_worktree(pid, result.worktree_path, result.default_branch)
+        store.projects.clear_error(pid)
+        row = store.projects.get(pid)
+        return {"ok": True, "project": _project_dict(row)}
+
+    @app.post("/api/v1/projects/{project_id}/sync")
+    async def sync_project(project_id: int):
+        """Re-sync a project's working tree with origin (issue #18)."""
+        row = store.projects.get(project_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"project {project_id} not found")
+        worktree = row["worktree_path"]
+        if not worktree:
+            # Provision on demand for projects registered before #18.
+            try:
+                result = provision_project(
+                    row["name"], row["url"], settings.paths.work_root,
+                    project_id=project_id, token=settings.github.token,
+                )
+            except ProvisionError as exc:
+                store.projects.set_error(project_id, str(exc))
+                raise HTTPException(status_code=502, detail=str(exc))
+            store.projects.set_worktree(project_id, result.worktree_path,
+                                       result.default_branch)
+            store.projects.clear_error(project_id)
+            return {"ok": True, "project": _project_dict(store.projects.get(project_id))}
+        try:
+            sha = sync_repo(worktree, token=settings.github.token,
+                           branch=row["default_branch"])
+        except ProvisionError as exc:
+            store.projects.set_error(project_id, str(exc))
+            raise HTTPException(status_code=502, detail=str(exc))
+        store.projects.clear_error(project_id)
+        out = _project_dict(store.projects.get(project_id))
+        out["commit"] = sha[:12]
+        return {"ok": True, "project": out}
+
+    @app.post("/api/v1/projects/{project_id}/pause")
+    async def pause_project(project_id: int):
+        row = store.projects.get(project_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"project {project_id} not found")
+        store.projects.set_paused(project_id, True)
+        refresh_project_status(store, project_id)
+        return {"ok": True, "project": _project_dict(store.projects.get(project_id))}
+
+    @app.post("/api/v1/projects/{project_id}/resume")
+    async def resume_project(project_id: int):
+        row = store.projects.get(project_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"project {project_id} not found")
+        store.projects.set_paused(project_id, False)
+        refresh_project_status(store, project_id)
+        return {"ok": True, "project": _project_dict(store.projects.get(project_id))}
 
     # ---- SSE --------------------------------------------------------
     @app.get("/api/v1/events")
@@ -619,6 +740,19 @@ def create_app(settings: Optional[Settings] = None,
         """
         async def generate():
             yield _sse("connected", {"timestamp": _now_iso()})
+            # Start the tail at the CURRENT end of each stream. Reading from the
+            # beginning (the old behaviour) replayed every historical alert —
+            # including stale criticals days old — into the live feed on every
+            # page load. Seeding the cursor at the last id means only events
+            # published after this connection are forwarded.
+            try:
+                last_alert_id = await bus.last_id("clams:alerts")
+            except Exception:
+                last_alert_id = "0-0"
+            try:
+                last_result_id = await bus.last_id("clams:results")
+            except Exception:
+                last_result_id = "0-0"
             counter = 0
             while True:
                 if await request.is_disconnected():
@@ -633,9 +767,11 @@ def create_app(settings: Optional[Settings] = None,
                         "message": f"telemetry failed: {exc}",
                         "timestamp": _now_iso(),
                     })
-                # Drain any pending bus events without blocking the cadence.
+                # Forward only bus events that arrived since the last tick.
                 try:
-                    for evt in await _drain_bus(bus):
+                    evts, last_alert_id, last_result_id = await _drain_bus(
+                        bus, last_alert_id, last_result_id)
+                    for evt in evts:
                         yield _sse(evt["event"], evt["data"])
                 except Exception:
                     pass
@@ -738,11 +874,19 @@ def _sse(event: str, data: Any) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
-async def _drain_bus(bus) -> list[dict]:
-    """Non-blocking read of the alert + result streams for SSE forwarding."""
+async def _drain_bus(bus, last_alert_id: str = "0-0",
+                     last_result_id: str = "0-0") -> tuple[list[dict], str, str]:
+    """Tail the alert + result streams for SSE forwarding.
+
+    Reads only entries newer than the supplied cursors (never the whole stream)
+    and returns the updated cursors so the next call resumes where this one
+    stopped. The previous implementation used ``bus.drain`` (``XRANGE - +``),
+    which re-read every historical entry on every tick and replayed stale
+    alerts into the live feed.
+    """
     out: list[dict] = []
     try:
-        msgs = await bus.drain("clams:alerts")
+        msgs, last_alert_id = await bus.read_since("clams:alerts", last_alert_id)
         for m in msgs:
             out.append({"event": "logs:stream", "data": {
                 "level": (m.payload or {}).get("severity", "info")
@@ -755,7 +899,7 @@ async def _drain_bus(bus) -> list[dict]:
     except Exception:
         pass
     try:
-        msgs = await bus.drain("clams:results")
+        msgs, last_result_id = await bus.read_since("clams:results", last_result_id)
         for m in msgs:
             out.append({"event": "planner:reply", "data": {
                 "kind": "task_result", "payload": m.payload,
@@ -763,7 +907,7 @@ async def _drain_bus(bus) -> list[dict]:
             }})
     except Exception:
         pass
-    return out
+    return out, last_alert_id, last_result_id
 
 
 async def _send_planner_message(settings: Settings, msg: PlannerMessage,

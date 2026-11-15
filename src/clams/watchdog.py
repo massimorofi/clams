@@ -512,12 +512,18 @@ class WatchdogService:
         """Undo a dispatch pause the watchdog itself imposed.
 
         Only touches the flag it set: a pause an operator applied deliberately
-        is never silently cleared by a healthy sweep.
+        is never silently cleared by a healthy sweep (#124). The blanket
+        ``set_paused_all(False)`` used to resume an emergency stop the moment a
+        probe happened to pass.
         """
         if not self._paused_by_watchdog:
             return
         self._paused_by_watchdog = False
+        self.store.runtime.set("watchdog_paused", "0")
         self.store.work_items.set_paused_all(False)
+        if self.store.runtime.get_bool("operator_paused"):
+            # The operator stopped this pipeline; put every row back.
+            self.store.work_items.set_paused_all(True)
         # A transient dependency blip (a slow LLM engine, a hiccup) pauses
         # dispatching and then clears on its own. Leaving its criticals
         # unacknowledged kept the global badge in Error after recovery, so the
@@ -533,6 +539,7 @@ class WatchdogService:
         if not self._paused_by_watchdog:
             self.store.work_items.set_paused_all(True)
             self._paused_by_watchdog = True
+            self.store.runtime.set("watchdog_paused", "1")
         self.raise_alert(
             "critical", "watchdog",
             "Critical condition detected; dispatching paused. "

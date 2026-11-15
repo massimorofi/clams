@@ -95,6 +95,12 @@ CREATE TABLE IF NOT EXISTS projects (
   updated_at          TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS runtime_state (
+  key                 TEXT PRIMARY KEY,
+  value               TEXT NOT NULL,
+  updated_at          TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_work_items_status ON work_items(status);
 CREATE INDEX IF NOT EXISTS idx_work_items_gh_status ON work_items(gh_status);
 CREATE INDEX IF NOT EXISTS idx_task_claims_expiry ON task_claims(lease_expires_at);
@@ -686,6 +692,41 @@ class TaskClaimRepo:
         ).fetchall()
 
 
+class RuntimeStateRepo:
+    """Small key/value table for operator state that must survive a restart.
+
+    Issue #124: the global pause lived only in process memory, so a restart
+    silently resumed dispatching an operator had deliberately stopped, and the
+    watchdog could not tell its own pause from an operator's.
+    """
+
+    def __init__(self, db: Database):
+        self.db = db
+
+    def get(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        row = self.db.conn.execute(
+            "SELECT value FROM runtime_state WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else default
+
+    def get_bool(self, key: str, default: bool = False) -> bool:
+        row = self.db.conn.execute(
+            "SELECT value FROM runtime_state WHERE key = ?", (key,)).fetchone()
+        if row is None:
+            return default
+        return str(row["value"]).lower() in ("1", "true", "yes")
+
+    def set(self, key: str, value: Any) -> None:
+        self.db.conn.execute(
+            """INSERT INTO runtime_state (key, value, updated_at) VALUES (?, ?, ?)
+               ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+                                              updated_at = excluded.updated_at""",
+            (key, str(value), iso()),
+        )
+
+    def delete(self, key: str) -> None:
+        self.db.conn.execute("DELETE FROM runtime_state WHERE key = ?", (key,))
+
+
 class AlertRepo:
     """Single writer: Watchdog."""
 
@@ -972,6 +1013,7 @@ class Store:
     alerts: AlertRepo = field(init=False)
     outbox: OutboxRepo = field(init=False)
     projects: ProjectRepo = field(init=False)
+    runtime: RuntimeStateRepo = field(init=False)
 
     def __post_init__(self) -> None:
         self.work_items = WorkItemRepo(self.db)
@@ -979,6 +1021,7 @@ class Store:
         self.alerts = AlertRepo(self.db)
         self.outbox = OutboxRepo(self.db)
         self.projects = ProjectRepo(self.db)
+        self.runtime = RuntimeStateRepo(self.db)
 
     def migrate(self) -> None:
         self.db.migrate()
