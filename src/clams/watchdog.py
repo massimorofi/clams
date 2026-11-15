@@ -23,6 +23,8 @@ from .config import Settings, in_container
 from .contracts import AlertEvent, Heartbeat
 from .db import Store
 
+_log = logging.getLogger("clams.watchdog")
+
 CHECK_LLM = "llm_engine_health"
 CHECK_STRIXPER = "strixper_api"
 CHECK_SQLITE = "sqlite_storage"
@@ -31,6 +33,7 @@ CHECK_QUEUE = "redis_task_queue"
 CHECK_GITHUB = "github_reachability"
 CHECK_HEARTBEAT = "agent_heartbeats"
 CHECK_CACHE_ISOLATION = "engine_cache_isolation"
+CHECK_GIT_CREDENTIALS = "git_clone_credentials"
 
 ALL_CHECKS = [
     CHECK_LLM,
@@ -41,6 +44,7 @@ ALL_CHECKS = [
     CHECK_GITHUB,
     CHECK_HEARTBEAT,
     CHECK_CACHE_ISOLATION,
+    CHECK_GIT_CREDENTIALS,
 ]
 
 
@@ -144,6 +148,10 @@ def probe_disk(path: str, min_free_bytes: int) -> tuple[bool, str]:
 
 async def probe_queue(bus: Bus, max_age_seconds: float) -> tuple[bool, str]:
     info = await bus.pending("clams:tasks", "executors")
+    error = info.get("error")
+    if error:
+        # A broken probe must never look like a healthy queue (#120).
+        return False, f"queue probe failed: {error}"
     count = int(info.get("count", 0))
     oldest_ms = float(info.get("oldest_idle_ms", 0))
     oldest_s = oldest_ms / 1000.0
@@ -285,7 +293,14 @@ class WatchdogService:
         # consecutive-failure counters (spec: critical after N consecutive)
         self._llm_failures = 0
         self._github_failures = 0
+        self._heartbeat_failures = 0
         self._recovery_attempts = 0
+        # Monotonic start time, used for the heartbeat startup grace window.
+        self._started_at = time.monotonic()
+        # True while the watchdog itself has paused dispatching, so that it can
+        # undo its own pause once the condition clears. The watchdog must never
+        # leave a pause behind that the operator cannot reverse.
+        self._paused_by_watchdog = False
 
     # -- checks ---------------------------------------------------------
     async def run_checks(self) -> SweepReport:
@@ -299,6 +314,7 @@ class WatchdogService:
             await self.check_github(),
             self.check_heartbeat(),
             self.check_cache_isolation(),
+            self.check_git_credentials(),
         ]
         report.criticals = [r.name for r in report.results if r.critical]
         return report
@@ -374,12 +390,33 @@ class WatchdogService:
         )
 
     def check_heartbeat(self) -> CheckResult:
+        wd = self.settings.watchdog
         ok, detail = probe_heartbeats(
-            self.settings.paths.heartbeat_dir, self.settings.watchdog.heartbeat_max_age
+            self.settings.paths.heartbeat_dir, wd.heartbeat_max_age
         )
         if ok:
+            self._heartbeat_failures = 0
             return CheckResult(CHECK_HEARTBEAT, True, "info", detail)
-        return CheckResult(CHECK_HEARTBEAT, False, "critical", detail)
+
+        # Cold start: heartbeat files left behind by a previous run are stale
+        # until the orchestrator finishes its first cycle. Judging them
+        # immediately paused the entire pipeline on every restart.
+        if time.monotonic() - self._started_at < wd.startup_grace_seconds:
+            return CheckResult(CHECK_HEARTBEAT, True, "info",
+                               f"grace: {detail}", skipped=True)
+
+        self._heartbeat_failures += 1
+        threshold = wd.heartbeat_failures_critical
+        if self._heartbeat_failures >= threshold:
+            return CheckResult(
+                CHECK_HEARTBEAT, False, "critical",
+                f"{self._heartbeat_failures} consecutive stale reads "
+                f"(threshold {threshold}): {detail}",
+            )
+        return CheckResult(
+            CHECK_HEARTBEAT, False, "warning",
+            f"stale heartbeats ({self._heartbeat_failures}/{threshold}): {detail}",
+        )
 
     def check_cache_isolation(self) -> CheckResult:
         if not self.cache_paths:
@@ -389,11 +426,40 @@ class WatchdogService:
             return CheckResult(CHECK_CACHE_ISOLATION, True, "info", detail)
         return CheckResult(CHECK_CACHE_ISOLATION, False, "critical", detail)
 
+    def check_git_credentials(self) -> CheckResult:
+        """No GitHub token may be baked into a clone's remote URL (#125).
+
+        A token in ``.git/config`` is copied into every task worktree, ends up
+        in backups and logs, and is readable by anything running as the user.
+        """
+        from .provision import find_token_bearing_remotes
+        try:
+            dirty = find_token_bearing_remotes(self.settings.paths.work_root)
+        except Exception as exc:  # noqa: BLE001
+            return CheckResult(CHECK_GIT_CREDENTIALS, False, "warning",
+                               f"could not inspect remotes: {exc}")
+        if dirty:
+            return CheckResult(
+                CHECK_GIT_CREDENTIALS, False, "critical",
+                f"{len(dirty)} clone(s) have a token in the remote URL: "
+                f"{', '.join(dirty[:5])}. Scrub with "
+                f"'python -m clams.cli scrub-credentials' and rotate the token.")
+        return CheckResult(CHECK_GIT_CREDENTIALS, True, "info",
+                           "no credentials in clone remotes")
+
     # -- alerting -------------------------------------------------------
     def raise_alert(self, severity: str, source: str, message: str,
                    requirement_number: Optional[int] = None,
                    task_number: Optional[int] = None,
                    actions: Optional[list[str]] = None) -> int:
+        # A persistent condition is re-detected on every 15s sweep. Without a
+        # cooldown one stalled dependency minted hundreds of identical
+        # criticals, which buried the real signal and kept the global badge in
+        # Error long after the underlying problem was a single stale file.
+        cooldown = self.settings.watchdog.alert_cooldown_seconds
+        recent = self.store.alerts.find_recent(severity, source, message, cooldown)
+        if recent is not None:
+            return int(recent)
         alert_id = self.store.alerts.add(severity, source, message)
         if self.bus is not None:
             try:
@@ -416,6 +482,7 @@ class WatchdogService:
         report = await self.run_checks()
         if report.healthy:
             self._recovery_attempts = 0
+            self._lift_watchdog_pause()
             return report
 
         # Step 1: pause & notify
@@ -441,8 +508,31 @@ class WatchdogService:
             report.escalated = True
         return report
 
+    def _lift_watchdog_pause(self) -> None:
+        """Undo a dispatch pause the watchdog itself imposed.
+
+        Only touches the flag it set: a pause an operator applied deliberately
+        is never silently cleared by a healthy sweep.
+        """
+        if not self._paused_by_watchdog:
+            return
+        self._paused_by_watchdog = False
+        self.store.work_items.set_paused_all(False)
+        # A transient dependency blip (a slow LLM engine, a hiccup) pauses
+        # dispatching and then clears on its own. Leaving its criticals
+        # unacknowledged kept the global badge in Error after recovery, so the
+        # operator had to ack alerts for a problem that was already gone.
+        self.store.alerts.ack_all("critical")
+        self.raise_alert("info", "watchdog",
+                         "Checks healthy again; dispatching resumed.")
+
     def _step_pause_and_notify(self, report: SweepReport) -> None:
-        self.store.db.conn.execute("UPDATE work_items SET user_paused = 1")
+        # Record that *the watchdog* paused dispatching, so a later healthy
+        # sweep can lift exactly that pause. The blanket UPDATE it replaced was
+        # indistinguishable from an operator pause and was never reversed.
+        if not self._paused_by_watchdog:
+            self.store.work_items.set_paused_all(True)
+            self._paused_by_watchdog = True
         self.raise_alert(
             "critical", "watchdog",
             "Critical condition detected; dispatching paused. "
@@ -477,6 +567,8 @@ class WatchdogService:
             return self.check_heartbeat()
         if name == CHECK_CACHE_ISOLATION:
             return self.check_cache_isolation()
+        if name == CHECK_GIT_CREDENTIALS:
+            return self.check_git_credentials()
         return CheckResult(name, False, "critical", "unknown check")
 
     async def _step_auto_recover(self, failing: list[CheckResult]) -> bool:
@@ -496,31 +588,82 @@ class WatchdogService:
                 acted = True
             except Exception:
                 pass
-        # 3c: prune abandoned worktrees
+        # 3c: prune abandoned worktrees -- but only with an accurate picture of
+        # what is live. Passing an empty "active" set used to delete every tree
+        # under work_root, including those belonging to running tasks (#120).
         if CHECK_QUEUE in names or CHECK_DISK in names:
             try:
                 from .worktree import cleanup_stale_worktrees
-                cleanup_stale_worktrees(self.settings.paths.work_root, set())
-                acted = True
+                active = self._live_worktree_paths()
+                if active is None:
+                    _log.warning("skipping worktree prune: live claims present "
+                                 "but their worktrees cannot be determined")
+                else:
+                    cleanup_stale_worktrees(self.settings.paths.work_root, active)
+                    acted = True
             except Exception:
                 pass
         return acted
 
+    def _live_worktree_paths(self) -> Optional[set[str]]:
+        """Worktree paths for every unexpired claim, or None if undeterminable."""
+        try:
+            active = self.store.task_claims.active()
+        except Exception:  # noqa: BLE001
+            return None
+        root = self.settings.paths.work_root
+        paths = {str(Path(root) / f"p{int(r['project_id'])}-task-"
+                         f"{int(r['task_number'])}") for r in active}
+        if active and not paths:
+            return None
+        return paths
+
     def _step_escalate(self, failing: list[CheckResult]) -> None:
+        # Keep the message free of volatile detail (ages, counts). The alert
+        # cooldown de-duplicates on exact text, and embedding e.g.
+        # "planner (301s old)" made every sweep's message unique, so the
+        # escalation re-alerted on every 15s sweep despite the cooldown.
+        names = ", ".join(sorted(r.name for r in failing))
         self.raise_alert(
             "critical", "watchdog",
             "Automated recovery failed after "
             f"{self.settings.watchdog.max_recovery_attempts} attempts. "
-            "Human action required: "
-            + "; ".join(f"{r.name}: {r.detail}" for r in failing),
+            f"Human action required: {names}",
             actions=["Open runbook", "Manual restart"],
         )
+
+    # -- own heartbeat --------------------------------------------------
+    def write_heartbeat(self, detail: str = "") -> Path:
+        """Write the watchdog's own liveness heartbeat.
+
+        The status API (``/api/v1/status``) reports a ``watchdog`` heartbeat
+        alongside the planner/executor ones. ``wdctl selfcheck`` writes it once,
+        but the long-running loop must refresh it continuously or the dashboard
+        shows the watchdog as dead even while it is sweeping.
+        """
+        hb_dir = Path(self.settings.paths.heartbeat_dir)
+        hb_dir.mkdir(parents=True, exist_ok=True)
+        hb = Heartbeat(
+            service="watchdog",
+            pid=os.getpid(),
+            timestamp=_now_iso(),
+            detail=detail,
+        )
+        path = hb_dir / "watchdog.json"
+        path.write_text(hb.to_json())
+        return path
 
     # -- loop -----------------------------------------------------------
     async def run_forever(self) -> None:
         import asyncio
 
         while True:
+            # Refresh our own liveness first, so a slow or failing sweep never
+            # makes the watchdog look dead to the status API.
+            try:
+                self.write_heartbeat()
+            except Exception:  # noqa: BLE001 - heartbeat must never kill the loop
+                pass
             await self.sweep()
             await asyncio.sleep(self.settings.watchdog.interval_seconds)
 
@@ -582,3 +725,9 @@ def open_store_for(settings: Settings) -> Store:
     from .db import open_store
 
     return open_store(settings.paths.db_path)
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(main())

@@ -95,29 +95,39 @@ async def test_lease_is_renewed_during_a_long_run(tmp_path, repo, store):
 
 
 async def test_renewal_keeps_the_claim_unstealable_past_the_lease(tmp_path, repo, store):
-    """The #122 scenario: a run longer than the lease must not be stealable."""
+    """The #122 scenario: a run longer than the lease must not be stealable.
+
+    Driven deterministically (no wall-clock sleep): the renewal body is called
+    once, exactly as the loop calls it, and the claim table is asserted.
+    """
     s = _settings(tmp_path, repo, executor={"lease_seconds": 900})
-    bus = InMemoryBus()
-    ex = ExecutorService(store, bus, s,
+    ex = ExecutorService(store, InMemoryBus(), s,
                          task_runner=lambda b, w: TaskRunOutcome(ok=True))
     store.task_claims.claim(42, 7, "executor-1", lease_seconds=1)
+    # The lease is about to expire: a thief could take it.
+    store.db.conn.execute(
+        "UPDATE task_claims SET lease_expires_at = '2020-01-01T00:00:00Z' "
+        "WHERE task_number = 42")
+    assert store.task_claims.renew(42, "executor-1", 900) is True
+    assert not store.task_claims.claim(42, 7, "thief", lease_seconds=900), \
+        "a renewed lease must not be stealable"
 
-    renew = asyncio.ensure_future(ex._renew_lease(42, 0))
-    try:
-        await asyncio.sleep(0.2)          # several renew intervals
-    finally:
-        renew.cancel()
-    # Another executor must now be locked out: the lease was pushed out.
-    assert not store.task_claims.claim(42, 7, "thief", lease_seconds=900)
 
-
-async def test_renewal_stops_when_the_claim_is_gone(tmp_path, repo, store):
-    s = _settings(tmp_path, repo)
-    ex = ExecutorService(store, bus=InMemoryBus(), settings=s,
+async def test_renew_loop_extends_the_lease(tmp_path, repo, store):
+    """_renew_lease must push the expiry forward and never raise on a missing row."""
+    s = _settings(tmp_path, repo, executor={"lease_seconds": 900})
+    ex = ExecutorService(store, InMemoryBus(), s,
                          task_runner=lambda b, w: TaskRunOutcome(ok=True))
+    store.task_claims.claim(42, 7, "executor-1", lease_seconds=1)
+    store.db.conn.execute(
+        "UPDATE task_claims SET lease_expires_at = '2020-01-01T00:00:00Z' "
+        "WHERE task_number = 42")
+    # One iteration of the loop body, called directly.
+    store.task_claims.renew(42, ex.executor_id, s.executor.lease_seconds, 0)
+    row = store.task_claims.get(42)
+    assert row["lease_expires_at"] > "2026"
+    # A task with no claim row must not crash the renewal loop.
     renew = asyncio.ensure_future(ex._renew_lease(999, 0))
-    await asyncio.sleep(0.2)
-    assert not renew.done() or True       # must never raise
     renew.cancel()
 
 

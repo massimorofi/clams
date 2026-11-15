@@ -44,14 +44,40 @@ def cmd_intake(args) -> int:
     s = _settings()
     store = open_store(s.paths.db_path)
     from .gh import GitHubClient
-    from .intake import IntakeService
+    from .intake import IntakeService, IntakeResult
+    from .project_setup import ensure_default_project, parse_owner_repo
 
-    gh = GitHubClient(s.github.owner, s.github.repo, s.github.token, s.github.api_base)
-    svc = IntakeService(store, gh, s)
-    result = asyncio.run(svc.sweep())
-    print(result.summary())
+    # The configured repo is the default project; every other registered project
+    # is polled too (issue #18), so `clams intake` matches what `clams watch`
+    # feeds the pipeline.
+    default_project_id = ensure_default_project(store, s)
+    gh = GitHubClient(s.github.owner, s.github.repo, s.github.token,
+                     s.github.api_base)
+    services = [IntakeService(store, gh, s, project_id=default_project_id)]
+    for row in store.projects.all():
+        pid = int(row["id"])
+        if pid == default_project_id:
+            continue
+        try:
+            owner, repo = parse_owner_repo(row["url"])
+        except ValueError:
+            continue
+        services.append(IntakeService(
+            store,
+            GitHubClient(owner, repo, s.github.token, s.github.api_base),
+            s, project_id=pid))
+
+    total = IntakeResult()
+    for svc in services:
+        result = asyncio.run(svc.sweep())
+        print(f"  project {svc.project_id}: {result.summary()}")
+        total.scanned += result.scanned
+        total.claimed.extend(result.claimed)
+        total.skipped.extend(result.skipped)
+        total.failed.extend(result.failed)
+    print(total.summary())
     store.db.close()
-    return 0 if not result.failed else 1
+    return 0 if not total.failed else 1
 
 
 def cmd_plan(args) -> int:
@@ -62,13 +88,17 @@ def cmd_plan(args) -> int:
     from .claudio_client import ClaudioClient
 
     gh = GitHubClient(s.github.owner, s.github.repo, s.github.token, s.github.api_base)
-    claudio = ClaudioClient(s.planner.base_url, s.planner.auth_token,
-                           s.planner.request_timeout)
+    # Planning and review judgement are single, structured completions. Use the
+    # direct OpenAI-compatible LLM (fast, deterministic) rather than the agentic
+    # Claudio chat, which spins up tool use over multiple turns and times out on
+    # a plain decomposition request (issue #18 planning step).
+    from .llm import make_planner_llm
+    llm = make_planner_llm(s)
+    from .project_setup import ensure_default_project
+    default_project_id = ensure_default_project(store, s)
 
-    def llm(prompt: str) -> str:
-        return asyncio.run(claudio.chat(prompt)).final_output
-
-    svc = PlannerService(store, gh, s, llm_call=llm)
+    svc = PlannerService(store, gh, s, llm_call=llm,
+                        project_id=default_project_id)
     plan, tasks = asyncio.run(svc.plan_requirement(args.requirement))
     print(f"requirement #{args.requirement} planned into {len(tasks)} task(s): {tasks}")
     store.db.close()
@@ -94,6 +124,7 @@ def _orchestrator(s: Settings, store, bus):
     from .intake import IntakeService
     from .planner import PlannerService
     from .projects import board_from_settings
+    from .project_setup import build_project_contexts, ensure_default_project
     from .review import ReviewService
     from .steering import SteeringService
     from .claudio_client import ClaudioClient
@@ -103,21 +134,35 @@ def _orchestrator(s: Settings, store, bus):
     # cannot drive must stop startup, not fail per-item mid-run.
     board = asyncio.run(board_from_settings(s))
 
+    # Multi-project (issue #18): the configured repo is the *default project*.
+    # Establish its id first so the intake and steering bind to it, then build
+    # a context for every other registered project.
+    default_project_id = ensure_default_project(store, s)
+
     gh = GitHubClient(s.github.owner, s.github.repo, s.github.token,
                      s.github.api_base, board=board)
-    claudio = ClaudioClient(s.planner.base_url, s.planner.auth_token,
-                           s.planner.request_timeout)
+    # Planning and review judgement are single, structured completions. Use the
+    # direct OpenAI-compatible LLM (fast, deterministic) rather than the agentic
+    # Claudio chat, which spins up tool use over multiple turns and times out on
+    # a plain decomposition request (issue #18 planning step).
+    from .llm import make_planner_llm
+    llm = make_planner_llm(s)
 
-    def llm(prompt: str) -> str:
-        return asyncio.run(claudio.chat(prompt)).final_output
-
-    planner = PlannerService(store, gh, s, llm_call=llm)
-    intake = IntakeService(store, gh, s)
+    planner = PlannerService(store, gh, s, llm_call=llm,
+                            project_id=default_project_id)
+    intake = IntakeService(store, gh, s, project_id=default_project_id)
     review = ReviewService(store, gh, s,
-                          judge=planner.judge_review if planner else None)
-    steering = SteeringService(store, s, gh=gh, planner=planner, intake=intake)
+                          judge=planner.judge_review if planner else None,
+                          project_id=default_project_id)
+    steering = SteeringService(store, s, gh=gh, planner=planner, intake=intake,
+                              project_id=default_project_id)
+
+    contexts = build_project_contexts(store, s, llm)
+
     return Orchestrator(store, bus, s, gh=gh, planner=planner, intake=intake,
-                       steering=steering, review=review)
+                       steering=steering, review=review,
+                       project_contexts=contexts,
+                       default_project_id=default_project_id)
 
 
 def cmd_execute(args) -> int:
@@ -133,7 +178,9 @@ def cmd_execute(args) -> int:
     from .gh import GitHubClient
     gh = GitHubClient(s.github.owner, s.github.repo, s.github.token, s.github.api_base)
     svc = ExecutorService(store, bus, s,
-                          task_runner=ClaudioTaskRunner(claudio), gh=gh,
+                          task_runner=ClaudioTaskRunner(
+                              claudio, approval_mode=s.executor.approval_mode),
+                          gh=gh,
                           executor_id=s.executor.executor_id)
     result = asyncio.run(svc.run_once())
     print(json.dumps(json.loads(result.to_json()), indent=2) if result else "no task")
@@ -163,7 +210,9 @@ def cmd_worker(args) -> int:
                            s.executor.request_timeout)
     gh = GitHubClient(s.github.owner, s.github.repo, s.github.token, s.github.api_base)
     svc = ExecutorService(store, bus, s,
-                         task_runner=ClaudioTaskRunner(claudio), gh=gh,
+                         task_runner=ClaudioTaskRunner(
+                             claudio, approval_mode=s.executor.approval_mode),
+                         gh=gh,
                          executor_id=s.executor.executor_id)
     print(f"clams executor daemon running (id={s.executor.executor_id})", flush=True)
     log.info("executor daemon started: agent=%s db=%s",
@@ -183,11 +232,31 @@ def cmd_review(args) -> int:
     from .review import ReviewService
 
     gh = GitHubClient(s.github.owner, s.github.repo, s.github.token, s.github.api_base)
-    svc = ReviewService(store, gh, s)
+    from .project_setup import ensure_default_project
+    default_project_id = ensure_default_project(store, s)
+    svc = ReviewService(store, gh, s, project_id=default_project_id)
     verdict = asyncio.run(svc.review_requirement(args.requirement))
     print(verdict.summary())
     store.db.close()
     return 0 if verdict.passed else 1
+
+
+def cmd_clear_alerts(args) -> int:
+    """Delete alert rows from the Activity feed.
+
+    Acknowledging an alert only marks it read; the row stays in the feed, so a
+    resolved incident (a watchdog storm, a burst of misrouted outbox failures)
+    clutters Activity indefinitely. This actually removes them.
+    """
+    s = _settings()
+    store = open_store(s.paths.db_path)
+    before = store.alerts.count_all()
+    removed = store.alerts.purge(acknowledged_only=not args.include_unacked,
+                                 severity=args.severity, before=args.before)
+    print(f"removed {removed} alert(s) ({before} -> "
+          f"{store.alerts.count_all()} remaining)")
+    store.db.close()
+    return 0
 
 
 def cmd_watch(args) -> int:
@@ -222,6 +291,25 @@ def cmd_status(args) -> int:
     print(f"unacked alerts       : {len(alerts)}")
     for it in items:
         print(f"  #{it.requirement_number} [{it.status}] {it.requirement_title}")
+    return 0
+
+
+def cmd_scrub_credentials(args) -> int:
+    """Rewrite any clone whose origin still embeds a token (issue #125)."""
+    s = _settings()
+    from .provision import find_token_bearing_remotes, scrub_remote_tokens
+    dirty = find_token_bearing_remotes(s.paths.work_root)
+    if dirty:
+        print(f"{len(dirty)} clone(s) have credentials in the remote URL:")
+        for d in dirty:
+            print(f"  {d}")
+    fixed = scrub_remote_tokens(s.paths.work_root)
+    for f in fixed:
+        print(f"  scrubbed {f}")
+    if not dirty and not fixed:
+        print("no token-bearing remotes found")
+    print("NOTE: any token that was written to disk must be rotated in GitHub; "
+          "scrubbing the file does not un-leak it.")
     return 0
 
 
@@ -312,6 +400,16 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("watch", help="run the orchestrator loop")
     sub.add_parser("status", help="show orchestrator status")
     sub.add_parser("doctor", help="run the health check matrix once")
+    sub.add_parser("scrub-credentials",
+                   help="strip tokens out of provisioned clone remote URLs (#125)")
+    ca = sub.add_parser("clear-alerts",
+                        help="delete alert rows from the Activity feed")
+    ca.add_argument("--severity", default=None,
+                    help="only this severity (info | warning | critical)")
+    ca.add_argument("--before", default=None,
+                    help="only alerts created before this ISO timestamp")
+    ca.add_argument("--include-unacked", action="store_true",
+                    help="also delete alerts nobody has acknowledged")
     sv = sub.add_parser("serve", help="run the HTTP + SSE backend for the web UI")
     sv.add_argument("--host", default=None, help="bind address (default 0.0.0.0)")
     sv.add_argument("--port", type=int, default=None, help="bind port (default 8200)")
@@ -334,6 +432,8 @@ HANDLERS = {
     "watch": cmd_watch,
     "status": cmd_status,
     "doctor": cmd_doctor,
+    "scrub-credentials": cmd_scrub_credentials,
+    "clear-alerts": cmd_clear_alerts,
     "healthcheck": cmd_healthcheck,
     "serve": cmd_serve,
 }
