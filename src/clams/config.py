@@ -193,6 +193,12 @@ class ExecutorSettings(BaseSettings):
     # below watchdog.heartbeat_max_age or the watchdog flags a live executor.
     heartbeat_interval: float = 20.0
     poll_interval: float = 1.0
+    # Claudio pauses any tool call that needs approval and answers the
+    # non-streaming /chat endpoint with 409 approval_required. Nobody is
+    # watching an unattended executor, so that pause is a permanent failure:
+    # every task was claimed, conflicted, and released unused. "off" makes the
+    # agent find a way without asking, which is what a headless runner needs.
+    approval_mode: str = "off"
 
 
 class LlmSettings(BaseSettings):
@@ -245,6 +251,10 @@ class Limits(BaseSettings):
     max_turns: int = 40
     max_wall_seconds: int = 1800
     max_replans: int = 3
+    # Extra slack before a task with no claim row at all is considered lost
+    # (#117). A claimed task is judged by its own lease; this only covers the
+    # window between "dispatched" and "claimed".
+    stale_task_grace_seconds: int = 300
     # HW-1 / HW-2 compute resource ceilings
     max_compute_queues: int = 8
     max_concurrent_engines: int = 2
@@ -292,12 +302,29 @@ class WatchdogSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="CLAMS__WATCHDOG__", extra="ignore")
 
     interval_seconds: float = 15.0
-    heartbeat_max_age: float = 60.0
+    # A single orchestrator cycle can legitimately take minutes: planning and
+    # the review gate make real LLM calls. At the old 60s a busy-but-healthy
+    # cycle was declared dead and the watchdog paused dispatching, so the
+    # threshold has to sit above the worst-case cycle, not below it.
+    heartbeat_max_age: float = 300.0
     disk_min_free_bytes: int = 2 * 1024 * 1024 * 1024
     queue_max_pending_age: float = 15 * 60.0
     llm_probe_timeout: float = 5.0
     llm_failures_critical: int = 3
     github_failures_critical: int = 3
+    # Heartbeats get the same consecutive-failure treatment as the LLM and
+    # GitHub probes. A daemon that is mid-restart legitimately leaves a stale
+    # file behind for a few seconds; going critical on the first read meant a
+    # routine restart paused the whole pipeline.
+    heartbeat_failures_critical: int = 3
+    # Don't judge heartbeats until this much time has elapsed since the watchdog
+    # started, so leftover files from a previous run cannot trip it before the
+    # orchestrator has completed its first cycle.
+    startup_grace_seconds: float = 120.0
+    # Identical unacked alerts inside this window are collapsed instead of
+    # re-inserted, so a persistent condition cannot mint a new critical every
+    # 15 seconds.
+    alert_cooldown_seconds: float = 900.0
     max_recovery_attempts: int = 3
 
 
