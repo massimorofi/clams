@@ -35,11 +35,26 @@ class OutboxWorker:
     MAX_ATTEMPTS = 3
 
     def __init__(self, store: Store, gh=None, settings: Optional[Settings] = None,
-                 notifier: Optional[Callable[[dict], Any]] = None):
+                 notifier: Optional[Callable[[dict], Any]] = None,
+                 gh_resolver: Optional[Callable[[int], Any]] = None):
         self.store = store
         self.gh = gh
         self.settings = settings or Settings()
         self.notifier = notifier
+        # Multi-project (issue #18): a side-effect queued for project P must be
+        # applied with P's GitHub client, not the default repo's. ``gh_resolver``
+        # maps project_id -> client; when absent every row uses ``self.gh``
+        # (the single-repo behaviour).
+        self.gh_resolver = gh_resolver
+
+    def _client_for(self, payload: dict):
+        if self.gh_resolver is None:
+            return self.gh
+        try:
+            pid = int(payload.get("project_id", 0) or 0)
+        except (TypeError, ValueError):
+            pid = 0
+        return self.gh_resolver(pid) or self.gh
 
     async def deliver_once(self) -> DeliveryReport:
         """Claim and deliver all currently pending outbox rows."""
@@ -73,16 +88,20 @@ class OutboxWorker:
         kind = row["kind"]
         payload = json.loads(row["payload"])
         if kind == "gh_comment":
-            if self.gh is None:
+            gh = self._client_for(payload)
+            if gh is None:
                 raise RuntimeError("no github client configured")
-            await self.gh.add_comment(int(payload["issue"]), payload["body"])
+            await gh.add_comment(int(payload["issue"]), payload["body"])
         elif kind == "gh_status":
-            if self.gh is None:
+            gh = self._client_for(payload)
+            if gh is None:
                 raise RuntimeError("no github client configured")
-            await self.gh.set_status(int(payload["issue"]), payload["status"])
+            await gh.set_status(int(payload["issue"]), payload["status"])
         elif kind == "notification":
             if self.notifier is None:
-                raise RuntimeError("no notifier configured")
+                # Nothing to notify: treat as delivered so the row does not
+                # burn retries and raise a spurious watchdog alert.
+                return
             result = self.notifier(payload)
             import inspect
             if inspect.isawaitable(result):

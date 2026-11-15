@@ -32,6 +32,10 @@ class GitRef(BaseModel):
     base_branch: str = "main"
     base_sha: str = ""
     work_branch: str = ""
+    # Absolute path to the project working tree the task branches from
+    # (issue #18). Empty means "use the process default" (settings.paths.repo_path),
+    # which keeps single-repo briefs valid.
+    repo_path: str = ""
 
 
 class TaskLimits(BaseModel):
@@ -61,6 +65,9 @@ class TaskBrief(BaseModel):
     scope: Scope = Field(default_factory=Scope)
     git: GitRef = Field(default_factory=GitRef)
     limits: TaskLimits = Field(default_factory=TaskLimits)
+    # The project this task belongs to (issue #18). Echoed back on the result so
+    # the review step can route to the right project's services.
+    project_id: int = 0
 
     @field_validator("task_issue", "requirement_issue")
     @classmethod
@@ -119,6 +126,8 @@ class ExecutionResult(BaseModel):
     evidence: Evidence = Field(default_factory=Evidence)
     artifact_delta: ArtifactDelta = Field(default_factory=ArtifactDelta)
     environment_state: EnvironmentState = Field(default_factory=EnvironmentState)
+    # Project the task belonged to, echoed from the brief (issue #18).
+    project_id: int = 0
 
     def to_json(self) -> str:
         return self.model_dump_json(by_alias=True)

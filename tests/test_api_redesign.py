@@ -2,6 +2,8 @@
 acknowledgement, and the global stop action."""
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -9,15 +11,32 @@ from clams.api import create_app, normalize_github_url
 from clams.bus import InMemoryBus
 from clams.config import Settings
 from clams.db import open_store
+from clams.provision import ProvisionResult
+
+
+def _fake_provision(name, url, work_root, *, project_id, token=None,
+                   timeout=300.0):
+    """Stand in for the real clone so API tests don't hit the network.
+
+    The clone itself is covered in test_provision.py; here we only care that
+    the registration contract (validation, duplicate check, response shape)
+    holds.
+    """
+    path = Path(work_root) / "projects" / f"{name}-{project_id}"
+    path.mkdir(parents=True, exist_ok=True)
+    return ProvisionResult(worktree_path=str(path), default_branch="main",
+                          cloned=True)
 
 
 @pytest.fixture()
-def client(tmp_path):
+def client(tmp_path, monkeypatch):
     s = Settings()
     s.paths.db_path = str(tmp_path / "t.db")
     s.paths.data_dir = str(tmp_path)
+    s.paths.work_root = str(tmp_path / "work")
     s.paths.heartbeat_dir = str(tmp_path / "hb")
     (tmp_path / "hb").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr("clams.api.provision_project", _fake_provision)
     bus = InMemoryBus()
     app = create_app(s, bus=bus)
     with TestClient(app) as c:

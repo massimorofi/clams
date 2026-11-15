@@ -37,11 +37,17 @@ class PlannerService:
         gh: GitHubClient,
         settings: Settings,
         llm_call: Callable[[str], str],
+        project_id: int = 0,
     ):
         self.store = store
         self.gh = gh
         self.settings = settings
         self.llm_call = llm_call
+        # The project whose work_items this planner writes to (issue #18).
+        # Work items are keyed by the composite (project_id, requirement_number),
+        # so planning must target the same bucket intake claimed the item into --
+        # otherwise the plan lands on project 0 and dispatch never sees it.
+        self.project_id = project_id
 
     # -- planning --------------------------------------------------------
     async def plan_requirement(
@@ -64,7 +70,8 @@ class PlannerService:
             base_branch=base_branch, base_sha=base_sha,
         )
         self.store.work_items.set_plan(
-            requirement_number, plan.to_json(), task_numbers
+            requirement_number, plan.to_json(), task_numbers,
+            project_id=self.project_id,
         )
         return plan, task_numbers
 
@@ -78,7 +85,7 @@ class PlannerService:
         base_sha: str = "",
     ) -> tuple[Plan, list[int]]:
         """Re-plan a requirement, enforcing the ``max_replans`` cap."""
-        item = self.store.work_items.get(requirement_number)
+        item = self.store.work_items.get(requirement_number, self.project_id)
         if item is None:
             raise PlanningError(f"requirement #{requirement_number} is not tracked")
         if item.replans >= self.settings.limits.max_replans:
@@ -87,7 +94,8 @@ class PlannerService:
                 f"{item.replans} time(s); max_replans="
                 f"{self.settings.limits.max_replans}"
             )
-        self.store.work_items.increment_replans(requirement_number)
+        self.store.work_items.increment_replans(requirement_number,
+                                               self.project_id)
         return await self.plan_requirement(
             requirement_number, title=title, body=body,
             base_branch=base_branch, base_sha=base_sha,
@@ -122,14 +130,15 @@ class PlannerService:
             f"## Acceptance criteria (updated by planner)\n{new_criteria}\n"
         )
         await self.gh.update_issue(requirement_number, body=new_body)
-        item = self.store.work_items.get(requirement_number)
+        item = self.store.work_items.get(requirement_number, self.project_id)
         if item is not None:
             payload = json.loads(item.plan_json) if item.plan_json else {"tasks": []}
             payload["acceptance_criteria"] = new_criteria
             payload["criteria_stale"] = True
             self.store.db.conn.execute(
-                "UPDATE work_items SET plan_json = ?, updated_at = ? WHERE requirement_number = ?",
-                (json.dumps(payload), _now(), requirement_number),
+                "UPDATE work_items SET plan_json = ?, updated_at = ? "
+                "WHERE project_id = ? AND requirement_number = ?",
+                (json.dumps(payload), _now(), self.project_id, requirement_number),
             )
 
 

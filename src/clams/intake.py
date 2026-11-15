@@ -7,12 +7,26 @@ the transactional outbox — never calling GitHub inside the claim transaction.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from .config import Settings
 from .db import Store, WorkItem
 from .gh import GitHubClient, GitHubError, STATUS_IN_PROGRESS, STATUS_READY
+
+# A planner-generated task sub-issue is marked either by the native sub-issue
+# link (invisible to REST) or, as the durable fallback, by a ``parent-<n>``
+# label and a ``Parent: #<n>`` body line written by decompose._child_body.
+_PARENT_LABEL = re.compile(r"^parent-\d+$")
+_PARENT_BODY = re.compile(r"^\s*Parent:\s*#\d+")
+
+
+def _is_task_subissue(issue) -> bool:
+    """True if ``issue`` is a Clams task rather than a top-level requirement."""
+    if any(_PARENT_LABEL.match(l) for l in getattr(issue, "labels", []) or []):
+        return True
+    return bool(_PARENT_BODY.match(getattr(issue, "body", "") or ""))
 
 
 class IntakeError(Exception):
@@ -34,10 +48,15 @@ class IntakeResult:
 
 
 class IntakeService:
-    def __init__(self, store: Store, gh: GitHubClient, settings: Settings):
+    def __init__(self, store: Store, gh: GitHubClient, settings: Settings,
+                 project_id: int = 0):
         self.store = store
         self.gh = gh
         self.settings = settings
+        # The project this intake feeds. Single-repo deployments leave it at 0;
+        # multi-project (issue #18) passes the registered project's id so the
+        # claimed work items are bound to the right project.
+        self.project_id = project_id
 
     async def sweep(self) -> IntakeResult:
         """Find ``status:Ready`` issues and claim the ones we do not already track."""
@@ -52,6 +71,11 @@ class IntakeService:
         result.scanned = len(issues)
         for issue in issues:
             number = issue.number
+            if _is_task_subissue(issue):
+                # A planner-generated task, not a requirement: claiming it would
+                # decompose a task into sub-tasks and flood the repo (issue #18).
+                result.skipped.append(number)
+                continue
             if await self._already_tracked(number):
                 result.skipped.append(number)
                 continue
@@ -67,7 +91,7 @@ class IntakeService:
         return result
 
     async def _already_tracked(self, number: int) -> bool:
-        return self.store.work_items.exists(number)
+        return self.store.work_items.exists(number, self.project_id)
 
     async def claim(self, requirement_number: int, title: str, gh_updated_at: str) -> bool:
         """Atomically take ownership of one requirement.
@@ -77,7 +101,8 @@ class IntakeService:
         transaction, so they are never lost and never applied before the claim.
         """
         won = self.store.work_items.claim_requirement(
-            requirement_number, title, gh_updated_at or _now()
+            requirement_number, title, gh_updated_at or _now(),
+            project_id=self.project_id,
         )
         if not won:
             return False
@@ -87,8 +112,9 @@ class IntakeService:
     def _queue_transition(self, requirement_number: int) -> None:
         self.store.outbox.enqueue(
             "gh_status",
-            {"issue": requirement_number, "status": STATUS_IN_PROGRESS},
-            idempotency_key=f"intake-status-{requirement_number}",
+            {"issue": requirement_number, "status": STATUS_IN_PROGRESS,
+             "project_id": self.project_id},
+            idempotency_key=f"intake-status-{self.project_id}-{requirement_number}",
         )
         self.store.outbox.enqueue(
             "gh_comment",
@@ -98,8 +124,9 @@ class IntakeService:
                     "**[clams]** Requirement claimed for autonomous execution.\n\n"
                     "Status moved to `In Progress`. A plan will follow shortly."
                 ),
+                "project_id": self.project_id,
             },
-            idempotency_key=f"intake-comment-{requirement_number}",
+            idempotency_key=f"intake-comment-{self.project_id}-{requirement_number}",
         )
 
     async def add_requirement(self, title: str, body: str = "",

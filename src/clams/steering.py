@@ -173,6 +173,7 @@ class SteeringService:
         planner=None,
         intake=None,
         llm_call: Optional[Callable[[str], str]] = None,
+        project_id: int = 0,
     ):
         self.store = store
         self.settings = settings
@@ -180,6 +181,10 @@ class SteeringService:
         self.planner = planner
         self.intake = intake
         self.llm_call = llm_call
+        # The project chat commands operate on (issue #18). Single-repo
+        # deployments leave it at 0; multi-project passes the default
+        # project's id. Global actions (pause-all) still span every project.
+        self.project_id = project_id
 
     # -- entry point -----------------------------------------------------
     async def handle(self, text: str) -> str:
@@ -212,27 +217,26 @@ class SteeringService:
     async def _do_pause(self, cmd: ParsedCommand) -> str:
         req = cmd.args.get("requirement_number")
         if req is None:
-            # global pause: every tracked requirement
-            self.store.db.conn.execute("UPDATE work_items SET user_paused = 1")
-            return "⏸ Execution paused. No new tasks will be dispatched. " \
-                   "Already-running executors are untouched."
-        self.store.work_items.set_paused(req, True)
+            # global pause: every tracked requirement, in every project
+            count = self.store.work_items.set_paused_all(True)
+            return f"⏸ Execution paused ({count} items). No new tasks will be " \
+                   "dispatched. Already-running executors are untouched."
+        self.store.work_items.set_paused(req, True, self.project_id)
         return f"⏸ Requirement #{req} paused. No new tasks will be dispatched for it."
 
     async def _do_resume(self, cmd: ParsedCommand) -> str:
         req = cmd.args.get("requirement_number")
         if req is None:
-            self.store.db.conn.execute(
-                "UPDATE work_items SET user_paused = 0")
-            return "▶ Execution resumed. Dispatching is enabled again."
-        self.store.work_items.set_paused(req, False)
+            count = self.store.work_items.set_paused_all(False)
+            return f"▶ Execution resumed ({count} items). Dispatching is enabled again."
+        self.store.work_items.set_paused(req, False, self.project_id)
         return f"▶ Requirement #{req} resumed."
 
     async def _do_status(self, cmd: ParsedCommand) -> str:
         req = cmd.args.get("requirement_number")
         if req is None:
             return self._global_status()
-        item = self.store.work_items.get(req)
+        item = self.store.work_items.get(req, self.project_id)
         if item is None:
             return f"Requirement #{req} is not tracked."
         lines = [
@@ -244,7 +248,7 @@ class SteeringService:
             f"  sub-tasks    : {len(item.task_numbers)}",
         ]
         for tn in item.task_numbers:
-            claim = self.store.task_claims.get(tn)
+            claim = self.store.task_claims.get(tn, self.project_id)
             if claim:
                 lines.append(
                     f"    task #{tn}: claimed by {claim['executor_id']} "
@@ -272,11 +276,11 @@ class SteeringService:
         task_number = int(cmd.args["task_number"])
         should_replan = bool(cmd.args.get("replan"))
 
-        claim = self.store.task_claims.get(task_number)
+        claim = self.store.task_claims.get(task_number, self.project_id)
         req = claim["requirement_number"] if claim else cmd.args.get("requirement_number")
 
         # revoke the lease
-        self.store.task_claims.release(task_number)
+        self.store.task_claims.release(task_number, self.project_id)
         # mark the child issue Blocked
         if self.gh is not None:
             try:
@@ -286,11 +290,12 @@ class SteeringService:
                 pass
         # drop it from the requirement's task list
         if req is not None:
-            item = self.store.work_items.get(req)
+            item = self.store.work_items.get(req, self.project_id)
             if item is not None:
                 remaining = [t for t in item.task_numbers if t != task_number]
                 self.store.work_items.set_plan(
-                    req, item.plan_json or "{}", remaining
+                    req, item.plan_json or "{}", remaining,
+                    project_id=self.project_id,
                 )
 
         msg = f"⏹ Task #{task_number} cancelled: lease revoked and issue marked Blocked."

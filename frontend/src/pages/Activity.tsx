@@ -55,6 +55,23 @@ export default function ActivityPage() {
     }
   }
 
+  // Ack leaves the row in the feed, so a resolved incident cluttered Activity
+  // forever. This deletes the filtered rows (acknowledged ones only).
+  async function clearFiltered() {
+    if (!window.confirm('Delete the acknowledged alerts in this filter?')) return
+    setBusy(true)
+    try {
+      const sev = severity === 'all' ? undefined : severity
+      const r = await api.purgeAlerts({ severity: sev })
+      await load()
+      toast(`${r.removed} alert(s) deleted, ${r.remaining} remaining.`)
+    } catch (e) {
+      toast(e instanceof Error ? e.message : 'Could not clear alerts.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
   return (
     <section className="page active" id="page-activity">
       <div className="heading">
@@ -77,6 +94,9 @@ export default function ActivityPage() {
           </select>
           <button className="btn" onClick={ackAll} disabled={busy}>
             Acknowledge filtered
+          </button>
+          <button className="btn" onClick={clearFiltered} disabled={busy}>
+            Clear acknowledged
           </button>
         </div>
       </div>

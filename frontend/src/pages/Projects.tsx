@@ -27,6 +27,7 @@ export default function ProjectsPage() {
   const [name, setName] = useState('')
   const [url, setUrl] = useState('')
   const [busy, setBusy] = useState(false)
+  const [actionBusy, setActionBusy] = useState<number | null>(null)
 
   const load = async () => {
     const r = await api.listProjects()
@@ -36,6 +37,35 @@ export default function ProjectsPage() {
   useEffect(() => {
     load().catch(() => {})
   }, [])
+
+  async function doSync(p: ProjectRow) {
+    setActionBusy(p.id)
+    try {
+      await api.syncProject(p.id)
+      await load()
+      toast(`Synced ${p.name}.`)
+    } catch (err) {
+      toast(err instanceof Error ? err.message : 'Sync failed.')
+    } finally {
+      setActionBusy(null)
+    }
+  }
+
+  async function togglePause(p: ProjectRow) {
+    setActionBusy(p.id)
+    try {
+      if (p.paused) {
+        await api.resumeProject(p.id)
+      } else {
+        await api.pauseProject(p.id)
+      }
+      await load()
+    } catch (err) {
+      toast(err instanceof Error ? err.message : 'Action failed.')
+    } finally {
+      setActionBusy(null)
+    }
+  }
 
   function openForm() {
     setShowForm(true)
@@ -140,7 +170,9 @@ export default function ProjectsPage() {
                 <th>Project</th>
                 <th>Status</th>
                 <th>Progress</th>
+                <th>Working tree</th>
                 <th>Updated</th>
+                <th>Actions</th>
               </tr>
             </thead>
             <tbody>
@@ -163,12 +195,43 @@ export default function ProjectsPage() {
                       </span>{' '}
                       {p.progress}%
                     </td>
+                    <td className="cellmuted">
+                      {p.error ? (
+                        <span className="err" title={p.error}>
+                          ⚠ {p.error}
+                        </span>
+                      ) : p.worktree_path ? (
+                        <code style={{ fontSize: 12 }}>{p.worktree_path}</code>
+                      ) : (
+                        '—'
+                      )}
+                    </td>
                     <td className="cellmuted">{p.updated ?? '—'}</td>
+                    <td>
+                      <div className="inlinebar" style={{ gap: 6 }}>
+                        <button
+                          className="btn"
+                          type="button"
+                          disabled={actionBusy === p.id}
+                          onClick={() => doSync(p)}
+                        >
+                          Sync
+                        </button>
+                        <button
+                          className="btn"
+                          type="button"
+                          disabled={actionBusy === p.id}
+                          onClick={() => togglePause(p)}
+                        >
+                          {p.paused ? 'Resume' : 'Pause'}
+                        </button>
+                      </div>
+                    </td>
                   </tr>
                 ))
               ) : (
                 <tr>
-                  <td colSpan={4} className="muted">
+                  <td colSpan={6} className="muted">
                     No projects yet. Add one to get started.
                   </td>
                 </tr>

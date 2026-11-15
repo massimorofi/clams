@@ -189,6 +189,10 @@ async def test_github_check_three_failures_is_critical(store, settings):
 
 def test_heartbeat_missing_is_critical(store, settings):
     svc = make_svc(store, settings)
+    # Past the cold-start grace window, a missing heartbeat is a real failure.
+    svc._started_at -= settings.watchdog.startup_grace_seconds + 1
+    assert svc.check_heartbeat().severity == "warning"
+    assert svc.check_heartbeat().severity == "warning"
     r = svc.check_heartbeat()
     assert r.critical is True
     assert "missing" in r.detail
@@ -202,9 +206,63 @@ def test_heartbeat_stale_is_critical(store, settings):
         Path(d, f"{name}.json").write_text(json.dumps(
             {"service": name, "pid": 1, "timestamp": old, "detail": ""}))
     svc = make_svc(store, settings)
+    svc._started_at -= settings.watchdog.startup_grace_seconds + 1
+    assert svc.check_heartbeat().severity == "warning"
+    assert svc.check_heartbeat().severity == "warning"
     r = svc.check_heartbeat()
     assert r.critical is True
     assert "stale" in r.detail
+
+
+def test_heartbeat_startup_grace_suppresses_stale(store, settings):
+    """A restart must not pause the pipeline on leftover stale files.
+
+    The watchdog used to go critical on its very first read, so a routine
+    daemon restart stamped every work item as paused and nothing was ever
+    resumed. Stale reads inside the grace window are informational only.
+    """
+    d = settings.paths.heartbeat_dir
+    Path(d).mkdir(parents=True, exist_ok=True)
+    old = (datetime.now(timezone.utc) - timedelta(seconds=300)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    for name in ("planner", "executor"):
+        Path(d, f"{name}.json").write_text(json.dumps(
+            {"service": name, "pid": 1, "timestamp": old, "detail": ""}))
+    svc = make_svc(store, settings)
+    r = svc.check_heartbeat()
+    assert r.ok is True
+    assert r.skipped is True
+    assert "grace" in r.detail
+
+
+def test_watchdog_pause_is_lifted_when_healthy(store, settings):
+    """The pause the watchdog imposes must be reversible by a healthy sweep."""
+    svc = make_svc(store, settings)
+    store.work_items.claim_requirement(500, "R", "2026-01-01T00:00:00Z", project_id=1)
+    store.work_items.set_paused_all(True)
+    svc._paused_by_watchdog = True
+    svc._lift_watchdog_pause()
+    assert svc._paused_by_watchdog is False
+    assert store.work_items.is_paused(500, 1) is False
+
+
+def test_watchdog_pause_does_not_clear_operator_pause(store, settings):
+    """A pause the operator applied deliberately is never silently lifted."""
+    svc = make_svc(store, settings)
+    store.work_items.claim_requirement(501, "R", "2026-01-01T00:00:00Z", project_id=1)
+    store.work_items.set_paused_all(True)
+    svc._paused_by_watchdog = False
+    svc._lift_watchdog_pause()
+    assert store.work_items.is_paused(501, 1) is True
+
+
+def test_identical_alerts_are_collapsed(store, settings):
+    """A persistent condition may not mint a new critical on every sweep."""
+    svc = make_svc(store, settings)
+    first = svc.raise_alert("critical", "watchdog", "boom")
+    second = svc.raise_alert("critical", "watchdog", "boom")
+    assert first == second
+    assert store.db.conn.execute(
+        "SELECT count(*) c FROM alerts WHERE message = 'boom'").fetchone()["c"] == 1
 
 
 def test_heartbeat_fresh_is_ok(store, settings):

@@ -76,6 +76,7 @@ class ReviewService:
         gh: GitHubClient,
         settings: Settings,
         judge=None,
+        project_id: int = 0,
     ):
         self.store = store
         self.gh = gh
@@ -83,6 +84,11 @@ class ReviewService:
         # ``judge`` is an optional planner-side semantic check
         # (callable(requirement_number, evidence_summary) -> bool).
         self.judge = judge
+        # Must match the project the requirement was claimed under (issue #18):
+        # work items are keyed by (project_id, requirement_number), so an
+        # unscoped lookup reads project 0 and reports the requirement as
+        # "not tracked", blocking valid work.
+        self.project_id = project_id
 
     # -- single task -----------------------------------------------------
     async def record_task_result(self, result: ExecutionResult) -> GateVerdict:
@@ -104,7 +110,7 @@ class ReviewService:
         Reads the evidence back out of the local DB rather than trusting whatever
         the caller hands over, so a stale or forged argument cannot slip through.
         """
-        item = self.store.work_items.get(requirement_number)
+        item = self.store.work_items.get(requirement_number, self.project_id)
         if item is None:
             reason = f"requirement #{requirement_number} not tracked"
             await self.gh.add_comment(
@@ -134,7 +140,8 @@ class ReviewService:
                                          passed=False, reasons=[reason]),
             )
             await self.gh.set_status(requirement_number, STATUS_BLOCKED)
-            self.store.work_items.set_status(requirement_number, "blocked")
+            self.store.work_items.set_status(requirement_number, "blocked",
+                                             self.project_id)
             return GateVerdict(False, [reason])
 
         reasons: list[str] = []
@@ -150,7 +157,8 @@ class ReviewService:
                                         reasons=reasons),
             )
             await self.gh.set_status(requirement_number, STATUS_BLOCKED)
-            self.store.work_items.set_status(requirement_number, "blocked")
+            self.store.work_items.set_status(requirement_number, "blocked",
+                                             self.project_id)
             return GateVerdict(False, reasons)
 
         if self.judge is not None:
@@ -164,7 +172,8 @@ class ReviewService:
                                              passed=False, reasons=[reason]),
                 )
                 await self.gh.set_status(requirement_number, STATUS_BLOCKED)
-                self.store.work_items.set_status(requirement_number, "blocked")
+                self.store.work_items.set_status(requirement_number, "blocked",
+                                             self.project_id)
                 return GateVerdict(False, [reason])
 
         await self.gh.add_comment(
@@ -173,7 +182,8 @@ class ReviewService:
                                      reasons=[]),
         )
         await self.gh.set_status(requirement_number, STATUS_REVIEW)
-        self.store.work_items.set_status(requirement_number, "review")
+        self.store.work_items.set_status(requirement_number, "review",
+                                         self.project_id)
         return GateVerdict(True, detail=f"{len(results)} task(s) verified")
 
     # -- helpers --------------------------------------------------------
@@ -192,7 +202,7 @@ class ReviewService:
                 res = ExecutionResult.model_validate(raw)
             except Exception:
                 continue
-            item = self.store.work_items.get(requirement_number)
+            item = self.store.work_items.get(requirement_number, self.project_id)
             if item and res.task_issue in item.task_numbers:
                 out[res.task_issue] = res
         return out

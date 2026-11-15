@@ -72,6 +72,20 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ name, url }),
     }),
+  // --- issue #18: project provisioning lifecycle ---
+  syncProject: (id: number) =>
+    req<{ ok: boolean; project: ProjectRow; commit?: string }>(
+      `/projects/${id}/sync`,
+      { method: 'POST' },
+    ),
+  pauseProject: (id: number) =>
+    req<{ ok: boolean; project: ProjectRow }>(`/projects/${id}/pause`, {
+      method: 'POST',
+    }),
+  resumeProject: (id: number) =>
+    req<{ ok: boolean; project: ProjectRow }>(`/projects/${id}/resume`, {
+      method: 'POST',
+    }),
   ackAlert: (id: number) =>
     req<AlertAckResult>(`/alerts/${id}/ack`, { method: 'POST' }),
   ackAllAlerts: (severity?: string) =>
@@ -79,6 +93,18 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(severity ? { severity } : {}),
     }),
+  // Acknowledging only marks an alert read; the row stays in the feed. This
+  // actually deletes them (defaults to acknowledged rows only).
+  purgeAlerts: (opts: { severity?: string; includeUnacked?: boolean } = {}) => {
+    const q = new URLSearchParams()
+    if (opts.severity) q.set('severity', opts.severity)
+    if (opts.includeUnacked) q.set('acknowledged_only', 'false')
+    const qs = q.toString()
+    return req<{ ok: boolean; removed: number; remaining: number }>(
+      `/alerts${qs ? `?${qs}` : ''}`,
+      { method: 'DELETE' },
+    )
+  },
   // --- issue #19: agent registry ---
   listAgents: () => req<AgentsResponse>('/agents'),
   createAgent: (body: {

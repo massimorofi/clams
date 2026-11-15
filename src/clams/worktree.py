@@ -77,7 +77,29 @@ def create_worktree(repo_path: str | Path, worktree_path: str | Path,
     repo = ensure_repo(repo_path)
     target = Path(worktree_path).expanduser().resolve()
     if target.exists():
-        raise WorktreeError(f"worktree path already exists: {target}")
+        # A run that was killed (restart, timeout, OOM) leaves its worktree on
+        # disk and the branch stays registered to that dead checkout. Refusing
+        # to proceed there meant a task could never be retried: every later
+        # attempt failed instantly with "worktree path already exists" and the
+        # requirement went blocked.
+        #
+        # Only reclaim a checkout git itself knows about. An unrelated directory
+        # at that path is not ours to delete, so it still raises.
+        listed = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            cwd=str(repo), capture_output=True, text=True,
+        ).stdout
+        registered = any(
+            line.strip() == f"worktree {target}" for line in listed.splitlines()
+        )
+        if not registered:
+            raise WorktreeError(f"worktree path already exists: {target}")
+        remove_worktree(repo, target)
+        if target.exists():
+            shutil.rmtree(target, ignore_errors=True)
+            run_git(["worktree", "prune"], repo)
+        if target.exists():
+            raise WorktreeError(f"worktree path already exists: {target}")
     target.parent.mkdir(parents=True, exist_ok=True)
 
     branch_exists = subprocess.run(

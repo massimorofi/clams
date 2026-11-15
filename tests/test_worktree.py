@@ -65,6 +65,23 @@ def test_create_worktree_rejects_existing_path(repo, tmp_path):
         create_worktree(repo, target, branch="task/2")
 
 
+def test_create_worktree_reclaims_stale_checkout(repo, tmp_path):
+    """A killed run must not block its task forever.
+
+    The executor names worktrees deterministically (p<project>-task<n>), so a
+    leftover directory means the previous run died. It used to raise
+    "worktree path already exists" on every retry, leaving the requirement
+    permanently blocked.
+    """
+    target = tmp_path / "stale"
+    create_worktree(repo, target, branch="task/stale", base_sha="HEAD")
+    # Simulate the crash: the checkout is still registered with git.
+    assert target.exists()
+    reclaimed = create_worktree(repo, target, branch="task/stale", base_sha="HEAD")
+    assert reclaimed.exists()
+    assert (reclaimed / "hello.py").exists()
+
+
 def test_create_worktree_reuses_existing_branch(repo, tmp_path):
     t1 = tmp_path / "a"
     create_worktree(repo, t1, branch="task/3", base_sha="HEAD")

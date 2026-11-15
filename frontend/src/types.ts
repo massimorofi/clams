@@ -84,6 +84,10 @@ export interface ProjectRow {
   url: string
   status: string
   progress: number
+  worktree_path?: string | null
+  default_branch?: string | null
+  error?: string | null
+  paused?: boolean
   created_at?: string
   updated_at?: string
   updated?: string
