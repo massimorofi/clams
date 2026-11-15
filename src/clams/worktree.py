@@ -6,6 +6,7 @@ failed task leaves nothing behind.
 """
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -250,6 +251,28 @@ def _matches(path: str, pattern: str) -> bool:
     return path == pattern
 
 
+# Both naming conventions in use: the multi-project ``p<project>-task<n>`` and
+# the original single-project ``task-<n>``. Anything else under work_root (notably
+# ``projects/``, the persistent clones) is off limits.
+_TASK_WORKTREE_NAME = re.compile(r"^(p\d+-)?task-?\d+$")
+
+
+def _owning_repo(worktree_path: Path) -> Optional[Path]:
+    """The main checkout a worktree belongs to, so removal is git-clean.
+
+    ``git worktree remove`` must be run from the owning repository; falling
+    back to ``shutil.rmtree`` leaves a stale registration behind in
+    ``.git/worktrees`` that breaks later operations on the clone.
+    """
+    proc = run_git(["rev-parse", "--git-common-dir"], worktree_path, check=False)
+    if proc.returncode != 0:
+        return None
+    common = Path(proc.stdout.strip())
+    if not common.is_absolute():
+        common = (worktree_path / common).resolve()
+    return common.parent if common.name == ".git" else None
+
+
 def cleanup_stale_worktrees(work_root: str | Path, active_paths: set[str]) -> list[str]:
     """Delete task worktrees under ``work_root`` that are not currently active."""
     root = Path(work_root).expanduser().resolve()
@@ -259,8 +282,21 @@ def cleanup_stale_worktrees(work_root: str | Path, active_paths: set[str]) -> li
     for entry in root.iterdir():
         if not entry.is_dir():
             continue
+        # Only task worktrees are ever fair game. ``work_root/projects/`` holds
+        # the persistent per-project clones that every worktree is cut from, and
+        # the old blanket "delete anything not active" rule wiped it (and with it
+        # every clone), so every later task failed with "not a git repository".
+        if not _TASK_WORKTREE_NAME.match(entry.name):
+            continue
         if str(entry) in active_paths or entry.name in active_paths:
             continue
-        shutil.rmtree(entry, ignore_errors=True)
+        owner = _owning_repo(entry)
+        if owner is not None:
+            remove_worktree(owner, entry)
+        else:
+            # A plain leftover directory, not a registered worktree.
+            shutil.rmtree(entry, ignore_errors=True)
+        if entry.exists():
+            shutil.rmtree(entry, ignore_errors=True)
         removed.append(str(entry))
     return removed
