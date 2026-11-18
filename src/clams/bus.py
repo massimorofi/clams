@@ -1,637 +1,262 @@
-"""Redis Streams event bus (spec §1.1, §4.2, §6.1 queue checks).
+"""Two-stream Redis bus wrapper with strict ack discipline (§4).
 
-Streams
-  clams:tasks    Planner -> Executor   (TaskBrief)
-  clams:results  Executor -> Planner  (ExecutionResult)
-  clams:alerts   Watchdog -> Planner  (AlertEvent)
-  clams:commands User/UI -> Planner   (CommandEnvelope)
-  clams:dead     dead-letter for undecodable / poison messages
+Streams: ``clams:tasks`` (planner -> executors, group ``executors``) and
+``clams:events`` (executors -> planner, group ``planner``). ``clams:dlq`` is an
+auxiliary dead-letter stream, not a work queue.
 
-An ``InMemoryBus`` with the identical interface is provided so unit tests never
-need a live Redis.
+Ack rule: a consumer XACKs only after the DB transaction that applies the
+message has committed. Start-up recovery: replay own PEL, then XAUTOCLAIM
+entries idle beyond the threshold. After ``max_deliveries`` deliveries a message
+is moved to the DLQ.
+
+``InMemoryBus`` implements the identical interface for unit tests.
 """
 from __future__ import annotations
 
-import json
 import time
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Any, Optional, Protocol
+from dataclasses import dataclass, field
+from typing import Optional
 
-from pydantic import BaseModel as BaseModel_
+try:
+    import redis as _redis
+except ImportError:  # pragma: no cover
+    _redis = None
 
-from .contracts import (
-    AlertEvent,
-    CommandEnvelope,
-    ContractError,
-    ExecutionResult,
-    TaskBrief,
-)
-
-STREAM_TASKS = "clams:tasks"
-STREAM_RESULTS = "clams:results"
-STREAM_ALERTS = "clams:alerts"
-STREAM_COMMANDS = "clams:commands"
-STREAM_DEAD = "clams:dead"
-
-PAYLOAD_FIELD = "payload"
-TYPE_FIELD = "type"
+FIELD = "m"  # single message field; value is the JSON envelope
 
 
 @dataclass
-class Received:
-    message_id: str
-    type: str
-    payload: dict[str, Any]
+class Delivered:
+    id: str
+    payload: str
+    deliveries: int = 1
 
 
-class Delivery:
-    """A received message plus the handle needed to acknowledge it.
+class Bus:
+    """Interface shared by RedisBus and InMemoryBus."""
 
-    Issue #114: the old helpers returned the decoded object and dropped the
-    message id, so nothing could ack *after* processing. Everything stayed in
-    the pending-entries list forever and a restart lost the work in flight.
-    Ack when the work is durably dealt with, not before.
-    """
-
-    __slots__ = ("item", "message_id", "stream", "group", "_bus")
-
-    def __init__(self, bus: "Bus", stream: str, group: str, message_id: str,
-                 item: Any) -> None:
-        self._bus = bus
-        self.stream = stream
-        self.group = group
-        self.message_id = message_id
-        self.item = item
-
-    def __repr__(self) -> str:  # pragma: no cover - debugging aid
-        return f"<Delivery {self.stream} {self.message_id} {type(self.item).__name__}>"
-
-    async def ack(self) -> None:
-        await self._bus.ack(self.stream, self.group, self.message_id)
+    def publish(self, stream: str, payload: str) -> str: ...
+    def read(self, stream: str, group: str, consumer: str, *, count: int = 10,
+             block_ms: int = 0) -> list[Delivered]: ...
+    def ack(self, stream: str, group: str, *ids: str) -> int: ...
+    def autoclaim(self, stream: str, group: str, consumer: str,
+                  min_idle_ms: int, count: int = 100) -> list[Delivered]: ...
+    def replay_pending(self, stream: str, group: str, consumer: str,
+                       count: int = 100) -> list[Delivered]: ...
+    def pending_count(self, stream: str, group: str) -> int: ...
+    def xlen(self, stream: str) -> int: ...
+    def push_dlq(self, dlq_stream: str, payload: str, reason: str) -> str: ...
+    def ping(self) -> bool: ...
 
 
-class Bus(Protocol):
-    """Event bus interface used by every service."""
+class RedisBus(Bus):
+    def __init__(self, url: str):
+        if _redis is None:
+            raise RuntimeError("redis package not installed")
+        self._r = _redis.Redis.from_url(url, decode_responses=True)
 
-    async def publish(self, stream: str, payload: Any, *, msg_type: str = "",
-                     maxlen: Optional[int] = None) -> str: ...
-    async def read(self, stream: str, group: str, consumer: str, *,
-                  count: int = 1, block_ms: int = 1000) -> list[Received]: ...
-    async def ack(self, stream: str, group: str, message_id: str) -> None: ...
-    async def dead_letter(self, stream: str, raw: Any, reason: str) -> None: ...
-    async def pending(self, stream: str, group: str) -> dict[str, Any]: ...
-    async def drain(self, stream: str) -> list[Received]: ...
-    async def last_id(self, stream: str) -> str: ...
-    async def read_since(self, stream: str, last_id: str, *,
-                        count: int = 100) -> tuple[list[Received], str]: ...
-    async def redeliver(self, stream: str, group: str, consumer: str, *,
-                        count: int = 100) -> list[Received]: ...
-    async def claim_idle(self, stream: str, group: str, consumer: str,
-                        min_idle_ms: int, *,
-                        count: int = 100) -> list[Received]: ...
-
-
-class RedisBus:
-    """Redis Streams backed bus with consumer groups and dead-lettering."""
-
-    def __init__(self, url: str = "redis://127.0.0.1:6379/0", namespace: str = "clams"):
-        self.url = url
-        self.namespace = namespace
-        self._client = None
-
-    async def connect(self):
-        if self._client is None:
-            import redis.asyncio as aioredis
-
-            self._client = aioredis.from_url(self.url, decode_responses=True)
-            await self._client.ping()
-        return self._client
-
-    def _name(self, stream: str) -> str:
-        return f"{self.namespace}:{stream.split(':', 1)[-1]}" if stream.startswith("clams:") else stream
-
-    async def close(self) -> None:
-        if self._client is not None:
-            await self._client.aclose()
-            self._client = None
-
-    async def publish(self, stream: str, payload: Any, *, msg_type: str = "",
-                     maxlen: Optional[int] = None) -> str:
-        client = await self.connect()
-        if isinstance(payload, BaseModel_):  # pydantic model
-            body = payload.model_dump_json()
-            msg_type = msg_type or type(payload).__name__
-        elif isinstance(payload, str):
-            body = payload
-        else:
-            body = json.dumps(payload)
-        data = {PAYLOAD_FIELD: body, TYPE_FIELD: msg_type}
-        if maxlen:
-            return await client.xadd(self._name(stream), data, maxlen=maxlen)  # type: ignore[return-value]
-        return await client.xadd(self._name(stream), data)  # type: ignore[return-value]
-
-    async def ensure_group(self, stream: str, group: str) -> None:
-        client = await self.connect()
+    def ensure_group(self, stream: str, group: str) -> None:
         try:
-            await client.xgroup_create(self._name(stream), group, id="0", mkstream=True)
-        except Exception as exc:  # BUSYGROUP: already exists
+            self._r.xgroup_create(stream, group, id="0", mkstream=True)
+        except _redis.ResponseError as exc:
             if "BUSYGROUP" not in str(exc):
                 raise
 
-    async def read(self, stream: str, group: str, consumer: str, *,
-                  count: int = 1, block_ms: int = 1000) -> list[Received]:
-        client = await self.connect()
-        await self.ensure_group(stream, group)
-        resp = await client.xreadgroup(
-            group, consumer, {self._name(stream): ">"}, count=count, block=block_ms
-        )
-        return _entries(resp)
+    def publish(self, stream: str, payload: str) -> str:
+        return self._r.xadd(stream, {FIELD: payload})
 
-    async def ack(self, stream: str, group: str, message_id: str) -> None:
-        client = await self.connect()
-        await client.xack(self._name(stream), group, message_id)
-
-    async def redeliver(self, stream: str, group: str, consumer: str, *,
-                        count: int = 100) -> list[Received]:
-        """Re-read this consumer's unacknowledged entries (its PEL).
-
-        ``XREADGROUP ... 0`` returns everything the consumer already claimed
-        but never acked. That is precisely the set a crashed worker leaves
-        behind, so calling this on start-up is what makes a restart lose
-        nothing (issue #114).
-        """
-        client = await self.connect()
-        await self.ensure_group(stream, group)
-        try:
-            resp = await client.xreadgroup(
-                group, consumer, {self._name(stream): "0"}, count=count
-            )
-        except Exception:
-            return []
-        return _entries(resp)
-
-    async def claim_idle(self, stream: str, group: str, consumer: str,
-                         min_idle_ms: int, *, count: int = 100) -> list[Received]:
-        """Steal entries idle for longer than ``min_idle_ms`` from dead consumers.
-
-        A message parked in a *different* consumer's PEL is invisible to
-        ``redeliver``. ``XAUTOCLAIM`` with a min-idle above the task lease
-        recovers those without racing a worker that is still running.
-        """
-        client = await self.connect()
-        await self.ensure_group(stream, group)
-        try:
-            resp = await client.xautoclaim(self._name(stream), group, consumer,
-                                           min_idle_ms, "0-0", count=count)
-        except Exception:
-            return []
-        if not resp:
-            return []
-        # redis-py returns (next_start_id, [[id, fields], ...], [deleted_ids])
-        entries = resp[1] if isinstance(resp, (list, tuple)) and len(resp) >= 2 else []
-        return _entries([(self._name(stream), entries)])
-
-    async def dead_letter(self, stream: str, raw: Any, reason: str) -> None:
-        client = await self.connect()
-        await client.xadd(
-            self._name(STREAM_DEAD),
-            {
-                PAYLOAD_FIELD: raw if isinstance(raw, str) else json.dumps(raw),
-                "source_stream": self._name(stream),
-                "reason": reason,
-                "dead_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            },
-        )
-
-    async def pending(self, stream: str, group: str) -> dict[str, Any]:
-        """Queue depth plus the age of the oldest unacked entry.
-
-        Issue #120: failures used to be swallowed and reported as
-        ``oldest_idle_ms = 0``, so a queue backed up for 16 hours read as
-        healthy. An error is now returned explicitly for the watchdog to raise.
-        """
-        client = await self.connect()
-        name = self._name(stream)
-        try:
-            info = await client.xpending(name, group)
-        except Exception as exc:
-            if "NOGROUP" in str(exc):
-                # No consumer group yet simply means nothing has been consumed.
-                return {"count": 0, "oldest_idle_ms": 0}
-            return {"count": 0, "oldest_idle_ms": 0,
-                    "error": f"xpending: {type(exc).__name__}: {exc}"}
-        if not info:
-            return {"count": 0, "oldest_idle_ms": 0}
-        count = int(info.get("pending", 0) if isinstance(info, dict) else info[0])
-        oldest_idle_ms = 0
-        try:
-            pending_detail = await self._pending_detail(name, group)
-        except Exception as exc:
-            return {"count": count, "oldest_idle_ms": 0,
-                    "error": f"xpending_range: {type(exc).__name__}: {exc}"}
-        if pending_detail:
-            oldest_idle_ms = max(p["idle_ms"] for p in pending_detail)
-        return {"count": count, "oldest_idle_ms": oldest_idle_ms}
-
-    async def _pending_detail(self, name: str, group: str) -> list[dict[str, Any]]:
-        """Per-entry PEL detail.
-
-        The async redis-py client exposes the ranged form as
-        ``xpending_range``; the old ``xpending(name, group, "-", "+", 100)``
-        call raised ``TypeError`` on every invocation and, because the caller
-        swallowed it, the queue age was always reported as zero (#120).
-        """
-        client = await self.connect()
-        resp = await client.xpending_range(name, group, min="-", max="+", count=100)
-        out = []
-        for entry in resp or []:
-            # entry: [msg_id, consumer, idle_time_ms, delivery_count]
-            if isinstance(entry, dict):
-                out.append({
-                    "id": entry.get("message_id"),
-                    "idle_ms": int(entry.get("time_since_delivered", 0)),
-                })
-            elif isinstance(entry, (list, tuple)) and len(entry) >= 3:
-                out.append({"id": entry[0], "idle_ms": int(entry[2] or 0)})
+    def read(self, stream: str, group: str, consumer: str, *, count: int = 10,
+             block_ms: int = 0) -> list[Delivered]:
+        resp = self._r.xreadgroup(group, consumer, {stream: ">"},
+                                  count=count, block=block_ms or None)
+        out: list[Delivered] = []
+        for _stream, entries in resp or []:
+            for msg_id, fields in entries:
+                out.append(Delivered(id=msg_id, payload=fields.get(FIELD, ""),
+                                     deliveries=1))
+        if out:
+            # real delivery counts (for DLQ-after-N); one XPENDING round-trip
+            try:
+                pend = self._r.xpending_range(stream, group, min="-", max="+",
+                                              count=1000)
+                counts = {p["message_id"]: p["times_delivered"] for p in pend}
+                for d in out:
+                    d.deliveries = counts.get(d.id, d.deliveries)
+            except Exception:  # noqa: BLE001 - counts are best-effort
+                pass
         return out
 
-    async def drain(self, stream: str) -> list[Received]:
-        """Read everything currently in the stream (no consumer group)."""
-        client = await self.connect()
-        try:
-            entries = await client.xrange(self._name(stream))
-        except Exception:
-            return []
-        out = []
-        for msg_id, fields in entries or []:
-            out.append(
-                Received(
-                    message_id=msg_id,
-                    type=(fields or {}).get(TYPE_FIELD, ""),
-                    payload=_decode((fields or {}).get(PAYLOAD_FIELD, "{}")),
-                )
-            )
+    def ack(self, stream: str, group: str, *ids: str) -> int:
+        return int(self._r.xack(stream, group, *ids)) if ids else 0
+
+    def autoclaim(self, stream: str, group: str, consumer: str,
+                  min_idle_ms: int, count: int = 100) -> list[Delivered]:
+        out: list[Delivered] = []
+        start = "0-0"
+        while True:
+            next_start, entries, _deleted = self._r.xautoclaim(
+                stream, group, consumer, min_idle_time=min_idle_ms,
+                start_id=start, count=count)
+            for msg_id, fields in entries:
+                out.append(Delivered(id=msg_id, payload=fields.get(FIELD, "")))
+            if next_start == "0-0" or not next_start:
+                break
+            start = next_start
         return out
 
-    async def last_id(self, stream: str) -> str:
-        """Id of the newest entry in the stream, or ``"0-0"`` if empty/missing.
+    def replay_pending(self, stream: str, group: str, consumer: str,
+                       count: int = 100) -> list[Delivered]:
+        resp = self._r.xreadgroup(group, consumer, {stream: "0"}, count=count)
+        out: list[Delivered] = []
+        for _stream, entries in resp or []:
+            for msg_id, fields in entries:
+                out.append(Delivered(id=msg_id, payload=fields.get(FIELD, "")))
+        return out
 
-        Used to start a tail read at the current end of the stream so historical
-        entries are never replayed to a freshly connected consumer.
-        """
-        client = await self.connect()
+    def pending_count(self, stream: str, group: str) -> int:
+        info = self._r.xpending(stream, group)
+        return int(info["pending"]) if info else 0
+
+    def xlen(self, stream: str) -> int:
+        return int(self._r.xlen(stream))
+
+    def push_dlq(self, dlq_stream: str, payload: str, reason: str) -> str:
+        return self._r.xadd(dlq_stream, {FIELD: payload, "reason": reason})
+
+    def ping(self) -> bool:
         try:
-            rev = await client.xrevrange(self._name(stream), max="+", min="-", count=1)
+            return bool(self._r.ping())
         except Exception:
-            return "0-0"
-        if not rev:
-            return "0-0"
-        return rev[0][0]
-
-    async def read_since(self, stream: str, last_id: str, *,
-                        count: int = 100) -> tuple[list[Received], str]:
-        """Read only entries newer than ``last_id`` (no consumer group).
-
-        Returns ``(messages, new_last_id)``. ``new_last_id`` advances to the id
-        of the last message returned, or stays at ``last_id`` when there are no
-        new entries, so the caller can persist it and resume exactly where it
-        left off on the next call.
-        """
-        client = await self.connect()
-        try:
-            resp = await client.xread({self._name(stream): last_id}, count=count)
-        except Exception:
-            return [], last_id
-        out: list[Received] = []
-        new_id = last_id
-        if resp:
-            for _stream_name, entries in resp:
-                for msg_id, fields in entries:
-                    out.append(
-                        Received(
-                            message_id=msg_id,
-                            type=(fields or {}).get(TYPE_FIELD, ""),
-                            payload=_decode((fields or {}).get(PAYLOAD_FIELD, "{}")),
-                        )
-                    )
-                    new_id = msg_id
-        return out, new_id
-
-    async def trim(self, stream: str, maxlen: int = 1000) -> None:
-        client = await self.connect()
-        await client.xtrim(self._name(stream), maxlen=maxlen)
-
-    async def purge(self, stream: str) -> None:
-        client = await self.connect()
-        try:
-            await client.delete(self._name(stream))
-        except Exception:
-            pass
+            return False
 
 
-# ``BaseModel`` import kept local so the module imports even if pydantic changes.
-from pydantic import BaseModel as BaseModel_  # noqa: E402
+@dataclass
+class _MemEntry:
+    id: str
+    payload: str
+    seq: int
 
 
-class InMemoryBus:
-    """Drop-in bus for tests: same interface, no Redis.
+@dataclass
+class _MemGroup:
+    last_seq: int = 0
+    #: msg_id -> (consumer, delivered_at_monotonic, deliveries)
+    pending: dict[str, tuple[str, float, int]] = field(default_factory=dict)
 
-    It models the part of Redis Streams that mattered for issue #114: a message
-    delivered to a consumer group sits in that group's pending-entries list
-    until it is acked, and an unacked message is handed back by
-    :meth:`redeliver`. Without this the tests could never catch the bug, because
-    the old stub simply forgot everything it had delivered.
-    """
+
+class InMemoryBus(Bus):
+    """Deterministic in-process bus with PEL + autoclaim semantics."""
 
     def __init__(self) -> None:
-        self.messages: dict[str, list[Received]] = {}
-        self._cursor: dict[tuple[str, str], int] = {}
-        # (stream, group) -> list of (Received, consumer, delivered_at)
-        self._pel: dict[tuple[str, str], list[tuple[Received, str, float]]] = {}
-        self._counter = 0
-        self.dead: list[dict[str, Any]] = []
-        self.acked: list[tuple[str, str, str]] = []
+        self._streams: dict[str, list[_MemEntry]] = {}
+        self._groups: dict[tuple[str, str], _MemGroup] = {}
+        self._seq = 0
 
-    def _next_id(self) -> str:
-        self._counter += 1
-        return f"{self._counter}-0"
+    # -- helpers ---------------------------------------------------------
+    def _next_id(self) -> tuple[str, int]:
+        self._seq += 1
+        return f"{self._seq}-1", self._seq
 
-    async def publish(self, stream: str, payload: Any, *, msg_type: str = "",
-                     maxlen: Optional[int] = None) -> str:
-        if isinstance(payload, BaseModel_):
-            body = payload.model_dump_json()
-            msg_type = msg_type or type(payload).__name__
-        elif isinstance(payload, str):
-            body = payload
-        else:
-            body = json.dumps(payload)
-        # Store the decoded dict when possible; keep the raw string otherwise so a
-        # malformed message survives publish and is dead-lettered on read.
-        try:
-            stored = _decode(body)
-        except ContractError:
-            stored = body  # type: ignore[assignment]
-        msg = Received(message_id=self._next_id(), type=msg_type, payload=stored)
-        items = self.messages.setdefault(stream, [])
-        items.append(msg)
-        if maxlen and len(items) > maxlen:
-            del items[:-maxlen]
-        return msg.message_id
+    def ensure_group(self, stream: str, group: str) -> None:
+        self._groups.setdefault((stream, group), _MemGroup())
+        self._streams.setdefault(stream, [])
 
-    async def ensure_group(self, stream: str, group: str) -> None:
-        self._cursor.setdefault((stream, group), 0)
-        self._pel.setdefault((stream, group), [])
+    # -- Bus interface ---------------------------------------------------
+    def publish(self, stream: str, payload: str) -> str:
+        msg_id, seq = self._next_id()
+        self._streams.setdefault(stream, []).append(
+            _MemEntry(id=msg_id, payload=payload, seq=seq))
+        return msg_id
 
-    async def read(self, stream: str, group: str, consumer: str, *,
-                  count: int = 1, block_ms: int = 1000) -> list[Received]:
-        key = (stream, group)
-        idx = self._cursor.get(key, 0)
-        items = self.messages.get(stream, [])[idx: idx + count]
-        self._cursor[key] = idx + len(items)
-        now = time.monotonic()
-        pel = self._pel.setdefault(key, [])
-        for msg in items:
-            pel.append((msg, consumer, now))
-        return items
-
-    async def ack(self, stream: str, group: str, message_id: str) -> None:
-        key = (stream, group)
-        pel = self._pel.get(key, [])
-        self._pel[key] = [e for e in pel if e[0].message_id != message_id]
-        self.acked.append((stream, group, message_id))
-
-    async def redeliver(self, stream: str, group: str, consumer: str, *,
-                        count: int = 100) -> list[Received]:
-        pel = self._pel.get((stream, group), [])
-        return [msg for msg, who, _ts in pel if who == consumer][:count]
-
-    async def claim_idle(self, stream: str, group: str, consumer: str,
-                         min_idle_ms: int, *, count: int = 100) -> list[Received]:
-        key = (stream, group)
-        pel = self._pel.get(key, [])
-        cutoff = time.monotonic() - (min_idle_ms / 1000.0)
-        claimed: list[Received] = []
-        rest: list[tuple[Received, str, float]] = []
-        for entry in pel:
-            msg, who, ts = entry
-            if who != consumer and ts <= cutoff and len(claimed) < count:
-                claimed.append(msg)
-                rest.append((msg, consumer, ts))
-            else:
-                rest.append(entry)
-        self._pel[key] = rest
-        return claimed
-
-    async def dead_letter(self, stream: str, raw: Any, reason: str) -> None:
-        self.dead.append({"stream": stream, "raw": raw, "reason": reason})
-
-    async def pending(self, stream: str, group: str) -> dict[str, Any]:
-        """``count`` = undelivered + delivered-but-unacked, ``oldest_idle_ms``
-        measured from delivery time (#120 needs a real number)."""
-        key = (stream, group)
-        idx = self._cursor.get(key, 0)
-        total = len(self.messages.get(stream, []))
-        undelivered = max(0, total - idx)
-        pel = self._pel.get(key, [])
-        now = time.monotonic()
-        oldest_ms = int(max(((now - ts) * 1000.0 for _m, _c, ts in pel), default=0))
-        return {"count": undelivered + len(pel), "oldest_idle_ms": oldest_ms}
-
-    async def pel_count(self, stream: str, group: str) -> int:
-        return len(self._pel.get((stream, group), []))
-
-    async def drain(self, stream: str) -> list[Received]:
-        return list(self.messages.get(stream, []))
-
-    async def last_id(self, stream: str) -> str:
-        items = self.messages.get(stream, [])
-        return items[-1].message_id if items else "0-0"
-
-    async def read_since(self, stream: str, last_id: str, *,
-                        count: int = 100) -> tuple[list[Received], str]:
-        items = self.messages.get(stream, [])
-        try:
-            last_n = int(str(last_id).split("-", 1)[0])
-        except (ValueError, AttributeError):
-            last_n = 0
-        new = [m for m in items if int(str(m.message_id).split("-", 1)[0]) > last_n]
-        new = new[:count]
-        new_id = new[-1].message_id if new else last_id
-        return new, new_id
-
-    async def purge(self, stream: str) -> None:
-        self.messages[stream] = []
-        self._pel = {k: v for k, v in self._pel.items() if k[0] != stream}
-        for k in list(self._cursor):
-            if k[0] == stream:
-                self._cursor[k] = 0
-
-
-# ---- typed helpers ----------------------------------------------------
-
-def _payload_str(payload: Any) -> str:
-    return payload if isinstance(payload, str) else json.dumps(payload)
-
-
-async def _take(bus: Bus, stream: str, group: str, consumer: str,
-                model: Any, **kw) -> Optional[Delivery]:
-    """Read one message and hand back an ack handle *without* acking.
-
-    The caller owns the acknowledgement: it must fire once the work is durably
-    dealt with. That ordering is the whole of the #114 fix.
-    """
-    items = await bus.read(stream, group, consumer, **kw)
-    if not items:
-        return None
-    msg = items[0]
-    try:
-        item = model.from_json(_payload_str(msg.payload))
-    except (ContractError, json.JSONDecodeError) as exc:
-        await bus.dead_letter(stream, msg.payload,
-                              f"{model.__name__} decode failed: {exc}")
-        await bus.ack(stream, group, msg.message_id)
-        return None
-    return Delivery(bus, stream, group, msg.message_id, item)
-
-
-async def _redeliver(bus: Bus, stream: str, group: str, consumer: str,
-                     model: Any, *, count: int = 100) -> list[Delivery]:
-    """Re-take this consumer's unacked entries (see :meth:`Bus.redeliver`)."""
-    items = await bus.redeliver(stream, group, consumer, count=count)
-    out: list[Delivery] = []
-    for msg in items:
-        try:
-            item = model.from_json(_payload_str(msg.payload))
-        except (ContractError, json.JSONDecodeError) as exc:
-            await bus.dead_letter(stream, msg.payload,
-                                  f"{model.__name__} redeliver decode failed: {exc}")
-            await bus.ack(stream, group, msg.message_id)
-            continue
-        out.append(Delivery(bus, stream, group, msg.message_id, item))
-    return out
-
-
-async def publish_task(bus: Bus, brief: TaskBrief) -> str:
-    return await bus.publish(STREAM_TASKS, brief, msg_type="TaskBrief")
-
-
-async def take_task(bus: Bus, group: str, consumer: str, **kw) -> Optional[Delivery]:
-    """``Delivery`` carrying a :class:`TaskBrief`; ack after the task ran."""
-    return await _take(bus, STREAM_TASKS, group, consumer, TaskBrief, **kw)
-
-
-async def redeliver_tasks(bus: Bus, group: str, consumer: str,
-                          *, count: int = 100) -> list[Delivery]:
-    return await _redeliver(bus, STREAM_TASKS, group, consumer, TaskBrief,
-                            count=count)
-
-
-async def read_task(bus: Bus, group: str, consumer: str, **kw) -> Optional[TaskBrief]:
-    """Decode and ack in one step (at-most-once).
-
-    Kept for tests and for readers that genuinely do not need a delivery
-    guarantee. Production consumers must use :func:`take_task` so a crash
-    mid-work leaves the message in the PEL instead of losing it (#114).
-    """
-    delivery = await take_task(bus, group, consumer, **kw)
-    if delivery is None:
-        return None
-    await delivery.ack()
-    return delivery.item
-
-
-async def publish_result(bus: Bus, result: ExecutionResult) -> str:
-    return await bus.publish(STREAM_RESULTS, result, msg_type="ExecutionResult")
-
-
-async def take_result(bus: Bus, group: str, consumer: str,
-                      **kw) -> Optional[Delivery]:
-    return await _take(bus, STREAM_RESULTS, group, consumer, ExecutionResult, **kw)
-
-
-async def redeliver_results(bus: Bus, group: str, consumer: str,
-                            *, count: int = 100) -> list[Delivery]:
-    return await _redeliver(bus, STREAM_RESULTS, group, consumer, ExecutionResult,
-                            count=count)
-
-
-async def read_result(bus: Bus, group: str, consumer: str,
-                      **kw) -> Optional[ExecutionResult]:
-    delivery = await take_result(bus, group, consumer, **kw)
-    if delivery is None:
-        return None
-    await delivery.ack()
-    return delivery.item
-
-
-# Bound the alerts stream so a long-running watchdog cannot grow it without limit.
-# The SSE feed tails this stream; an unbounded stream is both a memory leak and the
-# reason old alerts used to be replayed into the live feed.
-ALERT_STREAM_MAXLEN = 500
-
-
-async def publish_alert(bus: Bus, alert: AlertEvent) -> str:
-    return await bus.publish(STREAM_ALERTS, alert, msg_type="AlertEvent",
-                            maxlen=ALERT_STREAM_MAXLEN)
-
-
-async def take_alert(bus: Bus, group: str, consumer: str, **kw) -> Optional[Delivery]:
-    return await _take(bus, STREAM_ALERTS, group, consumer, AlertEvent, **kw)
-
-
-async def read_alert(bus: Bus, group: str, consumer: str, **kw) -> Optional[AlertEvent]:
-    delivery = await take_alert(bus, group, consumer, **kw)
-    if delivery is None:
-        return None
-    await delivery.ack()
-    return delivery.item
-
-
-async def publish_command(bus: Bus, cmd: CommandEnvelope) -> str:
-    return await bus.publish(STREAM_COMMANDS, cmd, msg_type="CommandEnvelope")
-
-
-async def take_command(bus: Bus, group: str, consumer: str,
-                       **kw) -> Optional[Delivery]:
-    return await _take(bus, STREAM_COMMANDS, group, consumer, CommandEnvelope, **kw)
-
-
-async def read_command(bus: Bus, group: str, consumer: str,
-                       **kw) -> Optional[CommandEnvelope]:
-    delivery = await take_command(bus, group, consumer, **kw)
-    if delivery is None:
-        return None
-    await delivery.ack()
-    return delivery.item
-
-
-def _entries(resp: Any) -> list[Received]:
-    """Flatten an ``XREAD``/``XREADGROUP`` reply into ``Received`` items."""
-    out: list[Received] = []
-    if not resp:
+    def read(self, stream: str, group: str, consumer: str, *, count: int = 10,
+             block_ms: int = 0) -> list[Delivered]:
+        g = self._groups.setdefault((stream, group), _MemGroup())
+        entries = self._streams.get(stream, [])
+        out: list[Delivered] = []
+        for e in entries:
+            if e.seq <= g.last_seq:
+                continue
+            g.last_seq = e.seq
+            deliveries = g.pending.get(e.id, (consumer, 0.0, 0))[2] + 1
+            g.pending[e.id] = (consumer, time.monotonic(), deliveries)
+            out.append(Delivered(id=e.id, payload=e.payload,
+                                 deliveries=deliveries))
+            if len(out) >= count:
+                break
         return out
-    for _stream_name, entries in resp:
-        for msg_id, fields in entries or []:
-            out.append(
-                Received(
-                    message_id=msg_id,
-                    type=(fields or {}).get(TYPE_FIELD, ""),
-                    payload=_decode((fields or {}).get(PAYLOAD_FIELD, "{}")),
-                )
-            )
-    return out
+
+    def ack(self, stream: str, group: str, *ids: str) -> int:
+        g = self._groups.get((stream, group))
+        if not g:
+            return 0
+        n = 0
+        for i in ids:
+            if g.pending.pop(i, None) is not None:
+                n += 1
+        return n
+
+    def autoclaim(self, stream: str, group: str, consumer: str,
+                  min_idle_ms: int, count: int = 100) -> list[Delivered]:
+        g = self._groups.get((stream, group))
+        if not g:
+            return []
+        now = time.monotonic()
+        out: list[Delivered] = []
+        by_seq = {e.id: e.seq for e in self._streams.get(stream, [])}
+        for msg_id in sorted(g.pending, key=lambda i: by_seq.get(i, 0)):
+            owner, seen, deliveries = g.pending[msg_id]
+            if owner == consumer:
+                continue
+            if (now - seen) * 1000 < min_idle_ms:
+                continue
+            deliveries += 1
+            g.pending[msg_id] = (consumer, now, deliveries)
+            entry = next((e for e in self._streams[stream] if e.id == msg_id),
+                         None)
+            out.append(Delivered(id=msg_id,
+                                 payload=entry.payload if entry else "",
+                                 deliveries=deliveries))
+            if len(out) >= count:
+                break
+        return out
+
+    def replay_pending(self, stream: str, group: str, consumer: str,
+                       count: int = 100) -> list[Delivered]:
+        g = self._groups.get((stream, group))
+        if not g:
+            return []
+        by_seq = {e.id: e.seq for e in self._streams.get(stream, [])}
+        out: list[Delivered] = []
+        for msg_id in sorted(g.pending, key=lambda i: by_seq.get(i, 0)):
+            owner, _seen, deliveries = g.pending[msg_id]
+            if owner != consumer:
+                continue
+            entry = next((e for e in self._streams[stream] if e.id == msg_id),
+                         None)
+            out.append(Delivered(id=msg_id,
+                                 payload=entry.payload if entry else "",
+                                 deliveries=deliveries))
+            if len(out) >= count:
+                break
+        return out
+
+    def pending_count(self, stream: str, group: str) -> int:
+        g = self._groups.get((stream, group))
+        return len(g.pending) if g else 0
+
+    def xlen(self, stream: str) -> int:
+        return len(self._streams.get(stream, []))
+
+    def push_dlq(self, dlq_stream: str, payload: str, reason: str) -> str:
+        msg_id, seq = self._next_id()
+        self._streams.setdefault(dlq_stream, []).append(
+            _MemEntry(id=msg_id, payload=f"{reason}||{payload}", seq=seq))
+        return msg_id
+
+    def ping(self) -> bool:
+        return True
 
 
-def _decode(raw: Any) -> dict[str, Any]:
-    if isinstance(raw, dict):
-        return raw
-    if isinstance(raw, (bytes, bytearray)):
-        raw = raw.decode("utf-8")
-    if isinstance(raw, str):
-        try:
-            parsed = json.loads(raw)
-            return parsed if isinstance(parsed, dict) else {"value": parsed}
-        except json.JSONDecodeError as exc:
-            raise ContractError(f"payload is not valid JSON: {exc}") from exc
-    raise ContractError(f"unsupported payload type {type(raw)!r}")
+def make_bus(url: str) -> Bus:
+    """Factory: real Redis bus."""
+    return RedisBus(url)

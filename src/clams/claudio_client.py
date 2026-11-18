@@ -1,19 +1,21 @@
-"""HTTP client for a Claudio agent backend instance.
+"""Sync HTTP client for an unmodified Claudio agent backend.
 
-Contract (verified against ``claudio-backend/src/claudio_backend/api``):
-  POST /chat        {message, session_id?, approval_mode?, files?}
-                  -> {run_id, session_id, final_output, usage}
-  POST /chat/stream  SSE variant of the same
-  GET  /healthz   -> {"status": "ok"}
-  GET  /version
-  POST /chat/runs/{run_id}/cancel
-Auth: ``Authorization: Bearer <token>``.
+Contract (WP0-verified live against ``claudio/agent:latest``, port 8100):
+  GET  /healthz -> {"status": "ok"}                       (no prefix)
+  POST /api/v1/chat   {message, session_id?, approval_mode?, workspace_dir?, files?}
+                    -> {run_id, session_id, final_output, usage}
+  POST /api/v1/chat/runs/{run_id}/cancel -> {cancelled: true}
+  GET  /api/v1/sessions/{session_id}/messages?limit=N -> {messages: [...]}
+Errors: {"error": {"code", "message", "retryable", "details"}}.
+Auth: ``Authorization: Bearer <token>`` (server.auth_token).
+approval_mode values: off | on_request | always.
+session_ref == Claudio session_id (uuid); a client-supplied session_id is
+honoured for new sessions, and the session keeps its bound workspace on resume.
 """
 from __future__ import annotations
 
-import json
-from dataclasses import dataclass
-from typing import Any, AsyncIterator, Optional
+from dataclasses import dataclass, field
+from typing import Any, Optional
 
 import httpx
 
@@ -34,127 +36,76 @@ class ChatResponse:
     run_id: str
     session_id: str
     final_output: str
-    usage: dict[str, Any]
+    usage: dict[str, Any] = field(default_factory=dict)
 
 
 class ClaudioClient:
-    def __init__(self, base_url: str, auth_token: str = "", timeout: float = 120.0,
-                 transport: Optional[httpx.AsyncBaseTransport] = None):
+    def __init__(self, base_url: str, auth_token: str = "",
+                 timeout: float = 120.0,
+                 transport: Optional[httpx.BaseTransport] = None):
         self.base_url = base_url.rstrip("/")
         self.auth_token = auth_token
         self.timeout = timeout
         self._transport = transport
 
-    def _client(self, timeout: Optional[float] = None) -> httpx.AsyncClient:
+    def _client(self, timeout: Optional[float] = None) -> httpx.Client:
         headers = {"Content-Type": "application/json"}
         if self.auth_token:
             headers["Authorization"] = f"Bearer {self.auth_token}"
-        return httpx.AsyncClient(
-            base_url=self.base_url, headers=headers,
-            timeout=timeout if timeout is not None else self.timeout,
-            transport=self._transport,
-        )
+        return httpx.Client(base_url=self.base_url, headers=headers,
+                            timeout=timeout if timeout is not None else self.timeout,
+                            transport=self._transport)
 
-    async def health(self) -> bool:
+    def health(self) -> bool:
         try:
-            async with self._client(timeout=5.0) as c:
-                r = await c.get("/healthz")
-            return r.status_code == 200
+            with self._client(timeout=5.0) as c:
+                return c.get("/healthz").status_code == 200
         except Exception:
             return False
 
-    async def version(self) -> dict[str, Any]:
-        async with self._client(timeout=10.0) as c:
-            r = await c.get("/version")
-            r.raise_for_status()
-            return r.json()
-
-    async def chat(self, message: str, session_id: Optional[str] = None,
-                  approval_mode: Optional[str] = None,
-                  files: Optional[list[Any]] = None,
-                  timeout: Optional[float] = None) -> ChatResponse:
+    def chat(self, message: str, session_id: Optional[str] = None,
+             approval_mode: Optional[str] = None,
+             workspace_dir: Optional[str] = None,
+             timeout: Optional[float] = None) -> ChatResponse:
         payload: dict[str, Any] = {"message": message}
         if session_id:
             payload["session_id"] = session_id
         if approval_mode:
             payload["approval_mode"] = approval_mode
-        if files:
-            payload["files"] = files
+        if workspace_dir:
+            payload["workspace_dir"] = workspace_dir
         try:
-            async with self._client(timeout=timeout) as c:
-                r = await c.post("/chat", json=payload)
+            with self._client(timeout=timeout) as c:
+                r = c.post("/api/v1/chat", json=payload)
         except httpx.TimeoutException as exc:
             raise ClaudioUnavailable(f"claudio chat timed out: {exc}") from exc
         except httpx.HTTPError as exc:
             raise ClaudioUnavailable(f"claudio chat unreachable: {exc}") from exc
-
         if r.status_code >= 400:
-            body = _safe(r)
             raise ClaudioError(
-                f"claudio chat failed with {r.status_code}: {_message_of(body)}",
-                status=r.status_code, payload=body,
-            )
-        data = r.json()
-        return ChatResponse(
-            run_id=data.get("run_id", ""),
-            session_id=data.get("session_id", ""),
-            final_output=data.get("final_output", "") or "",
-            usage=data.get("usage", {}) or {},
-        )
+                f"claudio chat failed {r.status_code}: {r.text[:300]}",
+                status=r.status_code, payload=r.text[:2000])
+        d = r.json()
+        return ChatResponse(run_id=d.get("run_id", ""),
+                            session_id=d.get("session_id", ""),
+                            final_output=d.get("final_output", "") or "",
+                            usage=d.get("usage", {}) or {})
 
-    async def cancel(self, run_id: str) -> dict[str, Any]:
-        async with self._client(timeout=15.0) as c:
-            r = await c.post(f"/chat/runs/{run_id}/cancel")
-            if r.status_code >= 400:
-                raise ClaudioError(f"cancel failed: {r.status_code}", status=r.status_code)
-            return r.json() if r.content else {}
-
-    async def stream(self, message: str, session_id: Optional[str] = None,
-                    approval_mode: Optional[str] = None) -> AsyncIterator[dict[str, Any]]:
-        """Yield parsed SSE events from /chat/stream."""
-        payload: dict[str, Any] = {"message": message}
-        if session_id:
-            payload["session_id"] = session_id
-        if approval_mode:
-            payload["approval_mode"] = approval_mode
+    def cancel(self, run_id: str) -> bool:
         try:
-            async with self._client() as c:
-                async with c.stream("POST", "/chat/stream", json=payload) as r:
-                    if r.status_code >= 400:
-                        text = await r.aread()
-                        raise ClaudioError(f"stream failed {r.status_code}: {text[:200]}",
-                                         status=r.status_code)
-                    event: dict[str, Any] = {}
-                    async for line in r.aiter_lines():
-                        if not line:
-                            if event:
-                                yield event
-                                event = {}
-                            continue
-                        if line.startswith("event:"):
-                            event["event"] = line[len("event:"):].strip()
-                        elif line.startswith("data:"):
-                            raw = line[len("data:"):].strip()
-                            try:
-                                event["data"] = json.loads(raw)
-                            except json.JSONDecodeError:
-                                event["data"] = raw
-                        elif line.startswith("id:"):
-                            event["id"] = line[len("id:"):].strip()
-                    if event:
-                        yield event
+            with self._client(timeout=15.0) as c:
+                r = c.post(f"/api/v1/chat/runs/{run_id}/cancel")
+            return r.status_code < 400
+        except httpx.HTTPError:
+            return False
+
+    def session_messages(self, session_id: str, limit: int = 200) -> list[dict]:
+        try:
+            with self._client(timeout=15.0) as c:
+                r = c.get(f"/api/v1/sessions/{session_id}/messages",
+                          params={"limit": limit})
+                r.raise_for_status()
+                data = r.json()
+                return data.get("messages", data if isinstance(data, list) else [])
         except httpx.HTTPError as exc:
-            raise ClaudioUnavailable(f"claudio stream unreachable: {exc}") from exc
-
-
-def _safe(r: httpx.Response) -> Any:
-    try:
-        return r.json()
-    except Exception:
-        return r.text[:500]
-
-
-def _message_of(body: Any) -> str:
-    if isinstance(body, dict):
-        return str(body.get("message") or body.get("error") or body)[:200]
-    return str(body)[:200]
+            raise ClaudioUnavailable(f"claudio session fetch failed: {exc}") from exc

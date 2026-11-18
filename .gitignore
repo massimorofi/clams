@@ -22,6 +22,7 @@ work/
 issue5_body.md
 FINAL_UPDATE_5.md
 todo/
+.scratch/
 
 
 # role env files (contain secrets; create from .env.example)
@@ -34,3 +35,7 @@ frontend/dist/
 
 # dev supervisor runtime (pids + logs)
 .dev/
+
+# clams v2
+.env.claudio-*
+backups/

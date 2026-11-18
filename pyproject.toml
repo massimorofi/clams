@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "clams"
-version = "0.1.0"
-description = "Clams — Claudio Multi-Agent System: orchestrator wrapping decoupled Claudio Planner/Executor instances"
+version = "2.0.0"
+description = "Clams v2 — planner/executor/api over one SQLite DB and two Redis streams, driving unmodified Claudio agents"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -14,9 +14,9 @@ dependencies = [
     "pydantic>=2.7",
     "pydantic-settings>=2.2",
     "redis>=5.0",
-    "aiosqlite>=0.20",
     "fastapi>=0.110",
     "uvicorn[standard]>=0.29",
+    "PyYAML>=6.0",
 ]
 
 [project.optional-dependencies]
@@ -27,16 +27,15 @@ dev = [
 
 [project.scripts]
 clams = "clams.cli:main"
-wdctl = "clams.watchdog:main"
-clamsctl = "clams.ctl:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-testpaths = ["tests"]
+testpaths = ["tests/unit", "tests/contract", "tests/integration", "tests/chaos"]
 addopts = "-q"
 markers = [
     "live: tests that hit real external services (GitHub/Redis/Claudio)",
+    "redis: tests that need a local Redis at CLAMS_REDIS_URL",
 ]

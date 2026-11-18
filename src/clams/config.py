@@ -1,416 +1,154 @@
-"""Runtime configuration for Clams (spec §2.2 HW-4, §5, §7.1).
+"""Clams v2 configuration — pydantic Settings with boot guards.
 
-All settings come from environment variables with the ``CLAMS__`` prefix, optionally
-loaded from a ``.env`` file. Defaults encode the hard safety limits from the
-specification; they are enforced in code, not merely documented.
+Every field maps to an env var ``CLAMS_<FIELD_UPPER>``. ``.env.example`` must
+list exactly these keys with the same defaults (enforced by
+``tests/unit/test_env_parity.py``).
 """
 from __future__ import annotations
 
-import os
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from typing import Literal, Optional
 
-from pydantic import Field, field_validator
+import yaml
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from .agents import (
-    DEFAULT_AUTH_TOKEN,
-    DEFAULT_EXECUTOR_PORT,
-    DEFAULT_PLANNER_PORT,
-)
+Role = Literal["planner", "executor", "api"]
 
-# Hostnames that always resolve to "this machine". Inside a container that means
-# the container itself, never the host -- so a loopback URL is a bug there.
-LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "0.0.0.0", "[::1]"})
 
-# Host alias Docker's built-in DNS resolves to the host's gateway IP when paired
-# with `extra_hosts: ["host.docker.internal:host-gateway"]`.
-CONTAINER_HOST_ALIAS = "host.docker.internal"
-
-
-def detect_in_container() -> bool:
-    """Best-effort "am I inside a container?" probe.
-
-    Checks the two markers that actually exist in practice: Docker's
-    ``/.dockerenv`` sentinel and a cgroup that names a container runtime.
-    Never raises -- an unreadable /proc just means "no evidence".
-    """
-    if os.path.exists("/.dockerenv"):
-        return True
-    if os.path.exists("/run/.containerenv"):  # podman
-        return True
-    try:
-        cgroup = Path("/proc/1/cgroup").read_text()
-    except OSError:
-        return False
-    return any(tok in cgroup for tok in ("docker", "containerd", "kubepods", "lxc"))
-
-
-@lru_cache(maxsize=1)
-def in_container() -> bool:
-    """Cached container detection (the answer cannot change mid-process)."""
-    return detect_in_container()
-
-
-def _is_loopback_url(url: str) -> bool:
-    try:
-        host = (urlsplit(url).hostname or "").strip("[]")
-    except ValueError:
-        return False
-    return host in LOOPBACK_HOSTS
-
-
-def resolve_llm_base_url(base_url: str, *, inside_container: bool | None = None,
-                        container_base_url: str | None = None
-                        ) -> tuple[str, bool]:
-    """Return ``(effective_url, rewrote)`` for an LLM endpoint.
-
-    A loopback base URL is correct when Clams runs natively and wrong inside a
-    container, where ``127.0.0.1`` is the container itself and the engine runs
-    on the host. When both conditions hold -- containerised *and* loopback --
-    the host part is swapped for ``host.docker.internal`` so the probe can
-    actually reach the engine.
-
-    An explicitly non-loopback URL is always used verbatim.
-    """
-    if inside_container is None:
-        inside_container = in_container()
-    if not inside_container or not _is_loopback_url(base_url):
-        return base_url, False
-    target = container_base_url or f"http://{CONTAINER_HOST_ALIAS}:8731"
-    return target, True
-
-
-class ApiSettings(BaseSettings):
-    """HTTP + SSE backend serving the web frontend (issue #14)."""
-
-    model_config = SettingsConfigDict(env_prefix="CLAMS__API__", extra="ignore")
-
-    host: str = "0.0.0.0"
-    port: int = 8200
-    # Absolute path to the built SPA. Empty = auto-detect (see _find_dist).
-    static_dir: str = ""
-    # Max seconds a CLI command triggered from the UI may run.
-    command_timeout: float = 300.0
-    # Seconds between telemetry:update SSE frames.
-    telemetry_interval: float = 2.0
-
-
-class ProjectSettings(BaseSettings):
-    """GitHub Projects (V2) board sync (issue #5).
-
-    ``enabled`` defaults to False because the sync needs ``read:project`` and
-    ``update:project`` token scopes that a plain ``repo`` token does not have.
-    When enabled, the board is resolved at startup and a misconfigured board
-    stops the run instead of failing per-item.
-    """
-
-    model_config = SettingsConfigDict(env_prefix="CLAMS__PROJECT__", extra="ignore")
-
-    enabled: bool = False
-    owner: str = ""
-    number: int = 0
-    status_field: str = "Status"
-    # Comma-separated "status:Label=Column" overrides merged over the defaults.
-    status_map: str = ""
-
-    @property
-    def effective_owner(self) -> str:
-        return self.owner or ""
-
-    def parsed_status_map(self, base: dict[str, str]) -> dict[str, str]:
-        out = dict(base)
-        for chunk in self.status_map.split(","):
-            chunk = chunk.strip()
-            if not chunk:
-                continue
-            if "=" not in chunk:
-                raise ValueError(
-                    f"CLAMS__PROJECT__STATUS_MAP entry {chunk!r} must be "
-                    f"'status:Label=Column'"
-                )
-            key, value = chunk.split("=", 1)
-            out[key.strip()] = value.strip()
-        return out
-
-
-class GitHubSettings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="CLAMS__GITHUB__", extra="ignore")
-
-    owner: str = "massimorofi"
-    repo: str = "claudio"
-    token: str = ""
-    api_base: str = "https://api.github.com"
-
-    @field_validator("token")
-    @classmethod
-    def _strip_token(cls, v: str) -> str:
-        return v.strip()
-
-    @property
-    def full_name(self) -> str:
-        return f"{self.owner}/{self.repo}"
-
-
-class RedisSettings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="CLAMS__REDIS__", extra="ignore")
-
-    url: str = "redis://127.0.0.1:6379/0"
-    namespace: str = "clams"
-
-
-class ClaudioSettings(BaseSettings):
-    """A single Claudio agent instance (Planner or Executor)."""
-
-    model_config = SettingsConfigDict(env_prefix="CLAMS__CLAUDIO__", extra="ignore")
-
-    base_url: str = "http://127.0.0.1:8100"
-    auth_token: str = ""
-    request_timeout: float = 120.0
-
-
-class PlannerSettings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="CLAMS__PLANNER__", extra="ignore")
-
-    base_url: str = "http://127.0.0.1:8100"
-    auth_token: str = ""
-    request_timeout: float = 120.0
-    host: str = "0.0.0.0"
-    port: int = 8080
-
-
-class ExecutorSettings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="CLAMS__EXECUTOR__", extra="ignore")
-
-    base_url: str = "http://127.0.0.1:8101"
-    auth_token: str = ""
-    request_timeout: float = 120.0
-    executor_id: str = "executor-1"
-    # Issue #122: the lease used to be 900s while a task may run 1800s, so a
-    # legitimate long task lost its lease mid-run, a second executor could
-    # steal and double-run it, and /api/v1/status reported "Idle" during work.
-    # It must exceed limits.max_wall_seconds (enforced in Settings.load) and is
-    # additionally renewed while the task runs (see ExecutorService).
-    lease_seconds: int = 2100
-    # How often the executor pushes its lease out while a task is in flight.
-    lease_renew_interval: float = 120.0
-    # How often the executor refreshes its heartbeat file. Must stay comfortably
-    # below watchdog.heartbeat_max_age or the watchdog flags a live executor.
-    heartbeat_interval: float = 20.0
-    poll_interval: float = 1.0
-    # Claudio pauses any tool call that needs approval and answers the
-    # non-streaming /chat endpoint with 409 approval_required. Nobody is
-    # watching an unattended executor, so that pause is a permanent failure:
-    # every task was claimed, conflicted, and released unused. "off" makes the
-    # agent find a way without asking, which is what a headless runner needs.
-    approval_mode: str = "off"
-
-
-class LlmSettings(BaseSettings):
-    """Direct OpenAI-compatible inference endpoint (halogen / GUFO / llama.cpp)."""
-
-    model_config = SettingsConfigDict(env_prefix="CLAMS__LLM__", extra="ignore")
-
-    base_url: str = "http://127.0.0.1:8731"
-    # Where the engine lives when Clams runs inside a container: the loopback
-    # default above points at the container itself there, so it is rewritten to
-    # this value (see resolve_llm_base_url).
-    container_base_url: str = f"http://{CONTAINER_HOST_ALIAS}:8731"
-    api_key: str = ""
-    model: str = ""
-    timeout: float = 300.0
-
-    @field_validator("base_url", "container_base_url")
-    @classmethod
-    def _require_url(cls, v: str) -> str:
-        v = (v or "").strip()
-        parts = urlsplit(v)
-        if parts.scheme not in ("http", "https") or not parts.netloc:
-            raise ValueError(f"llm base_url must be an absolute http(s) URL, got {v!r}")
-        return v
-
-    @property
-    def resolved_base_url(self) -> str:
-        """The URL to actually dial from this process."""
-        url, _ = resolve_llm_base_url(
-            self.base_url, container_base_url=self.container_base_url
-        )
-        return url
-
-
-class StrixperSettings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="CLAMS__STRIXPER__", extra="ignore")
-
-    base_url: str = "http://127.0.0.1:8000"
-    active_path: str = "/api/v1/runner/active"
-    restart_path: str = "/api/v1/runner/restart"
-    request_timeout: float = 15.0
-
-
-class Limits(BaseSettings):
-    """HW-4 non-gated local execution safety limits."""
-
-    model_config = SettingsConfigDict(env_prefix="CLAMS__LIMITS__", extra="ignore")
-
-    max_attempts: int = 3
-    max_turns: int = 40
-    max_wall_seconds: int = 1800
-    max_replans: int = 3
-    # Extra slack before a task with no claim row at all is considered lost
-    # (#117). A claimed task is judged by its own lease; this only covers the
-    # window between "dispatched" and "claimed".
-    stale_task_grace_seconds: int = 300
-    # HW-1 / HW-2 compute resource ceilings
-    max_compute_queues: int = 8
-    max_concurrent_engines: int = 2
-    queues_per_engine: int = 3
-
-    @field_validator("max_attempts", "max_turns", "max_wall_seconds", "max_replans")
-    @classmethod
-    def _positive(cls, v: int) -> int:
-        if v < 1:
-            raise ValueError("limit must be >= 1")
-        return v
-
-    @property
-    def queues_needed(self) -> int:
-        return self.max_concurrent_engines * self.queues_per_engine
-
-    def validate_against_device(self) -> None:
-        """HW-1: engines * queues must not exceed the device queue ceiling."""
-        if self.queues_needed > self.max_compute_queues:
-            raise ValueError(
-                f"HW-1 violated: {self.max_concurrent_engines} engines x "
-                f"{self.queues_per_engine} queues = {self.queues_needed} > "
-                f"device ceiling {self.max_compute_queues}"
-            )
-
-
-class PathsSettings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="CLAMS__PATHS__", extra="ignore")
-
-    data_dir: str = "./data"
-    db_path: str = "./data/clams.db"
-    work_root: str = "./work"
-    repo_path: str = "."
-    heartbeat_dir: str = "./data/heartbeats"
-    # Where the agent registry (issue #19) is persisted.
-    agents_file: str = "./data/agents.json"
-
-    @field_validator("db_path", "work_root", "data_dir", "agents_file")
-    @classmethod
-    def _abs(cls, v: str) -> str:
-        return str(Path(v).expanduser().resolve())
-
-
-class WatchdogSettings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="CLAMS__WATCHDOG__", extra="ignore")
-
-    interval_seconds: float = 15.0
-    # A single orchestrator cycle can legitimately take minutes: planning and
-    # the review gate make real LLM calls. At the old 60s a busy-but-healthy
-    # cycle was declared dead and the watchdog paused dispatching, so the
-    # threshold has to sit above the worst-case cycle, not below it.
-    heartbeat_max_age: float = 300.0
-    disk_min_free_bytes: int = 2 * 1024 * 1024 * 1024
-    queue_max_pending_age: float = 15 * 60.0
-    llm_probe_timeout: float = 5.0
-    llm_failures_critical: int = 3
-    github_failures_critical: int = 3
-    # Heartbeats get the same consecutive-failure treatment as the LLM and
-    # GitHub probes. A daemon that is mid-restart legitimately leaves a stale
-    # file behind for a few seconds; going critical on the first read meant a
-    # routine restart paused the whole pipeline.
-    heartbeat_failures_critical: int = 3
-    # Don't judge heartbeats until this much time has elapsed since the watchdog
-    # started, so leftover files from a previous run cannot trip it before the
-    # orchestrator has completed its first cycle.
-    startup_grace_seconds: float = 120.0
-    # Identical unacked alerts inside this window are collapsed instead of
-    # re-inserted, so a persistent condition cannot mint a new critical every
-    # 15 seconds.
-    alert_cooldown_seconds: float = 900.0
-    max_recovery_attempts: int = 3
-
-
-class AgentsSettings(BaseSettings):
-    """Agent registry defaults (issue #19).
-
-    The registry itself lives in ``paths.agents_file``; these settings only
-    seed it on first run and supply the defaults the UI offers when adding a
-    new agent.
-    """
-
-    model_config = SettingsConfigDict(env_prefix="CLAMS__AGENTS__", extra="ignore")
-
-    host: str = "127.0.0.1"
-    planner_port: int = DEFAULT_PLANNER_PORT
-    executor_port: int = DEFAULT_EXECUTOR_PORT
-    auth_token: str = DEFAULT_AUTH_TOKEN
-    request_timeout: float = 120.0
-
-    @field_validator("planner_port", "executor_port")
-    @classmethod
-    def _valid_port(cls, v: int) -> int:
-        if not (1 <= v <= 65535):
-            raise ValueError("port must be between 1 and 65535")
-        return v
+class ConfigError(Exception):
+    pass
 
 
 class Settings(BaseSettings):
-    """Top-level Clams settings."""
-
     model_config = SettingsConfigDict(
-        env_prefix="CLAMS__",
-        env_file=".env",
-        env_file_encoding="utf-8",
+        env_prefix="CLAMS_", env_file=".env", env_file_encoding="utf-8",
         extra="ignore",
-        env_nested_delimiter="__",
     )
 
-    github: GitHubSettings = Field(default_factory=GitHubSettings)
-    redis: RedisSettings = Field(default_factory=RedisSettings)
-    llm: LlmSettings = Field(default_factory=LlmSettings)
-    planner: PlannerSettings = Field(default_factory=PlannerSettings)
-    executor: ExecutorSettings = Field(default_factory=ExecutorSettings)
-    strixper: StrixperSettings = Field(default_factory=StrixperSettings)
-    limits: Limits = Field(default_factory=Limits)
-    paths: PathsSettings = Field(default_factory=PathsSettings)
-    watchdog: WatchdogSettings = Field(default_factory=WatchdogSettings)
-    project: ProjectSettings = Field(default_factory=ProjectSettings)
-    api: ApiSettings = Field(default_factory=ApiSettings)
-    agents: AgentsSettings = Field(default_factory=AgentsSettings)
-    poll_interval: float = 20.0
-    intake_label: str = "status:Ready"
-    inprogress_label: str = "status:In Progress"
-    review_label: str = "status:Review"
-    blocked_label: str = "status:Blocked"
-    done_label: str = "status:Done"
-    project_label: str = "clams"
+    # --- paths ---------------------------------------------------------------
+    data_dir: str = "./data"
+    db_path: str = "./data/clams.db"
+    work_root: str = "./work"
+    config_file: str = "./config/clams.yaml"
 
+    # --- bus / redis -----------------------------------------------------------
+    redis_url: str = "redis://127.0.0.1:6379/0"
+    stream_tasks: str = "clams:tasks"
+    stream_events: str = "clams:events"
+    stream_dlq: str = "clams:dlq"
+    group_executors: str = "executors"
+    group_planner: str = "planner"
+    msg_max_bytes: int = 16384          # payload <= 16 KB enforced
+    dlq_max_deliveries: int = 5
+
+    # --- claudio agents ---------------------------------------------------------
+    claudio_planner_url: str = "http://127.0.0.1:1072"
+    claudio_planner_token: str = ""
+    claudio_executor_url: str = "http://127.0.0.1:1073"
+    claudio_executor_token: str = ""
+    claudio_timeout_s: float = 120.0
+    # Root inside which Claudio-E may bind workspaces (worktrees live under it).
+    claudio_workspace_root: str = "./work"
+
+    # --- github -------------------------------------------------------------------
+    github_token: str = ""
+    github_api_base: str = "https://api.github.com"
+    github_graphql_base: str = "https://api.github.com/graphql"
+
+    # --- api -----------------------------------------------------------------------
+    api_host: str = "127.0.0.1"
+    api_port: int = 8200
+    api_token: str = ""
+    spa_dir: str = "./frontend/dist"
+
+    # --- executor -------------------------------------------------------------------
+    executor_id: str = "executor-1"
+    executor_capacity: int = 1
+    heartbeat_interval_s: int = 60
+    executor_alive_interval_s: int = 30
+    keep_failed_worktree_hours: int = 24
+
+    # --- planner loop -----------------------------------------------------------------
+    planner_cycle_s: float = 5.0
+    intake_every_n_cycles: int = 12
+    planner_heartbeat_max_age_s: int = 60
+    events_batch: int = 100
+    events_block_ms: int = 1000
+
+    # --- limits (bounded everything) ----------------------------------------------------
+    max_attempts: int = 3
+    max_turns: int = 40
+    max_wall_s: int = 1800
+    max_replans: int = 3
+    max_plan_tasks: int = 7
+    planning_llm_budget_per_cycle: int = 3
+    lease_dispatch_s: int = 120
+    lease_running_extend_s: int = 180
+    question_expiry_h: int = 24
+    outbox_max_attempts: int = 5
+    outbox_backoff_base_s: int = 2
+    retention_events_days: int = 14
+    retention_processed_days: int = 7
+    retention_sent_outbox_days: int = 14
+
+    # --- watchdog ----------------------------------------------------------------------
+    watchdog_probe_interval_s: int = 30
+    watchdog_healthy_probes_to_resume: int = 3
+    oldest_ready_alert_s: int = 300
+    min_free_disk_mb: int = 500
+
+    # --- misc ----------------------------------------------------------------------------
+    role: str = "planner"
+
+    @field_validator("role", mode="before")
     @classmethod
-    def load(cls, **overrides: Any) -> "Settings":
-        s = cls(**overrides)
-        s.limits.validate_against_device()
-        s.validate_lease_vs_wall()
-        return s
+    def _norm_role(cls, v: object) -> str:
+        v = str(v).lower()
+        if v not in ("planner", "executor", "api"):
+            raise ValueError(f"role must be planner|executor|api, got {v!r}")
+        return v
 
-    def validate_lease_vs_wall(self) -> None:
-        """Issue #122: a task must not be able to outlive its lease.
-
-        Raised at start-up rather than discovered at 3 a.m. as a double-run.
-        """
-        if self.executor.lease_seconds <= self.limits.max_wall_seconds:
-            raise ValueError(
-                f"CLAMS__EXECUTOR__LEASE_SECONDS ({self.executor.lease_seconds})"
-                f" must exceed CLAMS__LIMITS__MAX_WALL_SECONDS "
-                f"({self.limits.max_wall_seconds}): a task that outlives its "
-                f"lease is stolen and double-run by another executor"
+    # ------------------------------------------------------------------ guards
+    def boot_guard(self, role: Optional[str] = None) -> None:
+        """Fail fast on impossible/unsafe configuration for this role."""
+        role = role or self.role
+        if role == "api" and not self.api_token:
+            raise ConfigError(
+                "CLAMS_API_TOKEN is required for the api role (no unauthenticated "
+                "control plane). Set it in .env."
             )
+        if role == "planner":
+            Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+        if self.max_attempts < 1:
+            raise ConfigError("max_attempts must be >= 1")
+        if not (1 <= self.max_plan_tasks <= 7):
+            raise ConfigError("max_plan_tasks must be between 1 and 7")
+        if self.lease_dispatch_s < 10:
+            raise ConfigError("lease_dispatch_s must be >= 10")
+        if self.dlq_max_deliveries < 1:
+            raise ConfigError("dlq_max_deliveries must be >= 1")
+
+    def db_dir(self) -> Path:
+        return Path(self.db_path).parent
+
+    def load_projects_yaml(self) -> dict:
+        """Read config/clams.yaml (projects, limits, agents). Missing file = empty."""
+        p = Path(self.config_file)
+        if not p.exists():
+            return {}
+        with open(p, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        if not isinstance(data, dict):
+            raise ConfigError(f"{self.config_file} must contain a mapping")
+        return data
 
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
-    return Settings.load()
+    return Settings()
+
+
+def reset_settings_cache() -> None:
+    get_settings.cache_clear()

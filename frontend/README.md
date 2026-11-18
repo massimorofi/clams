@@ -1,32 +1,35 @@
-# React + TypeScript + Vite
+# Clams v2 — Control room
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+Vite + React + TypeScript + Tailwind + TanStack Query SPA for the Clams v2
+orchestrator. Talks to the backend API on the same origin under `/api/v1`.
 
-Currently, two official plugins are available:
+## Develop
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
-
-## React Compiler
-
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the Oxlint configuration
-
-If you are developing a production application, we recommend enabling type-aware lint rules by installing `oxlint-tsgolint` and editing `.oxlintrc.json`:
-
-```json
-{
-  "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["react", "typescript", "oxc"],
-  "options": {
-    "typeAware": true
-  },
-  "rules": {
-    "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
-}
+```sh
+npm install
+npm run dev      # Vite dev server on :5173, proxies /api + /healthz to :8200
 ```
 
-See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.
+## Build
+
+```sh
+npm run build    # tsc -b && vite build -> dist/
+npm run preview
+```
+
+The built `dist/` is served by the Clams API process in production.
+
+## Notes
+
+- The API bearer token is entered via the gear (Settings) popover and stored in
+  `localStorage` under `clams_api_token`; every request sends it as
+  `Authorization: Bearer <token>`.
+- Live updates come from the global `EventSource` on `/api/v1/events`; each
+  frame invalidates all TanStack Query caches. `EventSource` cannot send
+  headers, so the token is also passed as a `?token=` query parameter for the
+  stream.
+- Commands (`POST /api/v1/commands`) show a pending indicator and poll
+  `GET /api/v1/commands/{id}` every 2 s until the status becomes
+  `applied`/`rejected`, then a toast reports the outcome.
+- Dark mode follows `prefers-color-scheme` until toggled manually (gear-free,
+  header button; stored under `clams_theme`).

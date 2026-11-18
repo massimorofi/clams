@@ -1,103 +1,96 @@
-# Clams — Claudio Multi-Agent System
+# Clams v2 — Planner–Executor orchestrator for Claudio
 
-`clams` is a standalone orchestrator that turns GitHub Issues into a durable work
-queue and drives two decoupled Claudio instances — a **Planner** (user-facing
-copilot, Web UI + chat steering) and an **Executor** (headless task runner in
-isolated git worktrees) — with a **zero-LLM watchdog** supervising the whole thing.
+Clams turns GitHub Issues into a durable work queue and drives two **unmodified**
+Claudio agent containers — a **Planner** (decomposition + review judgement) and
+an **Executor** (headless task runner in isolated git worktrees) — with a
+web UI for supervision. One SQLite DB, exactly two Redis streams.
 
-Built to the specification in
-[massimorofi/claudio#5](https://github.com/massimorofi/claudio/issues/5).
-Implementation plan: [PLAN.md](./PLAN.md).
+Spec: [CLAMS_V2_SUPER_PLAN.md](doc/CLAMS_V2_SUPER_PLAN.md) ·
+Tracking issue: [massimorofi/clams#130](https://github.com/massimorofi/clams/issues/130)
 
-## Quick start
+## Architecture
 
-**Prerequisite — GitHub token scopes.** Clams reads and writes the GitHub
-Project board, which needs the **`project`** scope. Set it up with:
-
-```bash
-gh auth refresh -s project
-gh auth status    # scope list must include 'project'
+```
+GitHub Issues/Projects ──intake──► PLANNER (singleton, only DB writer)
+     ▲  │                          intake · plan · dispatch · review
+outbox │  ▼                        reaper · watchdog · outbox relay
+     ┌─┴──────────────┐  read-only ┌──────────────┐
+     │ SQLite (WAL)   ◄────────────│ API :8200    ├──► Browser (SPA)
+     └────────────────┘  commands  │ FastAPI+SSE  │
+                                   └──────────────┘
+planner ──XADD clams:tasks──► Redis 7 ──XREADGROUP──► EXECUTOR-RUNNER (1..N)
+planner ◄──XADD clams:events── Redis ◄──XACK discipline── │  worktree · gate
+                                                          └─HTTP─► Claudio-E
 ```
 
-Full walkthrough, including the browser method, how to propagate the token
-into Clams' own `.env` files, and troubleshooting every failure mode:
-**[docs/github-project-permissions.md](./docs/github-project-permissions.md)**.
+Five invariants (enforced and tested):
+
+1. **Single writer** — only the planner mutates domain tables; the API inserts
+   into `commands` only.
+2. **DB is truth, queues are transport** — losing Redis loses no work.
+3. **Every side-effect via outbox** — no GitHub call or XADD inside a business
+   transaction.
+4. **Evidence beats claims** — task success = deterministic gate pass
+   (`run:` commands exit 0 with output, ≥1 commit, scope respected, clean
+   tree), never model text.
+5. **Everything bounded** — attempts, turns, wall time, replans, plan size,
+   outbox retries, LLM calls per cycle.
+
+## Quick start (dev)
 
 ```bash
 python3 -m venv .venv && . .venv/bin/activate
 pip install -e ".[dev]"
-cp .env.example .env          # fill in GitHub token + Claudio URLs
-clams init-db
-clams doctor                  # verify Redis / strixper / Claudio / GitHub
-clams intake                  # pull status:Ready issues into the queue
-clams watch                   # run the full autonomous loop
+cp .env.example .env                      # defaults are parity-checked in CI
+clams migrate
+docker run -d -p 127.0.0.1:6379:6379 redis:7-alpine
+clams planner        # terminal 1
+clams executor       # terminal 2 (needs a Claudio-E on :1073)
+clams api            # terminal 3 → http://127.0.0.1:8200
 ```
 
-Web UI (Planner) is served through the nginx gateway on **http://localhost:8100**.
-
-## Docker
+## Full stack (Docker)
 
 ```bash
-docker compose up -d
-docker compose ps
-clams doctor
+cp .env.example .env
+cp .env.claudio.example .env.claudio-planner    # fill LLM keys
+cp .env.claudio.example .env.claudio-executor   # approval_mode=off
+./clamsctl rebuild && ./clamsctl status
 ```
-
-Services: `planner`, `executor`, `watchdog`, `redis`, `gateway`.
 
 ## CLI
 
 | Command | Purpose |
 |---|---|
-| `clams init-db` | create / migrate the local SQLite database |
-| `clams intake` | sweep GitHub for `status:Ready` requirements |
-| `clams plan <req>` | decompose a requirement into 3–7 sub-issues |
-| `clams dispatch` | publish task briefs for a planned requirement |
-| `clams execute` | run one task from the queue |
-| `clams review <req>` | run the evidence gate on a requirement |
-| `clams watch` | run the orchestrator loop |
-| `clams status` | show tracked requirements, leases, outbox, alerts |
-| `clams doctor` | run the health-check matrix once |
-| `wdctl selfcheck` | container healthcheck entrypoint |
-
-## Chat steering
-
-Talk to the Planner in the Web UI:
-
-| Say | Effect |
-|---|---|
-| `what is the status of requirement #12` | report tasks, leases, attempts |
-| `pause execution` | stop dispatching; running work untouched |
-| `resume` | re-enable dispatch |
-| `cancel task 3 and re-plan` | revoke lease, mark Blocked, re-plan |
-| `add requirement: Add JWT auth` | create the issue and queue it |
-| `change acceptance criteria for #12 to X` | update the issue and refresh briefs |
+| `clams planner` | run the planner loop (intake/plan/dispatch/review/reaper/outbox/watchdog) |
+| `clams executor` | run an executor-runner (consumes `clams:tasks`) |
+| `clams api` | serve REST + SSE + SPA on :8200 |
+| `clams migrate` | apply pending migrations |
+| `clams status` | JSON status snapshot |
+| `clams command pause\|resume --by operator` | queue a control command |
+| `clams healthcheck planner\|executor\|api` | container healthcheck |
 
 ## Tests
 
 ```bash
-pytest            # 250+ unit tests, no external services required
+pytest                    # unit + contract + integration + chaos
+pytest -m redis           # needs local Redis
+pytest tests/contract -m live   # needs a live claudio/agent container on :1072
 ```
 
 ## Layout
 
 ```
+clamsctl · docker-compose.yml · Dockerfile · pyproject.toml · .env.example
+config/clams.yaml        projects, limits, agents
+migrations/001_init.sql  schema v1
 src/clams/
-  config.py         settings + HW-4 limits
-  db.py             SQLite WAL schema + repositories
-  contracts.py      TaskBrief / ExecutionResult / AlertEvent
-  gh.py             GitHub REST + GraphQL sub-issue client
-  claudio_client.py Claudio backend HTTP client
-  bus.py            Redis Streams event bus (+ InMemoryBus)
-  intake.py         FR-2 requirement intake
-  decompose.py      FR-3 3–7 sub-issue decomposition
-  planner.py        planning, re-planning, review judgement
-  worktree.py       isolated git worktree lifecycle
-  executor.py       FR-4 headless task execution
-  review.py         FR-5 evidence gate
-  steering.py       FR-1 chat steering
-  watchdog.py       FR-6 check matrix + remediation ladder
-  outbox.py         transactional outbox worker
-  orchestrator.py   background loop
-  cli.py            `clams` CLI
+  config.py contracts.py bus.py outbox.py claudio_client.py cli.py
+  db/        conn + repositories (single-writer SQLite)
+  github/    client · intake · projection
+  planner/   loop · plan · dispatch · review · reaper · commands · watchdog
+  executor/  runner · worktree · evidence · scope
+  api/       app · sse · auth
+frontend/    Vite + React + TS + Tailwind + TanStack Query
+tests/       unit · contract · integration · chaos
 ```

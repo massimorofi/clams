@@ -1,146 +1,149 @@
-export type BadgeState = 'Idle' | 'Executing' | 'Paused' | 'Error'
-
-export interface Heartbeat {
-  alive: boolean
-  age_seconds: number | null
+export interface Executor {
+  executor_id: string;
+  version: string | null;
+  capacity: number | null;
+  last_seen: string | null;
 }
 
-export interface StatusPayload {
-  state: BadgeState
-  repository: string
-  active_agents: number
-  heartbeats: Record<string, Heartbeat>
-  unacked_alerts: number
-  outbox: Record<string, number>
-  timestamp: string
+export interface Alert {
+  alert_id: number | string;
+  probe: string | null;
+  severity: string;
+  message: string;
+  status: string;
+  created_at: string | null;
 }
 
-export interface ProjectInfo {
-  owner: string
-  repo: string
-  full_name: string
-  branch: string
-  commit: string
-  worktree_dir: string
-  clean: boolean
-  api_base: string
+export interface Overview {
+  workflows: Record<string, number>;
+  tasks: Record<string, number>;
+  success_rate: number;
+  executors: Executor[];
+  alerts: Alert[];
+  paused: boolean;
+  paused_by: string | null;
+  outbox: Record<string, number>;
 }
 
-export interface EditableField {
-  path: string
-  label: string
-  type: 'number' | 'boolean' | 'text'
-  min?: number
-  max?: number
-  step?: number
+export interface Workflow {
+  workflow_id: string;
+  project_id: number | string;
+  source: string;
+  gh_issue_number: number | null;
+  goal: string;
+  status: string;
+  replans: number;
+  created_at: string | null;
+  updated_at: string | null;
 }
 
-export interface ConfigResponse {
-  settings: Record<string, any>
-  runtime_overlay: Record<string, any>
-  editable: EditableField[]
+export interface TaskSummary {
+  task_id: string;
+  sequence_index: number;
+  title: string;
+  status: string;
+  attempt: number;
+  depends_on: number[];
+  commit_sha: string | null;
+  branch: string | null;
+  gh_issue_number: number | null;
 }
 
-export interface ConfigPutResponse {
-  ok: boolean
-  changed: Record<string, { from: any; to: any }>
-  settings: Record<string, any>
+export interface WorkflowDetail extends Workflow {
+  tasks: TaskSummary[];
 }
 
-export interface CliResult {
-  ok: boolean
-  exit_code: number
-  stdout: string
-  stderr: string
-  command: string
+export interface TaskBrief {
+  objective: string | null;
+  acceptance: string | null;
+  run: string[] | null;
+  writable: string[] | null;
+  forbidden: string[] | null;
+  repo: string | null;
+  base_ref: string | null;
+  max_turns: number | null;
+  max_wall_s: number | null;
+  answer?: string | null;
+  session_ref?: string | null;
 }
 
-export interface AlertRow {
-  id: number
-  severity: string
-  source: string
-  message: string
-  created_at?: string
-  acknowledged?: number
+export type EvidenceCheck = Record<string, unknown>;
+
+export interface Evidence {
+  passed: boolean | null;
+  reason: string | null;
+  checks: EvidenceCheck[] | null;
 }
 
-export interface WorkItemRow {
-  requirement_number: number
-  requirement_title: string
-  status: string
-  [k: string]: any
+export interface TaskResult {
+  outcome: string | null;
+  evidence: Evidence | null;
+  commit_sha: string | null;
+  branch: string | null;
+  changed_files: string[] | null;
+  log_tail: string | null;
+  session_ref: string | null;
 }
 
-export interface ChatMessage {
-  id: string
-  role: 'user' | 'planner' | 'system'
-  text: string
-  ts: string
+export interface TaskDetail extends TaskSummary {
+  workflow_id?: string | null;
+  brief: TaskBrief | null;
+  result: TaskResult | null;
+  lease_token?: string | null;
+  lease_expires_at?: string | null;
+  executor_id?: string | null;
+  session_ref?: string | null;
+  error_log?: string | null;
 }
 
-export interface ProjectRow {
-  id: number
-  name: string
-  url: string
-  status: string
-  progress: number
-  worktree_path?: string | null
-  default_branch?: string | null
-  error?: string | null
-  paused?: boolean
-  created_at?: string
-  updated_at?: string
-  updated?: string
+export interface Question {
+  question_id: number | string;
+  task_id: string;
+  attempt: number;
+  question: string;
+  options: string | null;
+  status: string;
+  answer: string | null;
+  asked_at: string | null;
+  expires_at: string | null;
 }
 
-export interface ProjectCreateResult {
-  ok: boolean
-  project: ProjectRow
+export type CommandStatus = 'new' | 'applied' | 'rejected';
+
+export interface Command {
+  command_id: number | string;
+  kind: string;
+  target: string | null;
+  payload: unknown;
+  status: CommandStatus;
+  result: unknown;
+  created_at: string | null;
+  applied_at: string | null;
 }
 
-export interface AlertAckResult {
-  ok: boolean
-  acknowledged?: number
-  id?: number
-  unacked_alerts: number
+export interface CommandRequest {
+  kind: string;
+  target?: string | null;
+  payload?: unknown;
+  issued_by: string;
 }
 
-/** The four Clams roles. Only planner and executor are Claudio agent instances. */
-export type AgentRole = 'planner' | 'executor' | 'orchestrator' | 'watchdog'
-
-/** One configured agent as returned by the API (secrets masked). */
-export interface AgentRow {
-  id: string
-  role: AgentRole
-  base_url: string
-  effective_base_url: string
-  enabled: boolean
-  request_timeout: number
-  has_auth_token: boolean
+export interface CommandAck {
+  command_id: number | string;
+  status: string;
 }
 
-export interface AgentsResponse {
-  agents: AgentRow[]
-  roles: AgentRole[]
-  claudio_roles: string[]
-  defaults: {
-    host: string
-    planner_port: number
-    executor_port: number
-    request_timeout: number
-  }
+export interface Project {
+  project_id?: number | string;
+  repo?: string;
+  gh_project_node_id?: string | null;
+  enabled?: boolean | number;
+  created_at?: string | null;
+  [key: string]: unknown;
 }
 
-export interface AgentMutationResponse {
-  ok: boolean
-  agent?: AgentRow
-  agents: AgentRow[]
-}
+export type TranscriptMessage = Record<string, unknown>;
 
-export interface AgentProbeResult {
-  ok: boolean
-  agent_id: string
-  status: number | null
-  url: string
-  detail: string
+export interface Transcript {
+  messages: TranscriptMessage[];
 }

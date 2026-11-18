@@ -1,0 +1,134 @@
+"""Planning: Claudio-P decomposes a workflow goal into a validated DAG (§8).
+
+Budget: at most ``planning_llm_budget_per_cycle`` LLM calls per planner cycle
+(the loop enforces it; this module exposes the call itself).
+"""
+from __future__ import annotations
+
+import json
+import logging
+import re
+from typing import Any, Optional
+
+from .. import contracts
+from ..contracts import Plan, PlanTask, PlanValidationError, validate_plan
+from ..db import (repo_alerts, repo_events, repo_tasks, repo_workflows)
+from ..db.conn import immediate
+
+log = logging.getLogger("clams.plan")
+
+PLAN_PROMPT = """You are the planning agent of Clams. Decompose the goal below \
+into 1-{max_tasks} sequential tasks for autonomous execution in a git worktree.
+
+Return ONLY a JSON object, no prose, matching:
+{{"tasks": [{{"title": str, "objective": str, "acceptance": str,
+"run": [str, ...], "writable": [glob, ...], "forbidden": [glob, ...],
+"depends_on": [sequence_index, ...]}}]}}
+
+Rules: tasks are ordered (sequence_index = position, 1-based); depends_on may \
+only reference earlier tasks; every task needs >=1 run command (shell, must \
+print output and exit 0 to pass) and >=1 writable glob; acceptance must be \
+objectively checkable.
+
+Goal (repo {repo}, base ref {base_ref}):
+{goal}
+"""
+
+REPAIR_PROMPT = """Your previous plan was invalid: {error}
+Return the corrected JSON object only.
+"""
+
+
+def extract_json(text: str) -> dict[str, Any]:
+    """Pull the first balanced JSON object out of a model reply."""
+    start = text.find("{")
+    if start < 0:
+        raise ValueError("no JSON object in reply")
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        else:
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return json.loads(text[start:i + 1])
+    raise ValueError("unbalanced JSON in reply")
+
+
+def build_brief(pt: PlanTask, repo: str, base_ref: str, settings) -> dict:
+    return {
+        "schema_version": contracts.SCHEMA_VERSION,
+        "objective": pt.objective,
+        "acceptance": pt.acceptance,
+        "run": pt.run,
+        "writable": pt.writable,
+        "forbidden": pt.forbidden,
+        "repo": repo,
+        "base_ref": base_ref,
+        "max_turns": settings.max_turns,
+        "max_wall_s": settings.max_wall_s,
+    }
+
+
+def plan_workflow(conn, claudio_p, settings, workflow_id: str,
+                  repo: str, base_ref: str = "main") -> str:
+    """Plan one workflow. Returns new workflow status.
+
+    Invalid plan -> one repair retry -> else blocked + alert.
+    """
+    wf = repo_workflows.get_workflow(conn, workflow_id)
+    if wf is None:
+        raise ValueError(f"unknown workflow {workflow_id}")
+    goal = wf["goal"]
+    prompt = PLAN_PROMPT.format(max_tasks=settings.max_plan_tasks,
+                                repo=repo, base_ref=base_ref, goal=goal)
+    errors: list[str] = []
+    plan: Optional[Plan] = None
+    for attempt in range(2):  # initial + one repair retry
+        try:
+            reply = claudio_p.chat(prompt, approval_mode="off",
+                                   timeout=settings.claudio_timeout_s)
+            raw = extract_json(reply.final_output)
+            plan = Plan.model_validate(raw)
+            validate_plan(plan, max_tasks=settings.max_plan_tasks)
+            break
+        except Exception as exc:  # noqa: BLE001 - any LLM failure -> repair retry
+            errors.append(str(exc)[:300])
+            plan = None
+            prompt = REPAIR_PROMPT.format(error=errors[-1])
+    if plan is None:
+        with immediate(conn):
+            repo_workflows.set_status(conn, workflow_id, "blocked")
+            repo_alerts.raise_alert(conn, "plan", "error",
+                                    f"workflow {workflow_id} unplanable: "
+                                    f"{errors[-1] if errors else 'unknown'}")
+            repo_events.append_event(conn, "workflow", workflow_id, "error",
+                                     "planning failed after repair retry")
+        return "blocked"
+
+    with immediate(conn):
+        for i, pt in enumerate(plan.tasks, start=1):
+            repo_tasks.create_task(
+                conn, workflow_id, i, pt.title, pt.objective, pt.acceptance,
+                build_brief(pt, repo, base_ref, settings),
+                depends_on=pt.depends_on,
+                max_attempts=settings.max_attempts,
+                gh_issue_number=wf["gh_issue_number"])
+        repo_workflows.set_plan(conn, workflow_id,
+                                plan.model_dump(), status="running")
+        repo_events.append_event(conn, "workflow", workflow_id, "info",
+                                 f"planned {len(plan.tasks)} tasks")
+    return "running"

@@ -1,241 +1,272 @@
-"""Inter-agent message contracts (spec §4.2).
+"""Clams v2 message + plan + brief contracts (pydantic, schema_version=1).
 
-Every payload crossing the Redis bus is validated with pydantic on publish *and*
-on consume. A payload that does not validate is never trusted by the receiving
-agent; it is dead-lettered instead.
+Two streams only:
+  clams:tasks   (Planner -> Executors): task.dispatch, task.cancel
+  clams:events  (Executors -> Planner): task.started, task.heartbeat,
+                task.question, task.result, executor.alive
+
+Every message: ``{schema_version:1, msg_id:uuid, type, ts, ...}``.
+Payload <= 16 KB (enforced by ``envelope_size_ok``).
 """
 from __future__ import annotations
 
 import json
-from typing import Any, Literal, Optional
+import uuid
+from datetime import datetime, timezone
+from typing import Any, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = 1
+MAX_PAYLOAD_BYTES = 16 * 1024
+
+TaskOutcome = Literal["success", "failed", "needs_input"]
 
 
-class ContractError(ValueError):
-    """Raised when a payload does not match its contract."""
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-class Scope(BaseModel):
+def new_msg_id() -> str:
+    return str(uuid.uuid4())
+
+
+class _Base(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    writable: list[str] = Field(default_factory=list)
-    read_only: list[str] = Field(default_factory=list)
-    forbidden: list[str] = Field(default_factory=list)
+    schema_version: int = SCHEMA_VERSION
+    msg_id: str = Field(default_factory=new_msg_id)
+    ts: str = Field(default_factory=_now_iso)
 
-
-class GitRef(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    base_branch: str = "main"
-    base_sha: str = ""
-    work_branch: str = ""
-    # Absolute path to the project working tree the task branches from
-    # (issue #18). Empty means "use the process default" (settings.paths.repo_path),
-    # which keeps single-repo briefs valid.
-    repo_path: str = ""
-
-
-class TaskLimits(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    max_turns: int = 40
-    max_wall_seconds: int = 1800
-
-    @field_validator("max_turns", "max_wall_seconds")
+    @field_validator("schema_version")
     @classmethod
-    def _positive(cls, v: int) -> int:
-        if v < 1:
-            raise ValueError("must be >= 1")
+    def _known_version(cls, v: int) -> int:
+        if v != SCHEMA_VERSION:
+            raise ValueError(f"unknown schema_version {v}")
         return v
 
 
-class TaskBrief(BaseModel):
-    """Planner -> Executor."""
+# --------------------------------------------------------------------------- brief
+class Brief(BaseModel):
+    """Immutable per-attempt task brief carried inside task.dispatch."""
+    model_config = ConfigDict(extra="forbid")
 
-    model_config = ConfigDict(extra="forbid", populate_by_name=True)
-
-    schema_version: str = Field(default=SCHEMA_VERSION, alias="$schema_version")
-    task_issue: int
-    requirement_issue: int
+    schema_version: int = SCHEMA_VERSION
     objective: str
-    acceptance_criterion: str
-    scope: Scope = Field(default_factory=Scope)
-    git: GitRef = Field(default_factory=GitRef)
-    limits: TaskLimits = Field(default_factory=TaskLimits)
-    # The project this task belongs to (issue #18). Echoed back on the result so
-    # the review step can route to the right project's services.
-    project_id: int = 0
+    acceptance: str
+    run: list[str] = Field(min_length=1)          # verify commands, all must pass
+    writable: list[str] = Field(min_length=1)     # globs the agent may touch
+    forbidden: list[str] = Field(default_factory=list)
+    repo: str                                     # owner/name
+    base_ref: str = "main"
+    max_turns: int = 40
+    max_wall_s: int = 1800
+    answer: Optional[str] = None                  # set when resuming after question
+    session_ref: Optional[str] = None             # set when resuming a session
 
-    @field_validator("task_issue", "requirement_issue")
+    @field_validator("schema_version")
     @classmethod
-    def _positive_int(cls, v: int) -> int:
-        if v < 1:
-            raise ValueError("issue numbers must be >= 1")
+    def _known_version(cls, v: int) -> int:
+        if v != SCHEMA_VERSION:
+            raise ValueError(f"unknown brief schema_version {v}")
         return v
 
-    def to_json(self) -> str:
-        return self.model_dump_json(by_alias=True)
 
-    @classmethod
-    def from_json(cls, raw: str | bytes) -> "TaskBrief":
-        return validate_task_brief(json.loads(raw))
+# ------------------------------------------------------------------ clams:tasks
+class TaskDispatch(_Base):
+    type: Literal["task.dispatch"] = "task.dispatch"
+    task_id: str
+    workflow_id: str
+    attempt: int = Field(ge=1)
+    lease_token: str
+    brief: Brief
 
 
-class CommandEvidence(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class TaskCancel(_Base):
+    type: Literal["task.cancel"] = "task.cancel"
+    task_id: str
+    attempt: int = Field(ge=1)
+    lease_token: str
 
-    cmd: str
-    exit_code: int
-    tail: str = ""
+
+# ----------------------------------------------------------------- clams:events
+class TaskStarted(_Base):
+    type: Literal["task.started"] = "task.started"
+    task_id: str
+    attempt: int = Field(ge=1)
+    lease_token: str
+    executor_id: str
+    session_ref: str
+
+
+class TaskHeartbeat(_Base):
+    type: Literal["task.heartbeat"] = "task.heartbeat"
+    task_id: str
+    attempt: int = Field(ge=1)
+    lease_token: str
+    turns_used: int = 0
+    elapsed_s: int = 0
+
+
+class TaskQuestion(_Base):
+    type: Literal["task.question"] = "task.question"
+    task_id: str
+    attempt: int = Field(ge=1)
+    lease_token: str
+    question: str
+    options: list[str] = Field(default_factory=list)
+    idempotency_key: str
 
 
 class Evidence(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="allow")
+    checks: list[dict[str, Any]] = Field(default_factory=list)
+    passed: bool = False
+    reason: str = ""
 
-    commands: list[CommandEvidence] = Field(default_factory=list)
-    log_file: str = ""
 
-
-class ArtifactDelta(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    files_changed: list[str] = Field(default_factory=list)
-    commit: str = ""
+class TaskResult(_Base):
+    type: Literal["task.result"] = "task.result"
+    task_id: str
+    attempt: int = Field(ge=1)
+    lease_token: str
+    outcome: TaskOutcome
+    evidence: dict[str, Any] = Field(default_factory=dict)
+    commit_sha: str = ""
     branch: str = ""
+    changed_files: list[str] = Field(default_factory=list)
+    log_tail: str = ""
+    session_ref: str = ""
 
 
-class EnvironmentState(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    git_head: str = ""
-    working_tree_clean: bool = False
-
-
-class ExecutionResult(BaseModel):
-    """Executor -> Planner."""
-
-    model_config = ConfigDict(extra="forbid", populate_by_name=True)
-
-    schema_version: str = Field(default=SCHEMA_VERSION, alias="$schema_version")
-    task_issue: int
-    status: Literal["completed", "failed", "timeout", "blocked"]
-    summary: str = ""
-    evidence: Evidence = Field(default_factory=Evidence)
-    artifact_delta: ArtifactDelta = Field(default_factory=ArtifactDelta)
-    environment_state: EnvironmentState = Field(default_factory=EnvironmentState)
-    # Project the task belonged to, echoed from the brief (issue #18).
-    project_id: int = 0
-
-    def to_json(self) -> str:
-        return self.model_dump_json(by_alias=True)
-
-    @classmethod
-    def from_json(cls, raw: str | bytes) -> "ExecutionResult":
-        return validate_execution_result(json.loads(raw))
+class ExecutorAlive(_Base):
+    type: Literal["executor.alive"] = "executor.alive"
+    executor_id: str
+    capacity: int = 1
+    version: str = ""
 
 
-class AlertEvent(BaseModel):
-    """Watchdog -> Planner / UI."""
+Message = Union[
+    TaskDispatch, TaskCancel,
+    TaskStarted, TaskHeartbeat, TaskQuestion, TaskResult, ExecutorAlive,
+]
 
-    model_config = ConfigDict(extra="forbid")
-
-    severity: Literal["info", "warning", "critical"]
-    source: str
-    message: str
-    timestamp: str
-    requirement_number: Optional[int] = None
-    task_number: Optional[int] = None
-    actions: list[str] = Field(default_factory=list)
-
-    def to_json(self) -> str:
-        return self.model_dump_json()
-
-    @classmethod
-    def from_json(cls, raw: str | bytes) -> "AlertEvent":
-        return AlertEvent.model_validate_json(raw)
-
-
-class CommandEnvelope(BaseModel):
-    """User chat -> orchestrator steering."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    action: str
-    args: dict[str, Any] = Field(default_factory=dict)
-    raw_text: str = ""
-    issued_at: str = ""
-
-    def to_json(self) -> str:
-        return self.model_dump_json()
-
-    @classmethod
-    def from_json(cls, raw: str | bytes) -> "CommandEnvelope":
-        return CommandEnvelope.model_validate_json(raw)
-
-
-class Heartbeat(BaseModel):
-    """Long-running service -> watchdog."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    service: str
-    pid: int = 0
-    timestamp: str
-    detail: str = ""
-
-    def to_json(self) -> str:
-        return self.model_dump_json()
-
-    @classmethod
-    def from_json(cls, raw: str | bytes) -> "Heartbeat":
-        return Heartbeat.model_validate_json(raw)
-
-
-# ---- explicit validators (clear errors, stable surface) ----------------
-
-def validate_task_brief(payload: Any) -> TaskBrief:
-    try:
-        return TaskBrief.model_validate(payload)
-    except Exception as exc:  # pydantic ValidationError
-        raise ContractError(f"invalid TaskBrief: {exc}") from exc
-
-
-def validate_execution_result(payload: Any) -> ExecutionResult:
-    try:
-        return ExecutionResult.model_validate(payload)
-    except Exception as exc:
-        raise ContractError(f"invalid ExecutionResult: {exc}") from exc
-
-
-def validate_alert(payload: Any) -> AlertEvent:
-    try:
-        return AlertEvent.model_validate(payload)
-    except Exception as exc:
-        raise ContractError(f"invalid AlertEvent: {exc}") from exc
-
-
-def validate_command(payload: Any) -> CommandEnvelope:
-    try:
-        return CommandEnvelope.model_validate(payload)
-    except Exception as exc:
-        raise ContractError(f"invalid CommandEnvelope: {exc}") from exc
-
-
-VALIDATORS = {
-    "task_brief": validate_task_brief,
-    "execution_result": validate_execution_result,
-    "alert": validate_alert,
-    "command": validate_command,
-    "heartbeat": Heartbeat.model_validate,
+_MESSAGE_TYPES: dict[str, type[BaseModel]] = {
+    "task.dispatch": TaskDispatch,
+    "task.cancel": TaskCancel,
+    "task.started": TaskStarted,
+    "task.heartbeat": TaskHeartbeat,
+    "task.question": TaskQuestion,
+    "task.result": TaskResult,
+    "executor.alive": ExecutorAlive,
 }
 
+TASK_STREAM_TYPES = {"task.dispatch", "task.cancel"}
+EVENT_STREAM_TYPES = set(_MESSAGE_TYPES) - TASK_STREAM_TYPES
 
-def validate_json(schema_name: str, payload: Any) -> BaseModel:
+
+class ContractError(Exception):
+    pass
+
+
+def parse_message(raw: Union[str, bytes, dict]) -> Message:
+    """Parse + validate one bus message. Raises ContractError on anything invalid."""
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode("utf-8")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ContractError(f"not json: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise ContractError("message must be an object")
+    mtype = raw.get("type")
+    model = _MESSAGE_TYPES.get(mtype)
+    if model is None:
+        raise ContractError(f"unknown message type {mtype!r}")
     try:
-        validator = VALIDATORS[schema_name]
-    except KeyError:
-        raise ContractError(f"unknown schema {schema_name!r}")
-    return validator(payload)
+        return model.model_validate(raw)  # type: ignore[return-value]
+    except Exception as exc:
+        raise ContractError(f"invalid {mtype}: {exc}") from exc
+
+
+def envelope_size_ok(msg: _Base) -> bool:
+    return len(msg.model_dump_json().encode("utf-8")) <= MAX_PAYLOAD_BYTES
+
+
+def dump_message(msg: _Base) -> str:
+    if not envelope_size_ok(msg):
+        raise ContractError(
+            f"message {msg.type} exceeds {MAX_PAYLOAD_BYTES} bytes payload cap")
+    return msg.model_dump_json()
+
+
+# ------------------------------------------------------------------- plan schema
+class PlanTask(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    title: str = Field(min_length=1)
+    objective: str = Field(min_length=1)
+    acceptance: str = Field(min_length=1)
+    run: list[str] = Field(min_length=1)
+    writable: list[str] = Field(min_length=1)
+    forbidden: list[str] = Field(default_factory=list)
+    depends_on: list[int] = Field(default_factory=list)  # sequence_index values
+
+
+class Plan(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    tasks: list[PlanTask]
+
+
+class PlanValidationError(Exception):
+    pass
+
+
+def validate_plan(plan: Plan, max_tasks: int = 7) -> None:
+    """Raise PlanValidationError unless the plan is structurally sound.
+
+    Rules (§8): 1..max_tasks tasks, unique titles, contiguous sequence_index
+    (implicit by list order, 1-based), depends_on acyclic and referencing
+    earlier tasks only, every task has >=1 run command and writable globs.
+    """
+    if not (1 <= len(plan.tasks) <= max_tasks):
+        raise PlanValidationError(
+            f"plan must have 1..{max_tasks} tasks, got {len(plan.tasks)}")
+    titles = [t.title for t in plan.tasks]
+    if len(set(titles)) != len(titles):
+        raise PlanValidationError("task titles must be unique")
+    n = len(plan.tasks)
+    for i, t in enumerate(plan.tasks, start=1):
+        for dep in t.depends_on:
+            if dep >= i:
+                raise PlanValidationError(
+                    f"task {i} ({t.title!r}) depends on {dep}: depends_on must "
+                    "reference earlier tasks only (acyclic by construction)")
+            if dep < 1:
+                raise PlanValidationError(f"task {i} has invalid depends_on {dep}")
+        if not t.run or not all(r.strip() for r in t.run):
+            raise PlanValidationError(f"task {i} needs >=1 non-empty run command")
+        if not t.writable or not all(g.strip() for g in t.writable):
+            raise PlanValidationError(f"task {i} needs >=1 writable glob")
+    # explicit cycle guard (defence in depth; earlier-only refs already forbid cycles)
+    _assert_acyclic(plan)
+
+
+def _assert_acyclic(plan: Plan) -> None:
+    deps = {i + 1: set(t.depends_on) for i, t in enumerate(plan.tasks)}
+    seen: set[int] = set()
+    stack: set[int] = set()
+
+    def visit(node: int) -> None:
+        if node in stack:
+            raise PlanValidationError(f"dependency cycle at task {node}")
+        if node in seen:
+            return
+        stack.add(node)
+        for d in deps.get(node, set()):
+            visit(d)
+        stack.discard(node)
+        seen.add(node)
+
+    for node in deps:
+        visit(node)

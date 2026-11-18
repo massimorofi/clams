@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$(readlink -f "$0")")"
+P=clams; DC=(docker compose -p "$P" -f docker-compose.yml)
+
+die(){ echo "[-] $*" >&2; exit 1; }
+need(){ docker info >/dev/null 2>&1 || die "Docker daemon not running"
+        docker compose version >/dev/null 2>&1 || die "docker compose v2 required"
+        [[ -f .env ]] || die ".env missing (cp .env.example .env)"; }
+confirm(){ [[ "${YES:-}" == 1 ]] && return; read -rp "$1 [y/N] " a; [[ $a == y ]] || exit 1; }
+
+case "${1:-}" in
+  start)   need; "${DC[@]}" up -d --wait && echo "[+] UI: http://localhost:8200" ;;
+  stop)    need; "${DC[@]}" stop ;;
+  restart) need; "${DC[@]}" restart ${2:-} ;;
+  rebuild) need; "${DC[@]}" pull --ignore-buildable || true
+           "${DC[@]}" build --pull
+           "${DC[@]}" up -d --wait --force-recreate ;;
+  status)  need; "${DC[@]}" ps
+           "${DC[@]}" exec -T planner clams status || true ;;
+  logs)    need; "${DC[@]}" logs -f --tail=200 ${2:-} ;;
+  migrate) need; "${DC[@]}" run --rm planner clams migrate ;;
+  backup)  need; mkdir -p backups
+           "${DC[@]}" exec -T planner sqlite3 /data/clams.db ".backup /data/backup.db"
+           "${DC[@]}" cp planner:/data/backup.db "backups/clams-$(date +%Y%m%d-%H%M%S).db" ;;
+  pause|resume) need; "${DC[@]}" exec -T planner clams command "$1" --by operator ;;
+  down)    need; confirm "Remove containers (volumes kept)?"; "${DC[@]}" down ;;
+  nuke)    need; confirm "DELETE ALL DATA incl. DB and queues?"; "${DC[@]}" down -v ;;
+  *) echo "Usage: clamsctl {start|stop|restart [svc]|rebuild|status|logs [svc]|migrate|backup|pause|resume|down|nuke}"; exit 1 ;;
+esac

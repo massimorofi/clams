@@ -1,222 +1,113 @@
 import type {
-  AgentMutationResponse,
-  AgentProbeResult,
-  AgentsResponse,
-  CliResult,
-  ConfigPutResponse,
-  ConfigResponse,
-  ProjectInfo,
-  StatusPayload,
-  AlertRow,
-  WorkItemRow,
-  ProjectRow,
-  ProjectCreateResult,
-  AlertAckResult,
-} from './types'
+  Command,
+  CommandAck,
+  CommandRequest,
+  Overview,
+  Project,
+  Question,
+  TaskDetail,
+  Transcript,
+  Workflow,
+  WorkflowDetail,
+} from './types';
 
-const BASE = '/api/v1'
+export const TOKEN_KEY = 'clams_api_token';
 
-async function req<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json' },
-    ...init,
-  })
-  if (!res.ok) {
-    let detail = `${res.status} ${res.statusText}`
-    try {
-      const body = await res.json()
-      if (body?.detail) detail = String(body.detail)
-    } catch {
-      /* non-JSON error body */
-    }
-    throw new Error(detail)
+export function getToken(): string {
+  try {
+    return localStorage.getItem(TOKEN_KEY) ?? '';
+  } catch {
+    return '';
   }
-  return (await res.json()) as T
+}
+
+export function setToken(token: string): void {
+  try {
+    if (token) localStorage.setItem(TOKEN_KEY, token);
+    else localStorage.removeItem(TOKEN_KEY);
+  } catch {
+    /* storage unavailable */
+  }
+}
+
+export class ApiError extends Error {
+  status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+  }
+}
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const headers = new Headers(init?.headers ?? {});
+  const token = getToken();
+  if (token) headers.set('Authorization', `Bearer ${token}`);
+  if (init?.body !== undefined && !headers.has('Content-Type')) {
+    headers.set('Content-Type', 'application/json');
+  }
+
+  let res: Response;
+  try {
+    res = await fetch(`/api/v1${path}`, { ...init, headers });
+  } catch {
+    throw new ApiError(0, 'Network error — is the Clams API reachable?');
+  }
+
+  const text = await res.text();
+  let data: unknown = null;
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = text;
+    }
+  }
+
+  if (!res.ok) {
+    let msg = res.statusText || `HTTP ${res.status}`;
+    if (typeof data === 'string' && data) msg = data;
+    else if (data && typeof data === 'object') {
+      const d = data as Record<string, unknown>;
+      if (typeof d.detail === 'string') msg = d.detail;
+      else if (typeof d.message === 'string') msg = d.message;
+    }
+    if (res.status === 401 || res.status === 403) {
+      msg = 'Unauthorized — set the API bearer token in Settings.';
+    }
+    throw new ApiError(res.status, msg);
+  }
+  return data as T;
 }
 
 export const api = {
-  getStatus: () => req<StatusPayload>('/status'),
-  getProject: () => req<ProjectInfo>('/project'),
-  pullProject: () => req<ProjectInfo>('/project/pull', { method: 'POST' }),
-  getConfig: () => req<ConfigResponse>('/config'),
-  putConfig: (values: Record<string, unknown>) =>
-    req<ConfigPutResponse>('/config', {
-      method: 'PUT',
-      body: JSON.stringify({ values }),
-    }),
-  cliExec: (command: string, args: string[] = [], timeout = 300) =>
-    req<CliResult>('/cli/exec', {
-      method: 'POST',
-      body: JSON.stringify({ command, args, timeout }),
-    }),
-  plannerAction: (body: {
-    action: string
-    requirement_number?: number
-    task_number?: number
-    detail?: string
-  }) => req<{ ok: boolean }>('/planner/action', { method: 'POST', body: JSON.stringify(body) }),
-  plannerMessage: (message: string, requirement_number?: number) =>
-    req<{ reply: string }>('/planner/message', {
-      method: 'POST',
-      body: JSON.stringify({ message, requirement_number }),
-    }),
-  getAlerts: (limit = 100, severity?: string) =>
-    req<{ alerts: AlertRow[] }>(
-      `/alerts?limit=${limit}${severity ? `&severity=${severity}` : ''}`,
-    ),
-  getTasks: () => req<{ tasks: WorkItemRow[] }>('/tasks'),
-  // --- issue #15 additions ---
-  listProjects: () => req<{ projects: ProjectRow[] }>('/projects'),
-  createProject: (name: string, url: string) =>
-    req<ProjectCreateResult>('/projects', {
-      method: 'POST',
-      body: JSON.stringify({ name, url }),
-    }),
-  // --- issue #18: project provisioning lifecycle ---
-  syncProject: (id: number) =>
-    req<{ ok: boolean; project: ProjectRow; commit?: string }>(
-      `/projects/${id}/sync`,
-      { method: 'POST' },
-    ),
-  pauseProject: (id: number) =>
-    req<{ ok: boolean; project: ProjectRow }>(`/projects/${id}/pause`, {
-      method: 'POST',
-    }),
-  resumeProject: (id: number) =>
-    req<{ ok: boolean; project: ProjectRow }>(`/projects/${id}/resume`, {
-      method: 'POST',
-    }),
-  ackAlert: (id: number) =>
-    req<AlertAckResult>(`/alerts/${id}/ack`, { method: 'POST' }),
-  ackAllAlerts: (severity?: string) =>
-    req<AlertAckResult>('/alerts/ack', {
-      method: 'POST',
-      body: JSON.stringify(severity ? { severity } : {}),
-    }),
-  // Acknowledging only marks an alert read; the row stays in the feed. This
-  // actually deletes them (defaults to acknowledged rows only).
-  purgeAlerts: (opts: { severity?: string; includeUnacked?: boolean } = {}) => {
-    const q = new URLSearchParams()
-    if (opts.severity) q.set('severity', opts.severity)
-    if (opts.includeUnacked) q.set('acknowledged_only', 'false')
-    const qs = q.toString()
-    return req<{ ok: boolean; removed: number; remaining: number }>(
-      `/alerts${qs ? `?${qs}` : ''}`,
-      { method: 'DELETE' },
-    )
+  overview: () => request<Overview>('/overview'),
+
+  workflows: (status?: string) =>
+    request<Workflow[]>(`/workflows${status ? `?status=${encodeURIComponent(status)}` : ''}`),
+
+  workflow: (id: string) => request<WorkflowDetail>(`/workflows/${encodeURIComponent(id)}`),
+
+  task: (id: string) => request<TaskDetail>(`/tasks/${encodeURIComponent(id)}`),
+
+  transcript: (id: string) =>
+    request<Transcript>(`/tasks/${encodeURIComponent(id)}/transcript`),
+
+  questions: (status = 'open') =>
+    request<Question[]>(`/questions?status=${encodeURIComponent(status)}`),
+
+  projects: async (): Promise<Project[]> => {
+    const raw = await request<unknown>('/projects');
+    if (Array.isArray(raw)) return raw as Project[];
+    if (raw && typeof raw === 'object' && Array.isArray((raw as { projects?: unknown }).projects)) {
+      return (raw as { projects: Project[] }).projects;
+    }
+    return [];
   },
-  // --- issue #19: agent registry ---
-  listAgents: () => req<AgentsResponse>('/agents'),
-  createAgent: (body: {
-    id: string
-    role: string
-    base_url: string
-    auth_token?: string
-    enabled?: boolean
-    request_timeout?: number
-  }) =>
-    req<AgentMutationResponse>('/agents', {
-      method: 'POST',
-      body: JSON.stringify(body),
-    }),
-  updateAgent: (
-    id: string,
-    body: {
-      role?: string
-      base_url?: string
-      auth_token?: string
-      enabled?: boolean
-      request_timeout?: number
-    },
-  ) =>
-    req<AgentMutationResponse>(`/agents/${encodeURIComponent(id)}`, {
-      method: 'PUT',
-      body: JSON.stringify(body),
-    }),
-  deleteAgent: (id: string) =>
-    req<AgentMutationResponse>(`/agents/${encodeURIComponent(id)}`, {
-      method: 'DELETE',
-    }),
-  probeAgent: (id: string) =>
-    req<AgentProbeResult>(`/agents/${encodeURIComponent(id)}/probe`, {
-      method: 'POST',
-    }),
-}
 
-/**
- * Subscribe to the SSE telemetry stream. Returns a disposer that closes the
- * underlying EventSource.
- */
-export function subscribeEvents(
-  handlers: Record<string, (data: any) => void>,
-): () => void {
-  const es = new EventSource('/api/v1/events')
-  for (const [name, fn] of Object.entries(handlers)) {
-    es.addEventListener(name, (ev: MessageEvent) => {
-      try {
-        fn(JSON.parse(ev.data))
-      } catch {
-        fn(ev.data)
-      }
-    })
-  }
-  return () => es.close()
-}
+  command: (id: string | number) => request<Command>(`/commands/${encodeURIComponent(String(id))}`),
 
-/**
- * Planner chat over WebSocket, with a REST fallback: if the socket cannot be
- * opened or dies, sends still succeed via POST so chat never becomes a dead end.
- */
-export class PlannerSocket {
-  private ws: WebSocket | null = null
-  private open = false
-
-  connect(onReply: (text: string) => void, onSystem?: (text: string) => void) {
-    try {
-      const proto = window.location.protocol === 'https:' ? 'wss' : 'ws'
-      this.ws = new WebSocket(`${proto}://${window.location.host}/ws`)
-      this.ws.onopen = () => {
-        this.open = true
-        onSystem?.('connected to planner over websocket')
-      }
-      this.ws.onmessage = (ev) => {
-        try {
-          const msg = JSON.parse(ev.data)
-          if (msg.event === 'planner:reply') onReply(String(msg.data?.reply ?? ''))
-          else if (msg.event === 'error') onSystem?.(String(msg.data?.message ?? 'error'))
-        } catch {
-          onReply(String(ev.data))
-        }
-      }
-      this.ws.onclose = () => {
-        this.open = false
-        onSystem?.('websocket closed, falling back to REST')
-      }
-      this.ws.onerror = () => {
-        this.open = false
-      }
-    } catch {
-      onSystem?.('websocket unavailable, using REST')
-    }
-  }
-
-  async send(message: string, requirement_number?: number) {
-    if (this.open && this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ type: 'planner:message', message, requirement_number }))
-      return
-    }
-    // Fallback so chat works even without a live socket.
-    const r = await api.plannerMessage(message, requirement_number)
-    return r.reply
-  }
-
-  close() {
-    try {
-      this.ws?.close()
-    } catch {
-      /* already closed */
-    }
-    this.ws = null
-    this.open = false
-  }
-}
+  sendCommand: (body: CommandRequest) =>
+    request<CommandAck>('/commands', { method: 'POST', body: JSON.stringify(body) }),
+};

@@ -39,6 +39,7 @@
 #   CLAMS_AGENT_IMAGE (claudio/agent:latest)
 #   CLAMS_AGENT_AUTH_TOKEN (dev-token-change-me)
 #
+
 set -euo pipefail
 
 # --- resolve repo root from this script's location, so it works from anywhere ---

@@ -1,29 +1,10 @@
-"""Clams — Claudio Multi-Agent System.
+"""Clams v2 — planner/executor/api over one SQLite DB and two Redis streams.
 
-Standalone orchestrator wrapping decoupled Claudio Planner/Executor instances:
-GitHub work queue, handoffs, leases, outbox, and a zero-LLM watchdog.
+Invariants (enforced + tested):
+  1. Single writer: only the planner mutates domain tables.
+  2. DB is truth, queues are transport.
+  3. Every side-effect via outbox.
+  4. Evidence beats claims.
+  5. Everything bounded.
 """
-__version__ = "0.1.0"
-
-from .config import (  # noqa: F401
-    Settings,
-    GitHubSettings,
-    RedisSettings,
-    PlannerSettings,
-    ExecutorSettings,
-    StrixperSettings,
-    Limits,
-    PathsSettings,
-    WatchdogSettings,
-    get_settings,
-)
-from .db import (  # noqa: F401
-    Database,
-    Store,
-    WorkItem,
-    WorkItemRepo,
-    TaskClaimRepo,
-    AlertRepo,
-    OutboxRepo,
-    open_store,
-)
+__version__ = "2.0.0"

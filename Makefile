@@ -1,7 +1,7 @@
 PY ?= .venv/bin/python
 PIP ?= .venv/bin/pip
 
-.PHONY: venv install test lint doctor up down status clean dev dev-start dev-stop dev-restart dev-status dev-logs
+.PHONY: venv install test test-live test-redis migrate status up down clean
 
 venv:
 	python3 -m venv .venv
@@ -13,36 +13,23 @@ install:
 test:
 	$(PY) -m pytest
 
-doctor:
-	$(PY) -m clams.cli doctor
+test-redis:
+	CLAMS_REDIS_URL=redis://127.0.0.1:6379/0 $(PY) -m pytest
 
-up:
-	docker compose up -d
+test-live:
+	$(PY) -m pytest tests/contract -m live
 
-down:
-	docker compose down
+migrate:
+	$(PY) -m clams.cli migrate
 
 status:
 	$(PY) -m clams.cli status
 
+up:
+	./clamsctl start
+
+down:
+	YES=1 ./clamsctl down
+
 clean:
-	rm -rf .pytest_cache build dist *.egg-info
-
-# Local dev stack (backend API + Vite frontend). See scripts/dev.sh.
-dev:
-	./scripts/dev.sh start
-
-dev-start:
-	./scripts/dev.sh start
-
-dev-stop:
-	./scripts/dev.sh stop
-
-dev-restart:
-	./scripts/dev.sh restart
-
-dev-status:
-	./scripts/dev.sh status
-
-dev-logs:
-	./scripts/dev.sh logs
+	rm -rf .pytest_cache **/__pycache__ build dist *.egg-info

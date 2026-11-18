@@ -1,0 +1,25 @@
+# Clams v2 project registry, limits and agent wiring.
+# Loaded by the planner at start-up; edits reach it via the config_patch command.
+
+projects:
+  - repo: massimorofi/claudio
+    enabled: true
+    base_ref: main
+    # GitHub Projects V2 board (optional; requires a token with project scope)
+    gh_project_number: 0
+    status_field: Status
+
+limits:
+  max_attempts: 3
+  max_turns: 40
+  max_wall_s: 7200
+  max_replans: 3
+  max_plan_tasks: 7
+
+agents:
+  planner:
+    # Claudio-P: planning + review judgement
+    url: http://claudio-planner:8100
+  executor:
+    # Claudio-E: headless execution, approval_mode=off
+    url: http://claudio-executor:8100
