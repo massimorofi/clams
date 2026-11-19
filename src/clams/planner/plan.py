@@ -34,8 +34,10 @@ Goal (repo {repo}, base ref {base_ref}):
 {goal}
 """
 
-REPAIR_PROMPT = """Your previous plan was invalid: {error}
-Return the corrected JSON object only.
+REPAIR_SUFFIX = """
+
+IMPORTANT: your previous attempt was invalid: {error}
+Fix exactly that and return the corrected JSON object only — no prose.
 """
 
 
@@ -108,7 +110,12 @@ def plan_workflow(conn, claudio_p, settings, workflow_id: str,
         except Exception as exc:  # noqa: BLE001 - any LLM failure -> repair retry
             errors.append(str(exc)[:300])
             plan = None
-            prompt = REPAIR_PROMPT.format(error=errors[-1])
+            # keep the full original prompt (goal + schema) — a bare error
+            # message gives the model nothing to repair against
+            prompt = (PLAN_PROMPT.format(max_tasks=settings.max_plan_tasks,
+                                         repo=repo, base_ref=base_ref,
+                                         goal=goal)
+                      + REPAIR_SUFFIX.format(error=errors[-1]))
     if plan is None:
         with immediate(conn):
             repo_workflows.set_status(conn, workflow_id, "blocked")
@@ -117,6 +124,9 @@ def plan_workflow(conn, claudio_p, settings, workflow_id: str,
                                     f"{errors[-1] if errors else 'unknown'}")
             repo_events.append_event(conn, "workflow", workflow_id, "error",
                                      "planning failed after repair retry")
+            from ..github import projection
+            projection.project_workflow_state(conn, workflow_id, repo,
+                                              "blocked")
         return "blocked"
 
     with immediate(conn):

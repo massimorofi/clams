@@ -188,17 +188,52 @@ class GitHubClient:
                 "options": {o["name"]: o["id"]
                             for o in status_field["options"]}}
 
+    def list_board_items(self, project_node_id: str) -> dict[int, str]:
+        """Map issue number -> Status option name for every issue card on the
+        board (first 100 items). Drafts/PRs and items without a Status value
+        are skipped."""
+        data = self._graphql(
+            "query($p: ID!) { node(id: $p) { ... on ProjectV2 { "
+            "items(first: 100) { nodes { content { ... on Issue { number } } "
+            "fieldValues(first: 20) { nodes { "
+            "... on ProjectV2ItemFieldSingleSelectValue { name "
+            "field { ... on ProjectV2FieldCommon { name } } } } } } } } } }",
+            {"p": project_node_id})
+        out: dict[int, str] = {}
+        try:
+            nodes = data["node"]["items"]["nodes"]
+        except (TypeError, KeyError):
+            return out
+        for n in nodes:
+            number = (n.get("content") or {}).get("number")
+            if number is None:
+                continue
+            for fv in (n.get("fieldValues") or {}).get("nodes", []):
+                if (fv.get("field") or {}).get("name") == "Status" and fv.get("name"):
+                    out[number] = fv["name"]
+                    break
+        return out
+
     def move_card(self, project_node_id: Optional[str], issue_number: int,
-                  option_id: str, *, idempotency_key: str = "") -> bool:
-        """Move the issue's project card to a status option (GraphQL)."""
+                  option_name: str, *, idempotency_key: str = "") -> bool:
+        """Move the issue's project card to the Status option with this name.
+
+        Raises GitHubError when the card or option is missing so the outbox
+        retries (and eventually dead-letters) instead of silently no-oping.
+        """
         if not project_node_id:
-            return False
+            raise GitHubError("move_card: no project node id")
         item = self._card_item(project_node_id, issue_number)
         if not item:
-            return False
-        field_id = self._status_field_id(project_node_id)
-        if not field_id:
-            return False
+            raise GitHubError(
+                f"move_card: issue #{issue_number} has no card on board "
+                f"{project_node_id}")
+        field_id, options = self._status_field_and_options(project_node_id)
+        option_id = options.get(option_name)
+        if not option_id:
+            raise GitHubError(
+                f"move_card: board has no Status option {option_name!r} "
+                f"(has: {sorted(options)})")
         self._graphql(
             "mutation($p: ID!, $i: ID!, $f: ID!, $v: String!) { "
             "updateProjectV2ItemFieldValue(input: {projectId: $p, itemId: $i, "
@@ -220,18 +255,19 @@ class GitHubClient:
             return None
         return None
 
-    def _status_field_id(self, project_node_id: str) -> Optional[str]:
+    def _status_field_and_options(self, project_node_id: str) -> tuple[str, dict]:
+        """Return (status_field_id, {option_name: option_id})."""
         data = self._graphql(
             "query($p: ID!) { node(id: $p) { ... on ProjectV2 { "
             "fields(first: 20) { nodes { ... on ProjectV2SingleSelectField "
-            "{ id name } } } } } }", {"p": project_node_id})
+            "{ id name options { id name } } } } } } }", {"p": project_node_id})
         try:
             for f in data["node"]["fields"]["nodes"]:
                 if f.get("name") == "Status":
-                    return f["id"]
+                    return f["id"], {o["name"]: o["id"] for o in f["options"]}
         except (TypeError, KeyError):
-            return None
-        return None
+            pass
+        raise GitHubError(f"board {project_node_id} has no Status field")
 
     def health(self) -> bool:
         """HEAD reachability probe (watchdog)."""

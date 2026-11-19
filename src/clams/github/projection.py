@@ -58,9 +58,31 @@ def project_task_state(conn, task_id: str, repo: str, state: str,
              "idempotency_key": key}, idempotency_key=key)
 
 
+# Board-driven projects: workflow state -> Projects V2 Status option name.
+# "blocked" lands on In review (board has no Blocked column; user decision).
+BOARD_STATE_OPTION = {"running": "In progress", "review": "In review",
+                      "done": "Done", "blocked": "In review",
+                      "cancelled": "Backlog"}
+
+
 def project_workflow_state(conn, workflow_id: str, repo: str, state: str) -> None:
     wf = repo_workflows.get_workflow(conn, workflow_id)
     if wf is None or not wf["gh_issue_number"]:
+        return
+    row = conn.execute(
+        "SELECT gh_project_node_id FROM projects WHERE project_id=?",
+        (wf["project_id"],)).fetchone()
+    node_id = row["gh_project_node_id"] if row else None
+    if node_id:
+        # board-only: the card column IS the status; no status:* labels
+        option = BOARD_STATE_OPTION.get(state)
+        if option:
+            key = f"gh:gh_board_move:wf:{workflow_id}:{state}"
+            repo_outbox.enqueue(
+                conn, "gh_board_move",
+                {"project_node_id": node_id, "issue": wf["gh_issue_number"],
+                 "option_name": option, "idempotency_key": key},
+                idempotency_key=key)
         return
     label = {"done": STATUS_DONE, "blocked": STATUS_BLOCKED,
              "cancelled": "status:Cancelled"}.get(state)

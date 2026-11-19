@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any, Optional
 
 from ..db import (repo_commands, repo_events, repo_projects, repo_questions,
@@ -13,15 +14,20 @@ log = logging.getLogger("clams.commands")
 
 TERMINAL_TASK = {"success", "failed", "cancelled"}
 
+# https://github.com/users/<owner>/projects/<n> | /organizations/<owner>/... | <owner>/...
+_BOARD_URL_RE = re.compile(
+    r"github\.com/(?:users/|organizations/|orgs/)?([^/]+)/projects/(\d+)")
 
-def drain_commands(conn, *, adhoc_handler=None) -> int:
+
+def drain_commands(conn, *, adhoc_handler=None, gh_client=None) -> int:
     """Apply all new commands. Returns count applied."""
     rows = repo_commands.fetch_new(conn)
     n = 0
     for row in rows:
         try:
             with immediate(conn):
-                result = _apply(conn, row, adhoc_handler=adhoc_handler)
+                result = _apply(conn, row, adhoc_handler=adhoc_handler,
+                                gh_client=gh_client)
             repo_commands.mark(conn, row["command_id"], "applied", result)
             n += 1
         except Exception as exc:  # noqa: BLE001
@@ -32,7 +38,7 @@ def drain_commands(conn, *, adhoc_handler=None) -> int:
     return n
 
 
-def _apply(conn, row, *, adhoc_handler=None) -> dict[str, Any]:
+def _apply(conn, row, *, adhoc_handler=None, gh_client=None) -> dict[str, Any]:
     kind = row["kind"]
     target = row["target"]
     payload = json.loads(row["payload"]) if row["payload"] else {}
@@ -113,7 +119,7 @@ def _apply(conn, row, *, adhoc_handler=None) -> dict[str, Any]:
         return {"workflow": wf}
 
     if kind == "config_patch":
-        return _config_patch(conn, payload, issuer)
+        return _config_patch(conn, payload, issuer, gh_client=gh_client)
 
     raise ValueError(f"unhandled command kind {kind}")
 
@@ -142,7 +148,42 @@ def _cancel(conn, target: Optional[str], payload: dict, issuer: str) -> dict:
     return {"workflow": target, "status": "cancelled"}
 
 
-def _config_patch(conn, payload: dict, issuer: str) -> dict:
+def _resolve_board(gh_client, board_url: str) -> dict:
+    """Turn a Projects V2 board URL into stored node IDs.
+
+    Returns a dict with gh_project_node_id / status_field_id / ready_option_id.
+    Raises ValueError with an operator-readable reason on any failure.
+    """
+    if gh_client is None:
+        raise ValueError("gh_board_url needs a configured GitHub client "
+                         "(CLAMS_GITHUB_TOKEN)")
+    m = _BOARD_URL_RE.search(str(board_url))
+    if not m:
+        raise ValueError(f"cannot parse board URL {board_url!r} "
+                         "(expected github.com/users/<owner>/projects/<n>)")
+    owner, number = m.group(1), int(m.group(2))
+    try:
+        info = gh_client.resolve_project(owner, number)
+    except Exception as exc:  # noqa: BLE001 — raw GraphQL/HTTP dumps are noise
+        raise ValueError(
+            f"could not resolve board {owner}/projects/{number} — is it a "
+            "user board, and does the GitHub token have the 'project' scope? "
+            f"({str(exc)[:120]})") from exc
+    if info is None:
+        raise ValueError(
+            f"board {owner}/projects/{number} not found — user boards only, "
+            "and the token needs the 'project' scope")
+    options = info.get("options", {})
+    if "Ready" not in options:
+        raise ValueError(f"board {owner}/projects/{number} has no 'Ready' "
+                         f"Status option (has: {sorted(options)})")
+    return {"gh_project_node_id": info["node_id"],
+            "status_field_id": info["status_field_id"],
+            "ready_option_id": options["Ready"]}
+
+
+def _config_patch(conn, payload: dict, issuer: str,
+                  gh_client=None) -> dict:
     projects = payload.get("projects")
     if not isinstance(projects, list):
         raise ValueError("config_patch needs projects: [...]")
@@ -151,6 +192,8 @@ def _config_patch(conn, payload: dict, issuer: str) -> dict:
         repo = p.get("repo")
         if not repo or "/" not in repo:
             raise ValueError(f"bad project repo {repo!r}")
+        if p.get("gh_board_url") and not p.get("gh_project_node_id"):
+            p = {**p, **_resolve_board(gh_client, p["gh_board_url"])}
         if p.get("remove"):
             existing = repo_projects.get_project(conn, repo)
             if existing is None:

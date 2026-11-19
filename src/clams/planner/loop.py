@@ -62,7 +62,8 @@ class PlannerLoop:
         paused = repo_runtime.is_paused(self.conn)
 
         # 1. commands (interrupt priority, applied even when paused)
-        stats["commands"] = commands_mod.drain_commands(self.conn)
+        stats["commands"] = commands_mod.drain_commands(
+            self.conn, gh_client=self.gh_client)
 
         # 2-5. planning work only when not paused
         if not paused:

@@ -87,7 +87,7 @@ class OutboxRelay:
                           idempotency_key=payload.get("idempotency_key", ""))
         elif kind == "gh_board_move":
             gh.move_card(payload.get("project_node_id"), payload["issue"],
-                         payload["option_id"],
+                         payload["option_name"],
                          idempotency_key=payload.get("idempotency_key", ""))
         elif kind == "gh_subissue":
             if payload.get("child"):

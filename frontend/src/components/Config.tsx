@@ -52,9 +52,7 @@ function Field({
 function AddProjectModal({ onClose }: { onClose: () => void }) {
   const { submit } = useCommand();
   const [repo, setRepo] = useState('');
-  const [nodeId, setNodeId] = useState('');
-  const [statusField, setStatusField] = useState('');
-  const [readyOption, setReadyOption] = useState('');
+  const [boardUrl, setBoardUrl] = useState('');
   const [sending, setSending] = useState(false);
 
   const repoOk = /^\S+\/\S+$/.test(repo.trim());
@@ -64,9 +62,7 @@ function AddProjectModal({ onClose }: { onClose: () => void }) {
     setSending(true);
     try {
       const entry: Record<string, unknown> = { repo: repo.trim(), enabled: true };
-      if (nodeId.trim()) entry.gh_project_node_id = nodeId.trim();
-      if (statusField.trim()) entry.status_field_id = statusField.trim();
-      if (readyOption.trim()) entry.ready_option_id = readyOption.trim();
+      if (boardUrl.trim()) entry.gh_board_url = boardUrl.trim();
       await submit('config_patch', {
         payload: { projects: [entry] },
         label: `add ${repo.trim()}`,
@@ -115,27 +111,22 @@ function AddProjectModal({ onClose }: { onClose: () => void }) {
           </p>
           <details className="text-sm">
             <summary className="cursor-pointer text-slate-500 dark:text-slate-400">
-              Optional: GitHub Projects V2 board
+              Optional: link a GitHub Projects V2 board
             </summary>
-            <div className="mt-3 space-y-3">
+            <div className="mt-3 space-y-2">
               <Field
-                label="Project node ID"
-                value={nodeId}
-                onChange={setNodeId}
-                placeholder="PVT_xxx"
+                label="Board URL"
+                value={boardUrl}
+                onChange={setBoardUrl}
+                placeholder="https://github.com/users/you/projects/2"
               />
-              <Field
-                label="Status field ID"
-                value={statusField}
-                onChange={setStatusField}
-                placeholder="PVT_field_xxx"
-              />
-              <Field
-                label="Ready option ID"
-                value={readyOption}
-                onChange={setReadyOption}
-                placeholder="opt_xxx"
-              />
+              <p className="text-xs text-slate-400">
+                Clams resolves the board&apos;s Status field and its{' '}
+                <code className="font-mono">Ready</code> option automatically and moves
+                cards there on intake. Leave empty for label-only intake (the usual
+                case). Requires the GitHub token to have the{' '}
+                <code className="font-mono">project</code> scope.
+              </p>
             </div>
           </details>
           <div className="flex justify-end gap-2">

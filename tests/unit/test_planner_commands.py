@@ -140,6 +140,99 @@ def test_config_patch_toggle_preserves_metadata(db):
     assert p["enabled"] == 0 and p["gh_project_node_id"] == "P9"
 
 
+class _FakeGH:
+    def __init__(self, info):
+        self.info = info
+        self.calls = []
+
+    def resolve_project(self, owner, number):
+        self.calls.append((owner, number))
+        return self.info
+
+
+_BOARD_INFO = {"node_id": "PVT_1", "status_field_id": "PVTSSF_1",
+               "options": {"Ready": "r1", "Done": "d1"}}
+
+
+def _drain_gh(db, gh):
+    from clams.planner.commands import drain_commands
+    return drain_commands(db, gh_client=gh)
+
+
+def test_config_patch_board_url_resolves(db):
+    cid = repo_commands.insert_command(
+        db, "config_patch",
+        {"projects": [{"repo": "o/b",
+                       "gh_board_url":
+                       "https://github.com/users/massimorofi/projects/2"}]}, "op")
+    gh = _FakeGH(_BOARD_INFO)
+    _drain_gh(db, gh)
+    assert gh.calls == [("massimorofi", 2)]
+    assert repo_commands.get(db, cid)["status"] == "applied"
+    p = repo_projects.get_project(db, "o/b")
+    assert p["gh_project_node_id"] == "PVT_1"
+    assert p["status_field_id"] == "PVTSSF_1"
+    assert p["ready_option_id"] == "r1"
+
+
+def test_config_patch_board_url_org_style_parses(db):
+    repo_commands.insert_command(
+        db, "config_patch",
+        {"projects": [{"repo": "o/b",
+                       "gh_board_url": "https://github.com/organizations/acme/projects/7"}]},
+        "op")
+    gh = _FakeGH(_BOARD_INFO)
+    _drain_gh(db, gh)
+    assert gh.calls == [("acme", 7)]
+
+
+def test_config_patch_board_url_without_ready_option_rejected(db):
+    cid = repo_commands.insert_command(
+        db, "config_patch",
+        {"projects": [{"repo": "o/b",
+                       "gh_board_url": "github.com/users/o/projects/1"}]}, "op")
+    _drain_gh(db, _FakeGH({"node_id": "PVT_1", "status_field_id": "F",
+                           "options": {"Todo": "t"}}))
+    row = repo_commands.get(db, cid)
+    assert row["status"] == "rejected"
+    assert "Ready" in json.loads(row["result"])["error"]
+
+
+def test_config_patch_board_url_resolve_error_is_friendly(db):
+    class _Boom(_FakeGH):
+        def resolve_project(self, owner, number):
+            raise RuntimeError("graphql errors: INSUFFICIENT_SCOPES ...")
+
+    cid = repo_commands.insert_command(
+        db, "config_patch",
+        {"projects": [{"repo": "o/b",
+                       "gh_board_url": "https://github.com/users/o/projects/1"}]}, "op")
+    _drain_gh(db, _Boom(_BOARD_INFO))
+    row = repo_commands.get(db, cid)
+    assert row["status"] == "rejected"
+    err = json.loads(row["result"])["error"]
+    assert "project' scope" in err and "o/projects/1" in err
+
+
+def test_config_patch_board_url_unparseable_rejected(db):
+    cid = repo_commands.insert_command(
+        db, "config_patch",
+        {"projects": [{"repo": "o/b", "gh_board_url": "not a url"}]}, "op")
+    _drain_gh(db, _FakeGH(_BOARD_INFO))
+    assert repo_commands.get(db, cid)["status"] == "rejected"
+
+
+def test_config_patch_board_url_without_gh_client_rejected(db):
+    cid = repo_commands.insert_command(
+        db, "config_patch",
+        {"projects": [{"repo": "o/b",
+                       "gh_board_url": "https://github.com/users/o/projects/1"}]}, "op")
+    _drain(db)  # no gh_client wired
+    row = repo_commands.get(db, cid)
+    assert row["status"] == "rejected"
+    assert "GitHub client" in json.loads(row["result"])["error"]
+
+
 def test_bad_command_rejected_not_applied(db):
     cid = repo_commands.insert_command(db, "answer", {"question_id": 999}, "op")
     _drain(db)
