@@ -7,7 +7,8 @@ import { defineConfig } from '@playwright/test';
  */
 export default defineConfig({
   testDir: './e2e',
-  timeout: 60_000,
+  // live stack: a command can queue behind a multi-minute planning LLM call
+  timeout: 300_000,
   workers: 1, // tests mutate shared live state (pause, ad-hoc, questions)
   retries: 0,
   reporter: [['list']],

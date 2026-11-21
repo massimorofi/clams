@@ -35,15 +35,18 @@ async function command(kind: string, target?: string,
   return r.json();
 }
 
-/** Wait until the planner has applied a command (drain can lag behind LLM work). */
+/** Wait until the planner has applied a command (drain can lag behind LLM
+ * work and GitHub rate-limit backoff in the same cycle). */
 async function waitCommand(commandId: number) {
   await expect
     .poll(async () => (await api(`/commands/${commandId}`)).json().status,
-          { timeout: 120_000, message: `command ${commandId} not applied` })
+          { timeout: 240_000, message: `command ${commandId} not applied` })
     .toBe('applied');
 }
 
 async function setPaused(paused: boolean) {
+  const ov = await (await api('/overview')).json();
+  if (!!ov.paused === paused) return; // already in the desired state
   const ack = await command(paused ? 'pause' : 'resume');
   await waitCommand(ack.command_id);
 }
@@ -115,9 +118,11 @@ test.describe('Clams v2 SPA smoke', () => {
         return !!wfId;
       }, { timeout: 30_000 })
       .toBeTruthy();
-    // cancel it so the planner does not spend LLM budget on a no-op goal
-    const ack = await command('cancel', wfId);
-    await waitCommand(ack.command_id);
+    // Fire-and-forget cancel so the planner does not spend LLM budget on a
+    // no-op goal. Waiting for it to apply would queue behind the very
+    // planning call it is meant to prevent; issuing it immediately usually
+    // lands in the same drain cycle as the adhoc command, before planning.
+    await command('cancel', wfId);
   });
 
   test('question inbox: answering resumes the task', async ({ page }) => {
@@ -148,10 +153,15 @@ test.describe('Clams v2 SPA smoke', () => {
       await expect(card).toBeVisible({ timeout: 15_000 });
       await card.getByPlaceholder('Type an answer…').fill('blue');
       await card.getByRole('button', { name: 'Answer' }).click();
-      // cancel the seeded workflow immediately so the now-ready task is
-      // never dispatched to a real executor
-      const ack = await command('cancel', wfId);
-      await waitCommand(ack.command_id);
+      // poll the DB directly: the answer command's drain can lag behind any
+      // planning call still running in the planner cycle
+      await expect
+        .poll(() => sql(`SELECT status FROM questions WHERE
+                           idempotency_key='${QK}';`),
+              { timeout: 180_000 })
+        .toBe('answered');
+      // cancel the seeded workflow so the now-ready task is never dispatched
+      await command('cancel', wfId);
       const rows = sql(
         `SELECT status||':'||COALESCE(answer,'') FROM questions
            WHERE idempotency_key='${QK}';
