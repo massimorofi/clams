@@ -35,7 +35,7 @@ class OutboxRelay:
         sent = failed = dead = 0
         for row in rows:
             try:
-                self._dispatch(row)
+                self._dispatch(row, conn)
                 repo_outbox.mark_sent(conn, row["outbox_id"])
                 sent += 1
             except Exception as exc:  # noqa: BLE001 - relay must not die
@@ -57,7 +57,7 @@ class OutboxRelay:
         return {"sent": sent, "failed": failed, "dead": dead}
 
     # ------------------------------------------------------------------
-    def _dispatch(self, row) -> None:
+    def _dispatch(self, row, conn=None) -> None:
         kind = row["kind"]
         payload = json.loads(row["payload"])
         if kind == "bus_publish":
@@ -71,11 +71,13 @@ class OutboxRelay:
         if kind.startswith("gh_"):
             if self.gh is None:
                 raise RuntimeError("no GitHub client configured")
-            self._dispatch_gh(kind, payload)
+            self._dispatch_gh(kind, payload, conn=conn,
+                              outbox_id=row["outbox_id"])
             return
         raise ValueError(f"unknown outbox kind {kind!r}")
 
-    def _dispatch_gh(self, kind: str, payload: dict) -> None:
+    def _dispatch_gh(self, kind: str, payload: dict, *, conn=None,
+                     outbox_id: Optional[int] = None) -> None:
         gh = self.gh
         if kind == "gh_comment":
             gh.add_comment(payload["repo"], payload["issue"],
@@ -99,6 +101,11 @@ class OutboxRelay:
                     payload["repo"], payload["title"], payload["body"],
                     payload.get("labels", []))
                 number = created["number"]
+                # persist before linking: if addSubIssue fails, the retry
+                # takes the `child` path above instead of creating a dup
+                if conn is not None and outbox_id is not None:
+                    payload["child"] = number
+                    repo_outbox.set_payload(conn, outbox_id, payload)
                 gh.add_subissue(payload["repo"], payload["parent"], number)
                 if self.on_subissue_created:
                     self.on_subissue_created(payload["task_id"], number)

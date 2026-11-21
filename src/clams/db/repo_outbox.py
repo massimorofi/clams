@@ -58,6 +58,14 @@ def mark_sent(conn: sqlite3.Connection, outbox_id: int) -> None:
                  (outbox_id,))
 
 
+def set_payload(conn: sqlite3.Connection, outbox_id: int,
+                payload: dict[str, Any]) -> None:
+    """Persist updated payload mid-delivery (e.g. the created sub-issue
+    number) so a retry after partial success is not duplicated."""
+    conn.execute("UPDATE outbox SET payload=? WHERE outbox_id=?",
+                 (json.dumps(payload), outbox_id))
+
+
 def mark_failed(conn: sqlite3.Connection, outbox_id: int, error: str,
                 backoff_base_s: int, max_attempts: int) -> str:
     """Bump attempts + exponential backoff; dead after max_attempts. New status."""

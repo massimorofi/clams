@@ -149,7 +149,7 @@ class GitHubClient:
             return False
         self._graphql(
             "mutation($parent: ID!, $child: ID!) { "
-            "addSubIssue(input: {issueId: $parent, subordinateId: $child}) "
+            "addSubIssue(input: {issueId: $parent, subIssueId: $child}) "
             "{ issue { number } } }",
             {"parent": parent_id, "child": child_id})
         return True
