@@ -43,7 +43,7 @@ def create_app(settings, *, claudio_p: Optional[ClaudioClient] = None,
         allow_methods=["*"], allow_headers=["*"])
 
     def ro_dep() -> Iterator[sqlite3.Connection]:
-        conn = connect(settings.db_path, read_only=True)
+        conn = connect(settings.db_path, read_only=True, check_same_thread=False)
         try:
             yield conn
         finally:
@@ -51,7 +51,7 @@ def create_app(settings, *, claudio_p: Optional[ClaudioClient] = None,
 
     def writer_dep() -> Iterator[sqlite3.Connection]:
         # the API's ONLY write target: commands
-        conn = connect(settings.db_path)
+        conn = connect(settings.db_path, check_same_thread=False)
         try:
             yield conn
         finally:
@@ -183,7 +183,7 @@ def create_app(settings, *, claudio_p: Optional[ClaudioClient] = None,
     @app.get(f"{API_PREFIX}/events")
     def events(request: Request, max_events: int = 0):
         header = request.headers.get("last-event-id")
-        conn = connect(settings.db_path, read_only=True)
+        conn = connect(settings.db_path, read_only=True, check_same_thread=False)
 
         def gen():
             try:

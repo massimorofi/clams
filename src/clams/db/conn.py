@@ -84,19 +84,24 @@ class Connection(sqlite3.Connection):
 
 
 def connect(db_path: str, read_only: bool = False,
-            timeout: float = 5.0) -> sqlite3.Connection:
-    # NOTE: connections are thread-affine; the API opens one per request.
+            timeout: float = 5.0,
+            check_same_thread: bool = True) -> sqlite3.Connection:
+    # NOTE: connections are thread-affine by default; the API opens one per
+    # request but FastAPI may tear a sync dependency down on a different
+    # threadpool thread -> pass check_same_thread=False there.
     """Open a connection with the mandated PRAGMAs."""
     p = Path(db_path)
     if read_only:
         if not p.exists():
             raise FileNotFoundError(f"db not found for read-only open: {db_path}")
         conn = sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=timeout,
-                               isolation_level=None, factory=Connection)
+                               isolation_level=None, factory=Connection,
+                               check_same_thread=check_same_thread)
     else:
         p.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(str(p), timeout=timeout, isolation_level=None,
-                               factory=Connection)
+                               factory=Connection,
+                               check_same_thread=check_same_thread)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=5000")
