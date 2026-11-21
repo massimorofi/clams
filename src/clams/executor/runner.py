@@ -72,7 +72,6 @@ class ExecutorRunner:
         self.version = version
         self.executor_id = settings.executor_id
         self._stop = threading.Event()
-        self._last_alive = 0.0
         self._last_reap = 0.0
 
     # ------------------------------------------------------------------ setup
@@ -90,15 +89,26 @@ class ExecutorRunner:
             self._handle(d)
 
     def run_forever(self) -> None:
+        # executor.alive must flow even while a task blocks the loop (no
+        # duration timeout anymore) — including startup PEL replay; otherwise
+        # the watchdog's executors probe declares the runner dead mid-task
+        threading.Thread(target=self._alive_beat, daemon=True,
+                         name="clams-alive").start()
         self.startup()
         while not self._stop.is_set():
             self._cycle()
+
+    def _alive_beat(self) -> None:
+        while not self._stop.wait(self.s.executor_alive_interval_s):
+            try:
+                self._emit_alive()
+            except Exception:  # noqa: BLE001
+                log.exception("alive beat failed")
 
     def stop(self) -> None:
         self._stop.set()
 
     def _cycle(self) -> None:
-        self._maybe_alive()
         self._maybe_reap()
         got = self.bus.read(self.s.stream_tasks, self.s.group_executors,
                             self.executor_id, count=self.s.executor_capacity,
@@ -267,11 +277,7 @@ class ExecutorRunner:
     def _stop_heartbeat(hb: tuple) -> None:
         hb[0].set()
 
-    def _maybe_alive(self) -> None:
-        now = time.monotonic()
-        if now - self._last_alive < self.s.executor_alive_interval_s:
-            return
-        self._last_alive = now
+    def _emit_alive(self) -> None:
         m = contracts.ExecutorAlive(executor_id=self.executor_id,
                                     capacity=self.s.executor_capacity,
                                     version=self.version)

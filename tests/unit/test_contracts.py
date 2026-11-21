@@ -125,3 +125,13 @@ def test_plan_parses_from_llm_json():
         "run": ["make test"], "writable": ["app/**"], "depends_on": []}]})
     plan = c.Plan.model_validate(json.loads(raw))
     c.validate_plan(plan)
+
+
+def test_claudio_client_timeout_sentinel():
+    """timeout=None must mean NO timeout (long agentic task runs), while
+    omitting it keeps the client default."""
+    from clams.claudio_client import ClaudioClient
+    c = ClaudioClient("http://x", "t", timeout=600.0)
+    assert c._client().timeout.read == 600.0          # default
+    assert c._client(timeout=None).timeout.read is None   # explicit none
+    assert c._client(timeout=30).timeout.read == 30    # explicit number

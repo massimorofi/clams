@@ -39,6 +39,9 @@ class ChatResponse:
     usage: dict[str, Any] = field(default_factory=dict)
 
 
+_UNSET = object()   # distinguishes "caller passed nothing" from explicit None
+
+
 class ClaudioClient:
     def __init__(self, base_url: str, auth_token: str = "",
                  timeout: float = 120.0,
@@ -48,13 +51,15 @@ class ClaudioClient:
         self.timeout = timeout
         self._transport = transport
 
-    def _client(self, timeout: Optional[float] = None) -> httpx.Client:
+    def _client(self, timeout=_UNSET) -> httpx.Client:
         headers = {"Content-Type": "application/json"}
         if self.auth_token:
             headers["Authorization"] = f"Bearer {self.auth_token}"
+        # explicit timeout=None means NO timeout (long agentic task runs);
+        # omitting the arg falls back to the client default
+        t = self.timeout if timeout is _UNSET else timeout
         return httpx.Client(base_url=self.base_url, headers=headers,
-                            timeout=timeout if timeout is not None else self.timeout,
-                            transport=self._transport)
+                            timeout=t, transport=self._transport)
 
     def health(self) -> bool:
         try:
@@ -66,7 +71,7 @@ class ClaudioClient:
     def chat(self, message: str, session_id: Optional[str] = None,
              approval_mode: Optional[str] = None,
              workspace_dir: Optional[str] = None,
-             timeout: Optional[float] = None) -> ChatResponse:
+             timeout=_UNSET) -> ChatResponse:
         payload: dict[str, Any] = {"message": message}
         if session_id:
             payload["session_id"] = session_id
