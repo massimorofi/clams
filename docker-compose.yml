@@ -35,7 +35,10 @@ services:
   claudio-planner:
     image: ${CLAUDIO_IMAGE:-claudio/agent:latest}
     env_file: .env.claudio-planner
-    volumes: [claudio-sessions:/sessions]
+    volumes:
+      - claudio-sessions:/sessions
+      # image config wins over env vars; bind our copy (raised run deadline)
+      - ./config/claudio-planner.yaml:/srv/claudio/claudio-backend/config/config.yaml
     healthcheck:
       test: ["CMD", "python", "-c",
              "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8100/healthz').status==200 else 1)"]
@@ -47,7 +50,11 @@ services:
   claudio-executor:
     image: ${CLAUDIO_IMAGE:-claudio/agent:latest}
     env_file: .env.claudio-executor
-    volumes: [claudio-sessions:/sessions, worktrees:/work]
+    volumes:
+      - claudio-sessions:/sessions
+      - worktrees:/work
+      # image config wins over env vars; bind our copy so /work is an allowed root
+      - ./config/claudio-executor.yaml:/srv/claudio/claudio-backend/config/config.yaml
     healthcheck:
       test: ["CMD", "python", "-c",
              "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8100/healthz').status==200 else 1)"]
