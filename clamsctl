@@ -10,7 +10,7 @@ need(){ docker info >/dev/null 2>&1 || die "Docker daemon not running"
 confirm(){ [[ "${YES:-}" == 1 ]] && return; read -rp "$1 [y/N] " a; [[ $a == y ]] || exit 1; }
 
 case "${1:-}" in
-  start)   need; "${DC[@]}" up -d --wait && echo "[+] UI: http://localhost:8200" ;;
+  start)   need; "${DC[@]}" up -d --wait && echo "[+] UI: http://localhost:1075" ;;
   stop)    need; "${DC[@]}" stop ;;
   restart) need; "${DC[@]}" restart ${2:-} ;;
   rebuild) need; "${DC[@]}" pull --ignore-buildable || true
