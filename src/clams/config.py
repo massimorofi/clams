@@ -51,6 +51,11 @@ class Settings(BaseSettings):
     claudio_timeout_s: float = 120.0
     # Root inside which Claudio-E may bind workspaces (worktrees live under it).
     claudio_workspace_root: str = "./work"
+    # Owner of provisioned worktrees: the runner (root in Docker) hands files
+    # to the unprivileged Claudio-E uid so the agent can edit and commit.
+    # Set empty/0 to disable the chown (e.g. native dev mode).
+    worktree_uid: int = 1000
+    worktree_gid: int = 1000
 
     # --- github -------------------------------------------------------------------
     github_token: str = ""

@@ -167,7 +167,9 @@ def _executor(settings) -> int:
     cl = ClaudioClient(settings.claudio_executor_url,
                        settings.claudio_executor_token,
                        timeout=settings.claudio_timeout_s)
-    wt = WorktreeManager(settings.work_root)
+    wt = WorktreeManager(settings.work_root,
+                          chown_uid=settings.worktree_uid or None,
+                          chown_gid=settings.worktree_gid or None)
     runner = ExecutorRunner(settings, bus, cl, wt)
     try:
         runner.run_forever()

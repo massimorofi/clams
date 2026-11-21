@@ -28,8 +28,17 @@ def _slug(repo: str) -> str:
 
 def _run(args: list[str], cwd: Optional[Path] = None,
          timeout: int = 300) -> str:
+    # The runner (root) operates on trees chowned to the agent uid, and the
+    # evidence gate runs there too — git's ownership safety check would
+    # refuse both. /work is Clams-owned storage, so trust it wholesale.
+    import os
+    env = {**os.environ,
+           "GIT_CONFIG_COUNT": "1",
+           "GIT_CONFIG_KEY_0": "safe.directory",
+           "GIT_CONFIG_VALUE_0": "*"}
     proc = subprocess.run(args, cwd=str(cwd) if cwd else None,
-                          capture_output=True, text=True, timeout=timeout)
+                          capture_output=True, text=True, timeout=timeout,
+                          env=env)
     if proc.returncode != 0:
         raise GitError(f"git {' '.join(args[:3])}... failed {proc.returncode}: "
                        f"{proc.stderr[:400]}")
@@ -39,10 +48,34 @@ def _run(args: list[str], cwd: Optional[Path] = None,
 class WorktreeManager:
     def __init__(self, work_root: str | Path,
                  remote_url_template: str = "https://github.com/{repo}.git",
-                 git_env: Optional[dict[str, str]] = None):
+                 git_env: Optional[dict[str, str]] = None,
+                 chown_uid: Optional[int] = None,
+                 chown_gid: Optional[int] = None):
         self.work_root = Path(work_root)
         self.remote_url_template = remote_url_template
         self.git_env = git_env or {}
+        # The runner provisions worktrees as root but the Claudio-E agent runs
+        # as an unprivileged uid (1000 in the published image); without the
+        # handoff the agent cannot edit or commit (issue #130 live finding).
+        self.chown_uid = chown_uid
+        self.chown_gid = chown_gid
+
+    def _chown(self, path: Path) -> None:
+        if self.chown_uid is None:
+            return
+        import os
+        try:
+            for root, dirs, files in os.walk(path):
+                for name in dirs + files:
+                    try:
+                        os.lchown(os.path.join(root, name),
+                                  self.chown_uid, self.chown_gid or -1)
+                    except (PermissionError, OSError):
+                        pass
+            os.lchown(str(path), self.chown_uid, self.chown_gid or -1)
+        except (PermissionError, OSError) as exc:
+            log.warning("worktree chown to %s failed for %s: %s",
+                        self.chown_uid, path, exc)
 
     # ------------------------------------------------------------- base clone
     def repo_dir(self, repo: str) -> Path:
@@ -57,6 +90,7 @@ class WorktreeManager:
                  timeout=600)
         # scrub any token from the remote URL (idempotent, always clean)
         self._scrub_remote(d)
+        self._chown(d.parent)
         return d
 
     def _scrub_remote(self, d: Path) -> None:
@@ -97,6 +131,10 @@ class WorktreeManager:
         _run(["git", "worktree", "add", str(path), "-b", branch, base_ref],
              cwd=clone)
         self._scrub_remote(path)
+        # the agent commits into the shared object store and the worktree's
+        # gitdir under the clone — both must be writable by its uid
+        self._chown(clone)
+        self._chown(path)
         return path, branch
 
     def remove(self, repo: str, task_id: str, attempt: int) -> None:
