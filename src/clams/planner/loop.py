@@ -136,27 +136,22 @@ class PlannerLoop:
         return n
 
     def _sweep_deadlocked(self) -> int:
-        """Self-heal running workflows stranded by pre-fix failures.
+        """Self-heal running workflows that missed a review.
 
-        A workflow whose task failed before the cascade fix still has pending
-        dependents and never reaches all-terminal. Block the stranded tasks
-        and review what's left. Idempotent and cheap: one indexed query.
+        Covers two shapes: (a) tasks stranded by a pre-fix failure (pending
+        dependents of a failed/blocked/cancelled task) — block them, then
+        review; (b) all tasks terminal but no event ever triggered review
+        (e.g. a lone task cancelled by command). Idempotent and cheap:
+        only running workflows, indexed queries.
         """
-        rows = self.conn.execute(
-            "SELECT DISTINCT workflow_id FROM tasks WHERE status IN "
-            "('failed','blocked','cancelled') AND workflow_id IN "
-            "(SELECT workflow_id FROM tasks WHERE status IN ('pending','ready'))"
-        ).fetchall()
+        rows = repo_workflows.list_by_status(self.conn, "running")
         n = 0
-        for r in rows:
-            wf = repo_workflows.get_workflow(self.conn, r["workflow_id"])
-            if wf is None or wf["status"] != "running":
-                continue
+        for wf in rows:
+            wid = wf["workflow_id"]
             with immediate(self.conn):
-                strand_dependents(self.conn, r["workflow_id"])
-                if repo_tasks.workflow_tasks_all_terminal(
-                        self.conn, r["workflow_id"]):
-                    review_workflow(self.conn, r["workflow_id"], self.s,
+                strand_dependents(self.conn, wid)
+                if repo_tasks.workflow_tasks_all_terminal(self.conn, wid):
+                    review_workflow(self.conn, wid, self.s,
                                     gh_enabled=self.gh_client is not None)
             n += 1
         return n
