@@ -163,8 +163,11 @@ def plan_workflow(conn, claudio_p, settings, workflow_id: str,
                 conn, workflow_id, i, pt.title, pt.objective, pt.acceptance,
                 build_brief(pt, repo, base_ref, settings),
                 depends_on=pt.depends_on,
-                max_attempts=settings.max_attempts,
-                gh_issue_number=wf["gh_issue_number"])
+                max_attempts=settings.max_attempts)
+            # NOTE: tasks must NOT inherit the workflow's gh_issue_number —
+            # project_tasks_created skips tasks that already carry one, so
+            # stamping the parent here silently disabled sub-issue creation.
+            # Each task gets its own sub-issue number via the outbox callback.
         repo_workflows.set_plan(conn, workflow_id,
                                 plan.model_dump(), status="running")
         if n_old:

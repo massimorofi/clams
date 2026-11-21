@@ -133,3 +133,22 @@ def test_replan_blocked_keeps_old_tasks(db):
     assert plan_workflow(db, ScriptedP(["nope", "still nope"]), s,
                          wf, "o/r") == "blocked"
     assert len(repo_tasks.list_tasks(db, wf)) == 2
+
+
+def test_github_tasks_get_no_parent_issue_number(db):
+    """Regression: tasks must not inherit the workflow's gh_issue_number —
+    that silently disabled sub-issue creation (project_tasks_created skips
+    tasks that already carry a number)."""
+    from clams.github import projection
+    from clams.db import repo_outbox
+    pid = repo_projects.upsert_project(db, "o/r")
+    wf = repo_workflows.create_workflow(db, pid, "github", "goal", 42)
+    s = Settings(_env_file=None)
+    plan_workflow(db, ScriptedP([GOOD]), s, wf, "o/r")
+    for t in repo_tasks.list_tasks(db, wf):
+        assert t["gh_issue_number"] is None
+    n = projection.project_tasks_created(db, wf, "o/r")
+    assert n == 2
+    kinds = [r["kind"] for r in db.execute(
+        "SELECT kind FROM outbox WHERE kind='gh_subissue'").fetchall()]
+    assert kinds == ["gh_subissue", "gh_subissue"]
