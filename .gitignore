@@ -39,3 +39,7 @@ frontend/dist/
 # clams v2
 .env.claudio-*
 backups/
+
+# playwright artifacts
+frontend/test-results/
+frontend/playwright-report/
