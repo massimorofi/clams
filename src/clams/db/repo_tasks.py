@@ -71,6 +71,57 @@ def transition(conn: sqlite3.Connection, task_id: str, dst: str,
                         (task_id,)).fetchone()
 
 
+def block_dependents(conn: sqlite3.Connection, workflow_id: str) -> list[str]:
+    """pending/ready tasks whose deps reference a failed/blocked/cancelled
+    task -> blocked. Iterative (blocking one strands its own dependents).
+    Idempotent; safe to call every cycle. Returns blocked task_ids.
+
+    A task stranded this way can never run: its deps can no longer all reach
+    'success'. Without this the workflow never reaches an all-terminal state
+    and is never reviewed (§6). Callers emit the audit events; this helper
+    uses a direct UPDATE (not ``transition``) so it stays a pure repo op.
+    """
+    blocked: list[str] = []
+    while True:
+        rows = conn.execute(
+            "SELECT task_id, depends_on FROM tasks "
+            "WHERE workflow_id=? AND status IN ('pending','ready')",
+            (workflow_id,)).fetchall()
+        progressed = False
+        for r in rows:
+            deps = json.loads(r["depends_on"])
+            if not deps:
+                continue
+            marks = ",".join("?" * len(deps))
+            n = conn.execute(
+                f"SELECT COUNT(*) n FROM tasks WHERE workflow_id=? "
+                f"AND status IN ('failed','blocked','cancelled') "
+                f"AND sequence_index IN ({marks})",
+                (workflow_id, *deps)).fetchone()["n"]
+            if n:
+                conn.execute(
+                    "UPDATE tasks SET status='blocked', updated_at=? "
+                    "WHERE task_id=?", (utcnow_s(), r["task_id"]))
+                blocked.append(r["task_id"])
+                progressed = True
+        if not progressed:
+            return blocked
+
+
+def delete_workflow_tasks(conn: sqlite3.Connection, workflow_id: str) -> int:
+    """Delete every task of a workflow (replan swap). Questions first: their
+    FK to tasks has no cascade. Caller must hold the transaction."""
+    ids = [r["task_id"] for r in conn.execute(
+        "SELECT task_id FROM tasks WHERE workflow_id=?",
+        (workflow_id,)).fetchall()]
+    if not ids:
+        return 0
+    marks = ",".join("?" * len(ids))
+    conn.execute(f"DELETE FROM questions WHERE task_id IN ({marks})", ids)
+    conn.execute("DELETE FROM tasks WHERE workflow_id=?", (workflow_id,))
+    return len(ids)
+
+
 def create_task(conn: sqlite3.Connection, workflow_id: str, sequence_index: int,
                 title: str, objective: str, acceptance: str, brief: dict[str, Any],
                 depends_on: Optional[list[int]] = None,
@@ -151,12 +202,19 @@ def claim_for_dispatch(conn: sqlite3.Connection, task_id: str,
         return cur.fetchone()
 
 
-def _running_lease(row: sqlite3.Row, extend_s: int) -> str:
-    """Lease = now+extend_s, never beyond created_at + max_wall_s + 300 (§6)."""
+def _running_lease(row: sqlite3.Row, extend_s: int,
+                   started_epoch: Optional[float] = None) -> str:
+    """Lease = now+extend_s, never beyond attempt start + max_wall_s + 300 (§6).
+
+    Anchored on started_at (per-attempt) so a task retried hours after creation
+    still gets a usable lease; falls back to created_at for legacy rows.
+    """
     from .conn import iso_to_epoch
-    brief = json.loads(row["brief_json"])
-    wall_cap = iso_to_epoch(row["created_at"]) + int(brief.get("max_wall_s", 1800)) + 300
     import time
+    brief = json.loads(row["brief_json"])
+    if started_epoch is None:
+        started_epoch = iso_to_epoch(row["started_at"] or row["created_at"])
+    wall_cap = started_epoch + int(brief.get("max_wall_s", 1800)) + 300
     return epoch_to_iso(min(time.time() + extend_s, wall_cap))
 
 
@@ -167,12 +225,15 @@ def on_started(conn: sqlite3.Connection, task_id: str, attempt: int,
     row = get_task(conn, task_id)
     if row is None:
         return None
+    import time
+    now_e = time.time()
     with conn.execute(
         "UPDATE tasks SET status='running', executor_id=?, session_ref=?, "
-        "lease_expires_at=?, updated_at=? "
+        "started_at=?, lease_expires_at=?, updated_at=? "
         "WHERE task_id=? AND attempt=? AND lease_token=? AND status='dispatched' "
         "RETURNING *",
-        (executor_id, session_ref, _running_lease(row, extend_s),
+        (executor_id, session_ref, utcnow_s(),
+         _running_lease(row, extend_s, started_epoch=now_e),
          utcnow_s(), task_id, attempt, lease_token)) as cur:
         return cur.fetchone()
 
@@ -280,18 +341,21 @@ def oldest_ready_age_s(conn: sqlite3.Connection) -> Optional[float]:
 def workflow_tasks_all_terminal(conn: sqlite3.Connection, workflow_id: str) -> bool:
     row = conn.execute(
         "SELECT COUNT(*) n FROM tasks WHERE workflow_id=? AND status NOT IN "
-        "('success','failed','cancelled')", (workflow_id,)).fetchone()
+        "('success','failed','cancelled','blocked')", (workflow_id,)).fetchone()
     return row["n"] == 0
 
 
 def workflow_outcome(conn: sqlite3.Connection, workflow_id: str) -> str:
-    """'done' if all success, 'failed' if any failed, else 'mixed'."""
+    """'done' all success | 'failed' any failed | 'blocked' any blocked and
+    none failed (stranded work needs a human, not a replan) | 'cancelled'."""
     rows = conn.execute(
         "SELECT status, COUNT(*) n FROM tasks WHERE workflow_id=? GROUP BY status",
         (workflow_id,)).fetchall()
     counts = {r["status"]: r["n"] for r in rows}
     if counts.get("failed", 0):
         return "failed"
+    if counts.get("blocked", 0):
+        return "blocked"
     if counts.get("cancelled", 0) and not counts.get("success", 0):
         return "cancelled"
     return "done"

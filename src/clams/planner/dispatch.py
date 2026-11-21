@@ -35,11 +35,15 @@ def dispatch_ready(conn, bus, settings) -> list[str]:
                 task_id=task_id, workflow_id=claimed["workflow_id"],
                 attempt=claimed["attempt"], lease_token=claimed["lease_token"],
                 brief=contracts.Brief(**brief))
+            # lease_token is unique per dispatch: without it, a retry that
+            # resets attempt numbering would dedup against the original
+            # publish and the task would never reach the executor.
             repo_outbox.enqueue(
                 conn, "bus_publish",
                 {"stream": settings.stream_tasks,
                  "msg": json.loads(contracts.dump_message(msg))},
-                idempotency_key=f"dispatch:{task_id}:{claimed['attempt']}")
+                idempotency_key=f"dispatch:{task_id}:{claimed['attempt']}"
+                                f":{claimed['lease_token'][:12]}")
             repo_events.append_event(conn, "task", task_id, "info",
                                      f"dispatched attempt {claimed['attempt']}")
         dispatched.append(task_id)

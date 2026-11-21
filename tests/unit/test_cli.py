@@ -23,7 +23,7 @@ def test_migrate_then_status(env, capsys):
     capsys.readouterr()
     assert main(["status"]) == 0
     out = json.loads(capsys.readouterr().out)
-    assert out["schema_version"] == 1
+    assert out["schema_version"] == 2
 
 
 def test_command_pause(env, capsys):

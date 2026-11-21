@@ -14,7 +14,7 @@ from clams.db.conn import db_integrity_ok, plus_s, utcnow_s
 
 
 def test_migrations_apply_once(db):
-    assert schema_version(db) == 1
+    assert schema_version(db) == 2   # 001_init + 002_tasks_started_at
     assert migrate(db) == []          # idempotent
     assert db_integrity_ok(db)
 
@@ -135,6 +135,29 @@ def test_claim_for_dispatch_atomic(db):
     assert repo_tasks.claim_for_dispatch(db, t, 120) is None
 
 
+def test_on_started_lease_survives_old_created_at(db):
+    """Regression: wall cap anchors on started_at, not created_at — a task
+    retried hours after creation must still get a future lease."""
+    import time
+    from clams.db.conn import epoch_to_iso, utcnow_s
+    pid = repo_projects.upsert_project(db, "o/r")
+    wf = repo_workflows.create_workflow(db, pid, "adhoc", "g")
+    brief = {"objective": "o", "acceptance": "a", "run": ["echo x"],
+             "writable": ["*.py"], "repo": "o/r", "max_wall_s": 1800}
+    t = repo_tasks.create_task(db, wf, 1, "t", "o", "a", brief)
+    repo_tasks.transition(db, t, "ready")
+    row, tok = repo_tasks.claim_for_dispatch(db, t, 120), None
+    tok = row["lease_token"]
+    # task was created 20h ago (past any max_wall_s cap)
+    db.execute("UPDATE tasks SET created_at=? WHERE task_id=?",
+               (epoch_to_iso(time.time() - 20 * 3600), t))
+    started = repo_tasks.on_started(db, t, 1, tok, "e1", "s1", extend_s=180)
+    assert started is not None and started["started_at"] is not None
+    assert started["lease_expires_at"] > utcnow_s()   # not clamped to the past
+    hb = repo_tasks.on_heartbeat(db, t, 1, tok, extend_s=180)
+    assert hb is not None and hb["lease_expires_at"] > utcnow_s()
+
+
 def test_on_started_fencing(db):
     wf = _mk_wf(db)
     t = repo_tasks.create_task(db, wf, 1, "a", "o", "a", _brief())
@@ -247,6 +270,66 @@ def test_workflow_outcome(db):
         repo_tasks.transition(db, t, "success")
     assert repo_tasks.workflow_tasks_all_terminal(db, wf)
     assert repo_tasks.workflow_outcome(db, wf) == "done"
+
+
+def test_block_dependents_transitive(db):
+    """Regression: a failed task must strand its (transitive) dependents —
+    otherwise the workflow never reaches all-terminal and is never reviewed."""
+    wf = _mk_wf(db)
+    t1 = repo_tasks.create_task(db, wf, 1, "a", "o", "a", _brief())
+    t2 = repo_tasks.create_task(db, wf, 2, "b", "o", "a", _brief(),
+                                depends_on=[1])
+    t3 = repo_tasks.create_task(db, wf, 3, "c", "o", "a", _brief(),
+                                depends_on=[2])
+    t4 = repo_tasks.create_task(db, wf, 4, "d", "o", "a", _brief())  # indep
+    repo_tasks.transition(db, t1, "ready")
+    repo_tasks.transition(db, t1, "dispatched")
+    repo_tasks.transition(db, t1, "running")
+    repo_tasks.transition(db, t1, "failed")
+    blocked = repo_tasks.block_dependents(db, wf)
+    assert set(blocked) == {t2, t3}
+    assert repo_tasks.get_task(db, t2)["status"] == "blocked"
+    assert repo_tasks.get_task(db, t3)["status"] == "blocked"
+    assert repo_tasks.get_task(db, t4)["status"] == "pending"  # untouched
+    # idempotent
+    assert repo_tasks.block_dependents(db, wf) == []
+
+
+def test_all_terminal_and_outcome_blocked(db):
+    wf = _mk_wf(db)
+    t1 = repo_tasks.create_task(db, wf, 1, "a", "o", "a", _brief())
+    t2 = repo_tasks.create_task(db, wf, 2, "b", "o", "a", _brief(),
+                                depends_on=[1])
+    repo_tasks.transition(db, t1, "ready")
+    repo_tasks.transition(db, t1, "dispatched")
+    repo_tasks.transition(db, t1, "running")
+    repo_tasks.transition(db, t1, "failed")
+    repo_tasks.block_dependents(db, wf)          # t2 -> blocked
+    assert repo_tasks.workflow_tasks_all_terminal(db, wf)
+    assert repo_tasks.workflow_outcome(db, wf) == "failed"   # failed wins
+    # blocked-only (question expiry shape): needs a human, not a replan
+    wf2 = _mk_wf(db)
+    s1 = repo_tasks.create_task(db, wf2, 1, "a", "o", "a", _brief())
+    s2 = repo_tasks.create_task(db, wf2, 2, "b", "o", "a", _brief())
+    for t in (s1,):
+        repo_tasks.transition(db, t, "ready")
+        repo_tasks.transition(db, t, "dispatched")
+        repo_tasks.transition(db, t, "running")
+        repo_tasks.transition(db, t, "success")
+    repo_tasks.transition(db, s2, "blocked")
+    assert repo_tasks.workflow_tasks_all_terminal(db, wf2)
+    assert repo_tasks.workflow_outcome(db, wf2) == "blocked"
+
+
+def test_delete_workflow_tasks_removes_questions(db):
+    from clams.db import repo_questions
+    wf = _mk_wf(db)
+    t = repo_tasks.create_task(db, wf, 1, "a", "o", "a", _brief())
+    repo_questions.open_question(db, t, 1, "why?", ["a", "b"], "k1")
+    assert repo_tasks.delete_workflow_tasks(db, wf) == 1
+    assert repo_tasks.list_tasks(db, wf) == []
+    assert db.execute("SELECT COUNT(*) n FROM questions").fetchone()["n"] == 0
+    assert repo_tasks.delete_workflow_tasks(db, wf) == 0  # idempotent
 
 
 # --------------------------------------------------------------- questions

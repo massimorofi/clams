@@ -50,5 +50,23 @@ def test_dispatch_idempotent_key_per_attempt(db):
     assert row["attempt"] == 2
     keys = [r["idempotency_key"] for r in db.execute(
         "SELECT idempotency_key FROM outbox").fetchall()]
-    assert keys.count(f"dispatch:{t1}:1") == 1
-    assert keys.count(f"dispatch:{t1}:2") == 1
+    assert keys.count(f"dispatch:{t1}:1") == 0  # old bare-attempt format gone
+    assert len([k for k in keys if k.startswith(f"dispatch:{t1}:1:")]) == 1
+    assert len([k for k in keys if k.startswith(f"dispatch:{t1}:2:")]) == 1
+
+
+def test_dispatch_after_retry_reset_republishes(db):
+    """Regression: retry resets attempt to 0; the republish must NOT dedup
+    against the original attempt-1 publish (lease token makes keys unique)."""
+    s = Settings(_env_file=None)
+    bus = InMemoryBus()
+    wf, (t1,) = _wf_tasks(db, n=1)
+    dispatch_ready(db, bus, s)
+    # operator retry: status ready, attempt reset to 0 (see commands._apply)
+    db.execute("UPDATE tasks SET status='ready', attempt=0, lease_token=NULL, "
+               "lease_expires_at=NULL WHERE task_id=?", (t1,))
+    got = dispatch_ready(db, bus, s)
+    assert got == [t1]
+    pubs = db.execute("SELECT COUNT(*) AS n FROM outbox "
+                      "WHERE kind='bus_publish'").fetchone()["n"]
+    assert pubs == 2  # original + retry republish

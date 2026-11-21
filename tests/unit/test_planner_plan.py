@@ -83,3 +83,53 @@ def test_plan_rejects_cyclic(db):
     ]})
     status = plan_workflow(db, ScriptedP([cyclic, cyclic]), s, wf, "o/r")
     assert status == "blocked"
+
+
+def test_replan_replaces_tasks_without_collision(db):
+    """Regression: replanning a workflow that already has tasks used to hit
+    UNIQUE(workflow_id, sequence_index)/(title) and stick in 'planning'."""
+    wf = _wf(db)
+    s = Settings(_env_file=None)
+    assert plan_workflow(db, ScriptedP([GOOD]), s, wf, "o/r") == "running"
+    # fail task 1 so the replan context has something to report
+    t1 = repo_tasks.list_tasks(db, wf)[0]
+    repo_tasks.transition(db, t1["task_id"], "ready")
+    repo_tasks.transition(db, t1["task_id"], "dispatched")
+    repo_tasks.transition(db, t1["task_id"], "running")
+    db.execute("UPDATE tasks SET error_log='gate fail: no tests' WHERE task_id=?",
+               (t1["task_id"],))
+    repo_workflows.set_status(db, wf, "planning")   # what review does on replan
+    # same plan back (identical titles -> the collision case)
+    assert plan_workflow(db, ScriptedP([GOOD]), s, wf, "o/r") == "running"
+    tasks = repo_tasks.list_tasks(db, wf)
+    assert [t["sequence_index"] for t in tasks] == [1, 2]
+    assert repo_workflows.get_workflow(db, wf)["status"] == "running"
+    msgs = [r["message"] for r in db.execute(
+        "SELECT message FROM events WHERE scope='workflow'").fetchall()]
+    assert any("replaced" in m for m in msgs)
+
+
+def test_replan_prompt_includes_prior_results(db):
+    wf = _wf(db)
+    s = Settings(_env_file=None)
+    plan_workflow(db, ScriptedP([GOOD]), s, wf, "o/r")
+    t1 = repo_tasks.list_tasks(db, wf)[0]
+    db.execute("UPDATE tasks SET status='failed', error_log='boom' "
+               "WHERE task_id=?", (t1["task_id"],))
+    repo_workflows.set_status(db, wf, "planning")
+    p = ScriptedP([GOOD])
+    plan_workflow(db, p, s, wf, "o/r")
+    assert "REPLAN" in p.prompts[0]
+    assert "add module" in p.prompts[0]      # prior title carried
+    assert "boom" in p.prompts[0]            # prior failure detail carried
+
+
+def test_replan_blocked_keeps_old_tasks(db):
+    """An invalid replan must not destroy the existing task set."""
+    wf = _wf(db)
+    s = Settings(_env_file=None)
+    plan_workflow(db, ScriptedP([GOOD]), s, wf, "o/r")
+    repo_workflows.set_status(db, wf, "planning")
+    assert plan_workflow(db, ScriptedP(["nope", "still nope"]), s,
+                         wf, "o/r") == "blocked"
+    assert len(repo_tasks.list_tasks(db, wf)) == 2

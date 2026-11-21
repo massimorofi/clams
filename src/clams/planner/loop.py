@@ -26,7 +26,7 @@ from . import commands as commands_mod
 from . import dispatch as dispatch_mod
 from . import plan as plan_mod
 from . import reaper as reaper_mod
-from .review import apply_event
+from .review import apply_event, review_workflow, strand_dependents
 from .watchdog import Watchdog
 
 log = logging.getLogger("clams.loop")
@@ -83,8 +83,13 @@ class PlannerLoop:
         stats["events"] = self._consume_events()
 
         # 7. reaper
-        stats["reaped"] = len(reaper_mod.reap_expired_leases(self.conn, s))
-        reaper_mod.expire_questions(self.conn, s)
+        gh_on = self.gh_client is not None
+        stats["reaped"] = len(reaper_mod.reap_expired_leases(
+            self.conn, s, gh_enabled=gh_on))
+        reaper_mod.expire_questions(self.conn, s, gh_enabled=gh_on)
+
+        # 7b. self-heal workflows stranded by pre-fix failures
+        stats["swept"] = self._sweep_deadlocked()
 
         # 8. outbox relay
         if self.outbox is not None:
@@ -127,6 +132,32 @@ class PlannerLoop:
             except Exception as exc:  # noqa: BLE001
                 log.exception("planning %s failed: %s", wf["workflow_id"], exc)
             budget -= 1
+            n += 1
+        return n
+
+    def _sweep_deadlocked(self) -> int:
+        """Self-heal running workflows stranded by pre-fix failures.
+
+        A workflow whose task failed before the cascade fix still has pending
+        dependents and never reaches all-terminal. Block the stranded tasks
+        and review what's left. Idempotent and cheap: one indexed query.
+        """
+        rows = self.conn.execute(
+            "SELECT DISTINCT workflow_id FROM tasks WHERE status IN "
+            "('failed','blocked','cancelled') AND workflow_id IN "
+            "(SELECT workflow_id FROM tasks WHERE status IN ('pending','ready'))"
+        ).fetchall()
+        n = 0
+        for r in rows:
+            wf = repo_workflows.get_workflow(self.conn, r["workflow_id"])
+            if wf is None or wf["status"] != "running":
+                continue
+            with immediate(self.conn):
+                strand_dependents(self.conn, r["workflow_id"])
+                if repo_tasks.workflow_tasks_all_terminal(
+                        self.conn, r["workflow_id"]):
+                    review_workflow(self.conn, r["workflow_id"], self.s,
+                                    gh_enabled=self.gh_client is not None)
             n += 1
         return n
 

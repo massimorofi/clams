@@ -118,3 +118,58 @@ def test_watchdog_dlq_and_dead_outbox(db):
     res = wd.probe(db)
     assert res["dlq"] == "fail"
     assert res["outbox"] == "fail"
+
+
+def _running_task_with_dependents(db, max_attempts=1):
+    """t1 running (lease will expire), t2 pending depends on t1."""
+    pid = repo_projects.upsert_project(db, "o/r")
+    wf = repo_workflows.create_workflow(db, pid, "adhoc", "g")
+    repo_workflows.set_status(db, wf, "running")
+    brief = {"objective": "o", "acceptance": "a", "run": ["x"],
+             "writable": ["*"], "repo": "o/r", "max_wall_s": 1800}
+    t1 = repo_tasks.create_task(db, wf, 1, "t1", "o", "a", brief,
+                                max_attempts=max_attempts)
+    t2 = repo_tasks.create_task(db, wf, 2, "t2", "o", "a", brief,
+                                depends_on=[1], max_attempts=max_attempts)
+    repo_tasks.promote_ready(db)
+    row = repo_tasks.claim_for_dispatch(db, t1, 120)
+    repo_tasks.on_started(db, t1, row["attempt"], row["lease_token"], "e1", "s")
+    return wf, t1, t2
+
+
+def test_lease_expiry_failure_blocks_dependents_and_reviews(db):
+    """Regression: reaper failing a task (attempts exhausted) must strand +
+    review, same as the result path — else workflow runs forever."""
+    s = Settings(_env_file=None, max_attempts=1)
+    wf, t1, t2 = _running_task_with_dependents(db, max_attempts=1)
+    db.execute("UPDATE tasks SET lease_expires_at=? WHERE task_id=?",
+               (plus_s(-1), t1))
+    reap_expired_leases(db, s)
+    assert repo_tasks.get_task(db, t1)["status"] == "failed"
+    assert repo_tasks.get_task(db, t2)["status"] == "blocked"
+    assert repo_workflows.get_workflow(db, wf)["status"] == "planning"
+
+
+def test_question_expiry_blocks_dependents_and_workflow(db):
+    """waiting_input expiry -> blocked -> dependents blocked -> workflow
+    blocked + alert (outcome 'blocked', no replan)."""
+    s = Settings(_env_file=None, question_expiry_h=24)
+    pid = repo_projects.upsert_project(db, "o/r")
+    wf = repo_workflows.create_workflow(db, pid, "adhoc", "g")
+    repo_workflows.set_status(db, wf, "running")
+    brief = {"objective": "o", "acceptance": "a", "run": ["x"],
+             "writable": ["*"], "repo": "o/r", "max_wall_s": 1800}
+    t1 = repo_tasks.create_task(db, wf, 1, "t1", "o", "a", brief)
+    t2 = repo_tasks.create_task(db, wf, 2, "t2", "o", "a", brief,
+                                depends_on=[1])
+    repo_tasks.transition(db, t1, "ready")
+    repo_tasks.transition(db, t1, "dispatched")
+    repo_tasks.transition(db, t1, "running")
+    repo_tasks.transition(db, t1, "waiting_input")
+    db.execute("UPDATE tasks SET updated_at=? WHERE task_id=?",
+               (plus_s(-25 * 3600), t1))
+    expire_questions(db, s)
+    assert repo_tasks.get_task(db, t1)["status"] == "blocked"
+    assert repo_tasks.get_task(db, t2)["status"] == "blocked"
+    assert repo_workflows.get_workflow(db, wf)["status"] == "blocked"
+    assert repo_alerts.open_count(db) == 1

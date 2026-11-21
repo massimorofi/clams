@@ -93,30 +93,62 @@ def _apply(conn, msg, settings, *, gh_enabled: bool) -> str:
             f"attempt {msg.attempt} -> {row['status']}"
             + (f" ({msg.evidence.get('reason', '')})"
                if row["status"] == "ready" else ""))
+        if row["status"] == "failed":
+            strand_dependents(conn, row["workflow_id"])
         if gh_enabled:
             from ..github import projection
             projection.project_task_state(conn, msg.task_id,
                                           _repo_of(conn, msg.task_id),
                                           row["status"], msg.attempt)
-        _review_workflow(conn, row["workflow_id"], settings,
-                         gh_enabled=gh_enabled)
+        review_workflow(conn, row["workflow_id"], settings,
+                        gh_enabled=gh_enabled)
         return "applied"
 
     log.warning("ignoring event type %s", t)
     return "applied"
 
 
-def _review_workflow(conn, workflow_id: str, settings, *, gh_enabled: bool) -> None:
-    """When all tasks terminal: done / replan (<=max) / blocked + alert (§6)."""
+def strand_dependents(conn, workflow_id: str) -> list[str]:
+    """Cascade-block pending/ready tasks stranded by a failed/blocked/cancelled
+    dependency, with audit events. Idempotent; caller holds the transaction."""
+    blocked = repo_tasks.block_dependents(conn, workflow_id)
+    for tid in blocked:
+        repo_events.append_event(conn, "task", tid, "warn",
+                                 "blocked: dependency failed")
+    return blocked
+
+
+def review_workflow(conn, workflow_id: str, settings,
+                    *, gh_enabled: bool = False) -> None:
+    """When all tasks terminal: done / replan (<=max) / blocked + alert (§6).
+
+    Public: called from event application, the lease reaper, command handling
+    and the loop's self-heal sweep. A workflow mid-planning (replan in flight)
+    or in intake is never reviewed here.
+    """
     wf = repo_workflows.get_workflow(conn, workflow_id)
-    if wf is None or wf["status"] in ("cancelled", "paused", "done", "blocked"):
+    if wf is None or wf["status"] in ("cancelled", "paused", "done", "blocked",
+                                      "intake", "planning"):
         return
     if not repo_tasks.workflow_tasks_all_terminal(conn, workflow_id):
-        if wf["status"] == "intake":
-            return
         return
     repo_workflows.set_status(conn, workflow_id, "review")
     outcome = repo_tasks.workflow_outcome(conn, workflow_id)
+    if outcome == "blocked":
+        # stranded work (question expiry / cancelled dep): needs a human,
+        # not a replan — replanning would discard successes and re-ask.
+        repo_workflows.set_status(conn, workflow_id, "blocked")
+        repo_alerts.raise_alert(conn, "workflow", "error",
+                                f"workflow {workflow_id} blocked: "
+                                "task(s) need attention")
+        repo_events.append_event(conn, "workflow", workflow_id, "error",
+                                 "blocked: task(s) need attention")
+        if gh_enabled:
+            _project_blocked(conn, workflow_id, settings)
+            from ..github import projection
+            projection.project_workflow_state(conn, workflow_id,
+                                              _wf_repo(conn, wf), "blocked")
+        return
     if outcome == "done":
         repo_workflows.set_status(conn, workflow_id, "done")
         repo_events.append_event(conn, "workflow", workflow_id, "info", "done")

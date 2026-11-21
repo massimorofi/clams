@@ -74,8 +74,9 @@ def _apply(conn, row, *, adhoc_handler=None, gh_client=None) -> dict[str, Any]:
         task = repo_tasks.get_task(conn, target or "")
         if task is None:
             raise ValueError(f"unknown task {target}")
-        if task["status"] != "failed":
-            raise ValueError(f"task {target} is {task['status']}, not failed")
+        if task["status"] not in ("failed", "blocked"):
+            raise ValueError(
+                f"task {target} is {task['status']}, not failed/blocked")
         # operator override: re-open a failed task with a fresh attempt budget
         conn.execute(
             "UPDATE tasks SET status='ready', attempt=0, lease_token=NULL, "
@@ -135,6 +136,10 @@ def _cancel(conn, target: Optional[str], payload: dict, issuer: str) -> dict:
         repo_questions.cancel_open_for_task(conn, target)
         repo_events.append_event(conn, "task", target, "info",
                                  f"cancelled by {issuer}")
+        # a cancelled task strands its dependents just like a failure; the
+        # loop's sweep reviews the workflow once all tasks are terminal
+        from .review import strand_dependents
+        strand_dependents(conn, task["workflow_id"])
         return {"task": target, "status": "cancelled"}
     wf = repo_workflows.get_workflow(conn, target)
     if wf is None:

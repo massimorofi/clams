@@ -40,6 +40,13 @@ IMPORTANT: your previous attempt was invalid: {error}
 Fix exactly that and return the corrected JSON object only — no prose.
 """
 
+REPLAN_SUFFIX = """
+
+This is a REPLAN after a previous attempt failed. Prior task outcomes:
+{prior}
+Do not redo work already marked success; focus the new plan on what failed.
+"""
+
 
 def extract_json(text: str) -> dict[str, Any]:
     """Pull the first balanced JSON object out of a model reply."""
@@ -95,8 +102,28 @@ def plan_workflow(conn, claudio_p, settings, workflow_id: str,
     if wf is None:
         raise ValueError(f"unknown workflow {workflow_id}")
     goal = wf["goal"]
-    prompt = PLAN_PROMPT.format(max_tasks=settings.max_plan_tasks,
-                                repo=repo, base_ref=base_ref, goal=goal)
+    # replan context: the prior task set is superseded by the new plan (§8:
+    # the planner receives goal + prior results so it does not redo successes)
+    prior = repo_tasks.list_tasks(conn, workflow_id)
+    prior_ctx = ""
+    if prior:
+        lines = []
+        for t in prior:
+            detail = (t["error_log"] or "")[:200]
+            if not detail and t["result_json"]:
+                try:
+                    detail = str(json.loads(t["result_json"])
+                                 .get("log_tail", ""))[:200]
+                except Exception:  # noqa: BLE001
+                    detail = ""
+            lines.append(f"- [{t['status']}] {t['title']}"
+                         + (f": {detail}" if detail else ""))
+        prior_ctx = REPLAN_SUFFIX.format(prior="\n".join(lines))
+    base_prompt = (PLAN_PROMPT.format(max_tasks=settings.max_plan_tasks,
+                                      repo=repo, base_ref=base_ref,
+                                      goal=goal)
+                   + prior_ctx)
+    prompt = base_prompt
     errors: list[str] = []
     plan: Optional[Plan] = None
     for attempt in range(2):  # initial + one repair retry
@@ -112,10 +139,7 @@ def plan_workflow(conn, claudio_p, settings, workflow_id: str,
             plan = None
             # keep the full original prompt (goal + schema) — a bare error
             # message gives the model nothing to repair against
-            prompt = (PLAN_PROMPT.format(max_tasks=settings.max_plan_tasks,
-                                         repo=repo, base_ref=base_ref,
-                                         goal=goal)
-                      + REPAIR_SUFFIX.format(error=errors[-1]))
+            prompt = base_prompt + REPAIR_SUFFIX.format(error=errors[-1])
     if plan is None:
         with immediate(conn):
             repo_workflows.set_status(conn, workflow_id, "blocked")
@@ -130,6 +154,10 @@ def plan_workflow(conn, claudio_p, settings, workflow_id: str,
         return "blocked"
 
     with immediate(conn):
+        # replan swap: the fresh plan supersedes the old task set. Without
+        # this the inserts collide with UNIQUE(workflow_id, sequence_index)
+        # / UNIQUE(workflow_id, title) and the workflow sticks in 'planning'.
+        n_old = repo_tasks.delete_workflow_tasks(conn, workflow_id)
         for i, pt in enumerate(plan.tasks, start=1):
             repo_tasks.create_task(
                 conn, workflow_id, i, pt.title, pt.objective, pt.acceptance,
@@ -139,6 +167,12 @@ def plan_workflow(conn, claudio_p, settings, workflow_id: str,
                 gh_issue_number=wf["gh_issue_number"])
         repo_workflows.set_plan(conn, workflow_id,
                                 plan.model_dump(), status="running")
-        repo_events.append_event(conn, "workflow", workflow_id, "info",
-                                 f"planned {len(plan.tasks)} tasks")
+        if n_old:
+            repo_events.append_event(
+                conn, "workflow", workflow_id, "warn",
+                f"replan: replaced {n_old} superseded tasks with "
+                f"{len(plan.tasks)}")
+        else:
+            repo_events.append_event(conn, "workflow", workflow_id, "info",
+                                     f"planned {len(plan.tasks)} tasks")
     return "running"
