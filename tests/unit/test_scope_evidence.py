@@ -23,6 +23,15 @@ def test_forbidden_wins():
     assert not scope.is_writable("src/deep/x.py", ["src/**"], ["src/deep/**"])
 
 
+def test_catchall_forbidden_yields_to_writable():
+    """Regression (live E2E): plans emit forbidden ['*'] meaning 'nothing
+    beyond writable' — it must not veto the explicitly writable files."""
+    assert scope.is_writable("README.md", ["README.md"], ["*", ".git/**"])
+    assert not scope.is_writable("other.txt", ["README.md"], ["*"])
+    # specific forbidden still vetoes even when writable would allow
+    assert not scope.is_writable("config.env", ["**"], ["*.env"])
+
+
 def test_bare_filename_glob():
     assert scope.is_writable("README.md", ["*.md"], [])
     assert not scope.is_writable("notes.txt", ["*.md"], [])

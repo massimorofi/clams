@@ -19,9 +19,16 @@ def _matches(path: str, pattern: str) -> bool:
         return False
 
 
+#: patterns that mean "everything" — LLM plans routinely emit
+#: forbidden: ["*"] alongside specific writable globs to mean "nothing
+#: *beyond* writable". A catch-all must not veto an explicitly writable file;
+#: specific forbidden patterns (e.g. "*.env", "src/secret.py") always veto.
+_CATCHALL = {"*", "**", "*/**"}
+
+
 def is_writable(path: str, writable: Iterable[str], forbidden: Iterable[str]) -> bool:
     w = list(writable)
-    f = list(forbidden)
+    f = [pat for pat in forbidden if pat.strip("/") not in _CATCHALL]
     if any(_matches(path, pat) for pat in f):
         return False
     return any(_matches(path, pat) for pat in w)
