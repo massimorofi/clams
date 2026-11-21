@@ -102,6 +102,9 @@ class EvidenceGate:
 
     def _env(self) -> dict[str, str]:
         import os
-        env = dict(os.environ)
+        from .worktree import trust_env
+        # brief run: commands may call git; the trees are agent-owned while
+        # the gate runs as root -> same trust config as the worktree ops
+        env = trust_env(dict(os.environ))
         env.update(self.wt.git_env)
         return env

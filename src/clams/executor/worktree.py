@@ -26,19 +26,27 @@ def _slug(repo: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]", "-", repo)
 
 
-def _run(args: list[str], cwd: Optional[Path] = None,
-         timeout: int = 300) -> str:
-    # The runner (root) operates on trees chowned to the agent uid, and the
-    # evidence gate runs there too — git's ownership safety check would
-    # refuse both. /work is Clams-owned storage, so trust it wholesale.
+def trust_env(base: Optional[dict[str, str]] = None) -> dict[str, str]:
+    """Env that disables git's ownership check for /work trees.
+
+    The runner (root) operates on trees chowned to the agent uid, and the
+    evidence gate runs brief `run:` commands (which may themselves call
+    git) there too — git's safety check would refuse both. /work is
+    Clams-owned storage, so trust it wholesale.
+    """
     import os
-    env = {**os.environ,
+    env = {**(base if base is not None else os.environ),
            "GIT_CONFIG_COUNT": "1",
            "GIT_CONFIG_KEY_0": "safe.directory",
            "GIT_CONFIG_VALUE_0": "*"}
+    return env
+
+
+def _run(args: list[str], cwd: Optional[Path] = None,
+         timeout: int = 300) -> str:
     proc = subprocess.run(args, cwd=str(cwd) if cwd else None,
                           capture_output=True, text=True, timeout=timeout,
-                          env=env)
+                          env=trust_env())
     if proc.returncode != 0:
         raise GitError(f"git {' '.join(args[:3])}... failed {proc.returncode}: "
                        f"{proc.stderr[:400]}")
