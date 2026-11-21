@@ -34,6 +34,7 @@ services:
 
   claudio-planner:
     image: ${CLAUDIO_IMAGE:-claudio/agent:latest}
+    ports: ["127.0.0.1:1072:8100"]
     env_file: .env.claudio-planner
     volumes:
       - claudio-sessions:/sessions
@@ -49,6 +50,7 @@ services:
 
   claudio-executor:
     image: ${CLAUDIO_IMAGE:-claudio/agent:latest}
+    ports: ["127.0.0.1:1073:8100"]
     env_file: .env.claudio-executor
     volumes:
       - claudio-sessions:/sessions
@@ -92,7 +94,7 @@ services:
     command: ["api"]
     # rw on clams-db is required: the API's only write is INSERT into commands
     volumes: [clams-db:/data, claudio-sessions:/sessions:ro]
-    ports: ["127.0.0.1:8200:8200"]
+    ports: ["0.0.0.0:1075:8200"]
     depends_on:
       planner: {condition: service_healthy}
 
