@@ -227,12 +227,35 @@ class PlannerLoop:
                                   max_attempts=self.s.outbox_max_attempts,
                                   on_subissue_created=self._on_subissue_created)
         log.info("planner loop starting (cycle=%ss)", self.s.planner_cycle_s)
-        while not self._stop.is_set():
-            try:
-                self.cycle()
-            except Exception:  # noqa: BLE001
-                log.exception("planner cycle crashed")
-            self._stop.wait(self.s.planner_cycle_s)
+        hb = threading.Thread(target=self._heartbeat_beat, daemon=True,
+                              name="clams-heartbeat")
+        hb.start()
+        try:
+            while not self._stop.is_set():
+                try:
+                    self.cycle()
+                except Exception:  # noqa: BLE001
+                    log.exception("planner cycle crashed")
+                self._stop.wait(self.s.planner_cycle_s)
+        finally:
+            hb.join(timeout=5)
+
+    def _heartbeat_beat(self) -> None:
+        """Keep runtime_state.heartbeat fresh while a cycle is blocked on a
+        long planning LLM call (a replan can outlast the 60 s healthcheck
+        window). Proves process liveness; the cycle's own write still marks
+        loop progress. Own connection: sqlite connections are thread-affine.
+        """
+        conn = connect(self.s.db_path)
+        try:
+            while not self._stop.wait(15):
+                try:
+                    with immediate(conn):
+                        repo_runtime.heartbeat(conn)
+                except Exception:  # noqa: BLE001
+                    log.exception("heartbeat beat failed")
+        finally:
+            conn.close()
 
     def _on_subissue_created(self, task_id: str, number: int) -> None:
         with immediate(self.conn):

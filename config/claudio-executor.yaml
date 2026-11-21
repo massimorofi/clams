@@ -88,7 +88,9 @@ agent:
   max_budget_usd: 100.0
   # headless execution: Clams passes approval_mode=off per request, but the
   # image config wins here — an unattended executor must never gate.
-  approval_mode: off
+  # NOTE: quoted — bare `off` is YAML 1.1 boolean False and fails pydantic
+  # string validation, which blanks the whole config (incl. auth token).
+  approval_mode: "off"
   # When true, the agent's run_command executes on the HOST machine (outside
   # the Docker container) via the host executor daemon, instead of inside the
   # container. The daemon must be running and listening on the socket below.
