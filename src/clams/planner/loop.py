@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 from typing import Optional
 
 from .. import contracts
@@ -51,6 +52,7 @@ class PlannerLoop:
         self.watchdog = Watchdog(bus, claudio_p, claudio_e, settings)
         self._stop = threading.Event()
         self._cycle_n = 0
+        self._stall_seen: dict[str, dict] = {}   # task_id -> alerted turns
         if hasattr(bus, "ensure_group"):
             bus.ensure_group(settings.stream_events, settings.group_planner)
 
@@ -59,6 +61,7 @@ class PlannerLoop:
         s = self.s
         stats: dict[str, int] = {}
         self._cycle_n += 1
+        self._apply_overrides()
         paused = repo_runtime.is_paused(self.conn)
 
         # 1. commands (interrupt priority, applied even when paused)
@@ -90,6 +93,9 @@ class PlannerLoop:
 
         # 7b. self-heal workflows stranded by pre-fix failures
         stats["swept"] = self._sweep_deadlocked()
+
+        # 7c. stall probe: alert (never kill) on alive-but-stuck tasks
+        stats["stalled"] = self._stall_probe()
 
         # 8. outbox relay
         if self.outbox is not None:
@@ -153,6 +159,64 @@ class PlannerLoop:
                 if repo_tasks.workflow_tasks_all_terminal(self.conn, wid):
                     review_workflow(self.conn, wid, self.s,
                                     gh_enabled=self.gh_client is not None)
+            n += 1
+        return n
+
+    def _apply_overrides(self) -> None:
+        """Re-apply runtime settings overrides (settings_patch command) and
+        publish the effective snapshot the API/UI reads. Cheap: one indexed
+        read; setattr only when the stored JSON changed."""
+        from ..db.conn import get_runtime_state, set_runtime_state
+        raw = get_runtime_state(self.conn, "settings_overrides") or "{}"
+        if raw != getattr(self, "_overrides_raw", None):
+            self._overrides_raw = raw
+            try:
+                overrides = json.loads(raw)
+            except ValueError:
+                overrides = {}
+            from ..config import EDITABLE_SETTINGS
+            for k, v in overrides.items():
+                if k in EDITABLE_SETTINGS:
+                    setattr(self.s, k, v)
+            with immediate(self.conn):
+                set_runtime_state(self.conn, "settings_effective",
+                                  json.dumps(overrides))
+
+    def _stall_probe(self) -> int:
+        """Alert when a running task's heartbeat shows no turn progress for
+        stall_alert_minutes. Detection, not punishment: the task keeps its
+        lease as long as heartbeats arrive — a human decides what to do."""
+        from ..db import repo_alerts
+        cutoff = time.time() - self.s.stall_alert_minutes * 60
+        rows = self.conn.execute(
+            "SELECT task_id, heartbeat_json FROM tasks WHERE status='running' "
+            "AND heartbeat_json IS NOT NULL").fetchall()
+        n = 0
+        for r in rows:
+            try:
+                hb = json.loads(r["heartbeat_json"])
+            except ValueError:
+                continue
+            turns = hb.get("turns_used", -1)
+            if turns < 0:
+                continue                      # progress unknown: don't judge
+            # remember the turn count we last alerted on, per task
+            seen = self._stall_seen.setdefault(r["task_id"], {})
+            if seen.get("turns") == turns:    # already alerted for this stall
+                continue
+            from ..db.conn import iso_to_epoch
+            if iso_to_epoch(hb.get("progress_ts") or hb["ts"]) > cutoff:
+                continue                      # progress is recent enough
+            self._stall_seen[r["task_id"]] = {"turns": turns}
+            with immediate(self.conn):
+                repo_alerts.raise_alert(
+                    self.conn, f"stall:{r['task_id']}", "warn",
+                    f"task {r['task_id']} alive but no turn progress for "
+                    f"{self.s.stall_alert_minutes} min (turns={turns}) — "
+                    "check the session transcript; cancel or retry if stuck")
+                repo_events.append_event(
+                    self.conn, "task", r["task_id"], "warn",
+                    f"stalled: no turn progress {self.s.stall_alert_minutes}m")
             n += 1
         return n
 

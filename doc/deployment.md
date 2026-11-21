@@ -99,6 +99,17 @@ Every transition is enforced by the table in `src/clams/db/repo_tasks.py`;
 events are fenced on `(task_id, attempt, lease_token)` so a dead executor can
 never corrupt state.
 
+**No task-duration timeouts.** A running task is never killed for taking long:
+heartbeats extend the lease without an upper bound, and death is detected by
+*heartbeat silence* (the runner's heartbeat thread dies with the process), not
+by elapsed time. Work is bounded by `max_turns` (the agent's own turn budget).
+A dispatched-but-unclaimed task simply waits in Redis (PEL + XAUTOCLAIM
+redeliver it when an executor returns) — a backlog or a dead executor never
+burns its attempts. An *alive but stuck* agent (heartbeats, no turn progress)
+is detected by the stall probe → **alert + UI badge, never a kill**; a human
+cancels or retries. Most of these knobs are editable at runtime from the UI
+**Config → Execution flow settings** (planner-side settings only).
+
 ```mermaid
 stateDiagram-v2
     [*] --> pending : plan created (task inserted)
@@ -109,12 +120,11 @@ stateDiagram-v2
     ready --> blocked : dependency stranded
     ready --> cancelled : cancel command
     dispatched --> running : task.started (fenced)
-    dispatched --> ready : lease expired, attempt < max (reaper)
-    dispatched --> failed : lease expired, attempts exhausted (reaper)
+    dispatched --> dispatched : never expires — waits in Redis PEL for an executor
     dispatched --> cancelled : cancel command
     running --> success : task.result success + evidence gate PASS
-    running --> ready : result failed / gate FAIL, attempt < max
-    running --> failed : result failed, attempts exhausted
+    running --> ready : result failed / gate FAIL (retryable), attempt < max
+    running --> failed : attempts exhausted, OR config-class error_code (auth etc. — fail fast, retries skipped)
     running --> waiting_input : task.question / needs_input
     running --> cancelled : cancel command
     waiting_input --> ready : answer command (brief carries answer + session_ref)
@@ -174,9 +184,10 @@ watchdog pause is auto-cleared (after 3 consecutive healthy probes).
 
 | Bound | Setting | Default |
 |---|---|---|
-| Dispatch lease (must be picked up) | `CLAMS_LEASE_DISPATCH_S` | 120 s |
-| Running lease | extended by each heartbeat to now+`CLAMS_LEASE_RUNNING_EXTEND_S` | 180 s |
-| Hard wall cap per attempt | `started_at + max_wall_s + 300` | `CLAMS_MAX_WALL_S`=1800 |
+| Dispatch lease | informational only — an unclaimed task waits in Redis, it is **not** expired | `CLAMS_LEASE_DISPATCH_S` |
+| Running lease (heartbeat grace) | extended by each heartbeat to now+`CLAMS_LEASE_RUNNING_EXTEND_S`; silence ⇒ executor declared dead ⇒ requeue/fail | 180 s |
+| ~~Wall cap~~ | **removed** — no duration kill; `max_wall_s` kept in the brief for informational use only | — |
+| Stall alert (no kill) | no turn progress for `CLAMS_STALL_ALERT_MINUTES` → alert + badge | 15 min |
 | Task attempts | `CLAMS_MAX_ATTEMPTS` | 3 |
 | Workflow replans | `CLAMS_MAX_REPLANS` | 3 |
 | Plan size | `CLAMS_MAX_PLAN_TASKS` | 7 |

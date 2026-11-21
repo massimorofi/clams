@@ -157,6 +157,22 @@ def create_app(settings, *, claudio_p: Optional[ClaudioClient] = None,
     def projects(ro: sqlite3.Connection = Depends(ro_dep)):
         return [dict(r) for r in repo_projects.list_projects(ro)]
 
+    # ---------------------------------------------------------- config
+    @app.get(f"{API_PREFIX}/config")
+    def config(ro: sqlite3.Connection = Depends(ro_dep)):
+        """Effective runtime settings + the editable schema, so the UI form
+        is generated from the same registry the planner enforces."""
+        from ..config import EDITABLE_SETTINGS, get_settings
+        from ..db.conn import get_runtime_state
+        s = get_settings()
+        overrides = json.loads(
+            get_runtime_state(ro, "settings_overrides") or "{}")
+        effective = {k: getattr(s, k) for k in EDITABLE_SETTINGS}
+        for k, v in overrides.items():
+            effective[k] = v          # planner-applied overrides win
+        return {"editable": EDITABLE_SETTINGS, "effective": effective,
+                "overrides": overrides}
+
     # ---------------------------------------------------------- commands
     @app.post(f"{API_PREFIX}/commands", status_code=202)
     def post_command(body: CommandBody,

@@ -14,7 +14,7 @@ from clams.db.conn import db_integrity_ok, plus_s, utcnow_s
 
 
 def test_migrations_apply_once(db):
-    assert schema_version(db) == 2   # 001_init + 002_tasks_started_at
+    assert schema_version(db) == 4   # 001..004
     assert migrate(db) == []          # idempotent
     assert db_integrity_ok(db)
 
@@ -233,16 +233,75 @@ def test_heartbeat_extends_lease(db):
 
 
 def test_lease_expiry_requeue(db):
+    """Heartbeat silence on a RUNNING task is the death signal (no wall cap)."""
     wf = _mk_wf(db)
     t = repo_tasks.create_task(db, wf, 1, "a", "o", "a", _brief())
     repo_tasks.promote_ready(db)
     row = repo_tasks.claim_for_dispatch(db, t, 120)
+    repo_tasks.on_started(db, t, row["attempt"], row["lease_token"], "e1", "s")
     db.execute("UPDATE tasks SET lease_expires_at=? WHERE task_id=?",
                (plus_s(-1), t))
     expired = repo_tasks.expired_leases(db)
     assert [r["task_id"] for r in expired] == [t]
     r = repo_tasks.requeue_after_lease(db, t)
     assert r["status"] == "ready" and r["attempt"] == 1
+
+
+def test_dispatched_never_expires(db):
+    """No dispatch-lease kill: an unclaimed task waits in Redis (PEL) without
+    burning attempts — a backlog or dead executor must not penalize it."""
+    wf = _mk_wf(db)
+    t = repo_tasks.create_task(db, wf, 1, "a", "o", "a", _brief())
+    repo_tasks.promote_ready(db)
+    repo_tasks.claim_for_dispatch(db, t, 120)
+    db.execute("UPDATE tasks SET lease_expires_at=? WHERE task_id=?",
+               (plus_s(-1), t))
+    assert repo_tasks.expired_leases(db) == []
+
+
+def test_no_wall_cap_on_heartbeat(db):
+    """Regression (timeout removal): heartbeats extend the lease forever —
+    even for a task created long ago with a small max_wall_s."""
+    import time
+    from clams.db.conn import epoch_to_iso
+    wf = _mk_wf(db)
+    t = repo_tasks.create_task(db, wf, 1, "a", "o", "a", _brief())
+    repo_tasks.promote_ready(db)
+    row = repo_tasks.claim_for_dispatch(db, t, 120)
+    repo_tasks.on_started(db, t, row["attempt"], row["lease_token"], "e1", "s")
+    db.execute("UPDATE tasks SET created_at=?, started_at=? WHERE task_id=?",
+               (epoch_to_iso(time.time() - 30 * 3600),
+                epoch_to_iso(time.time() - 30 * 3600), t))
+    hb = repo_tasks.on_heartbeat(db, t, 1, row["lease_token"], extend_s=180)
+    assert hb is not None
+    assert hb["lease_expires_at"] > repo_tasks.utcnow_s()  # not clamped
+
+
+def test_config_class_error_fails_fast(db):
+    """auth-class failures skip the retry ladder (would fail identically)."""
+    wf = _mk_wf(db)
+    t = repo_tasks.create_task(db, wf, 1, "a", "o", "a", _brief(),
+                               max_attempts=3)
+    repo_tasks.promote_ready(db)
+    row = repo_tasks.claim_for_dispatch(db, t, 120)
+    repo_tasks.on_started(db, t, row["attempt"], row["lease_token"], "e1", "s")
+    r = repo_tasks.on_result(db, t, row["attempt"], row["lease_token"],
+                             "failed", False, {"log_tail": "401 unauthorized"},
+                             error_code="claudio:auth")
+    assert r["status"] == "failed"          # not 'ready' despite attempts left
+
+
+def test_transient_error_retries(db):
+    wf = _mk_wf(db)
+    t = repo_tasks.create_task(db, wf, 1, "a", "o", "a", _brief(),
+                               max_attempts=3)
+    repo_tasks.promote_ready(db)
+    row = repo_tasks.claim_for_dispatch(db, t, 120)
+    repo_tasks.on_started(db, t, row["attempt"], row["lease_token"], "e1", "s")
+    r = repo_tasks.on_result(db, t, row["attempt"], row["lease_token"],
+                             "failed", False, {"log_tail": "boom"},
+                             error_code="claudio:unavailable")
+    assert r["status"] == "ready"           # retry as usual
 
 
 def test_waiting_input_expiry_blocks(db):

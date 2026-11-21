@@ -204,18 +204,11 @@ def claim_for_dispatch(conn: sqlite3.Connection, task_id: str,
 
 def _running_lease(row: sqlite3.Row, extend_s: int,
                    started_epoch: Optional[float] = None) -> str:
-    """Lease = now+extend_s, never beyond attempt start + max_wall_s + 300 (§6).
-
-    Anchored on started_at (per-attempt) so a task retried hours after creation
-    still gets a usable lease; falls back to created_at for legacy rows.
-    """
-    from .conn import iso_to_epoch
+    """Lease = now + extend_s. NO wall cap: a task may run as long as it keeps
+    proving life (heartbeats). Death is detected by heartbeat silence (the
+    reaper), not by elapsed duration; work is bounded by max_turns instead."""
     import time
-    brief = json.loads(row["brief_json"])
-    if started_epoch is None:
-        started_epoch = iso_to_epoch(row["started_at"] or row["created_at"])
-    wall_cap = started_epoch + int(brief.get("max_wall_s", 1800)) + 300
-    return epoch_to_iso(min(time.time() + extend_s, wall_cap))
+    return epoch_to_iso(time.time() + extend_s)
 
 
 def on_started(conn: sqlite3.Connection, task_id: str, attempt: int,
@@ -240,17 +233,37 @@ def on_started(conn: sqlite3.Connection, task_id: str, attempt: int,
 
 def on_heartbeat(conn: sqlite3.Connection, task_id: str, attempt: int,
                  lease_token: str, extend_s: int = 180,
-                 hard_cap_s: int = 1800) -> Optional[sqlite3.Row]:
-    """running stays running; lease extended to now+extend_s, never past wall cap."""
+                 hard_cap_s: int = 1800, turns_used: int = -1,
+                 elapsed_s: int = 0) -> Optional[sqlite3.Row]:
+    """running stays running; lease extended to now+extend_s (no wall cap).
+
+    The heartbeat payload (turns_used = session message count, -1 unknown)
+    is stored so the planner's stall probe can detect an alive-but-stuck
+    agent (turns not advancing) and alert — never kill.
+    """
     row = get_task(conn, task_id)
     if row is None or row["status"] != "running":
         return None
     if row["attempt"] != attempt or row["lease_token"] != lease_token:
         return None
+    # progress_ts advances only when the turn count actually grows, so the
+    # stall probe measures "no progress", not "no heartbeat"
+    now = utcnow_s()
+    prev = {}
+    if row["status"] == "running" and "heartbeat_json" in row.keys():
+        try:
+            prev = json.loads(row["heartbeat_json"] or "{}")
+        except ValueError:
+            prev = {}
+    progressed = turns_used >= 0 and turns_used != prev.get("turns_used", -2)
+    progress_ts = now if progressed else prev.get("progress_ts", now)
+    hb = json.dumps({"turns_used": turns_used, "elapsed_s": elapsed_s,
+                     "ts": now, "progress_ts": progress_ts})
     return conn.execute(
-        "UPDATE tasks SET lease_expires_at=?, updated_at=? WHERE task_id=? "
-        "RETURNING *", (_running_lease(row, extend_s), utcnow_s(),
-                        task_id)).fetchone()
+        "UPDATE tasks SET lease_expires_at=?, updated_at=?, heartbeat_json=? "
+        "WHERE task_id=? RETURNING *",
+        (_running_lease(row, extend_s), now, hb,
+         task_id)).fetchone()
 
 
 def on_question(conn: sqlite3.Connection, task_id: str, attempt: int,
@@ -259,10 +272,21 @@ def on_question(conn: sqlite3.Connection, task_id: str, attempt: int,
                              "waiting_input", from_status="running")
 
 
+#: error classes that will fail identically on every retry (broken config,
+#: bad credentials, missing repo) — retrying only burns attempts and time.
+#: The task goes straight to `failed` with an actionable alert instead.
+CONFIG_CLASS_ERRORS = ("claudio:auth", "claudio:config", "infra:config")
+
+
 def on_result(conn: sqlite3.Connection, task_id: str, attempt: int,
               lease_token: str, outcome: str, gate_passed: bool,
-              result: dict[str, Any]) -> Optional[sqlite3.Row]:
-    """Apply a task.result with fencing. Returns the updated row or None if fenced."""
+              result: dict[str, Any],
+              error_code: str = "") -> Optional[sqlite3.Row]:
+    """Apply a task.result with fencing. Returns the updated row or None if fenced.
+
+    Retry policy: a config-class error_code skips the retry ladder entirely
+    (fail fast + alert); any other failure retries while attempts remain.
+    """
     row = get_task(conn, task_id)
     if row is None or row["attempt"] != attempt or row["lease_token"] != lease_token:
         return None
@@ -278,8 +302,9 @@ def on_result(conn: sqlite3.Connection, task_id: str, attempt: int,
         return transition(conn, task_id, "success", **extra)
     if outcome == "needs_input":
         return transition(conn, task_id, "waiting_input", **extra)
-    # failed / gate fail: retry if attempts remain
-    if row["attempt"] < row["max_attempts"]:
+    config_class = error_code.startswith(CONFIG_CLASS_ERRORS)
+    # failed / gate fail: retry if attempts remain (config-class never does)
+    if not config_class and row["attempt"] < row["max_attempts"]:
         extra["lease_token"] = None
         extra["lease_expires_at"] = None
         extra["executor_id"] = None
@@ -322,8 +347,12 @@ def expire_waiting_input(conn: sqlite3.Connection, hours: int) -> list[str]:
 
 
 def expired_leases(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Running tasks whose heartbeat went silent (lease = last proof of life
+    + grace). Dispatched tasks are NOT expired: an unclaimed message simply
+    waits in Redis (PEL + XAUTOCLAIM redeliver it when an executor returns),
+    so a backlog or a dead executor never penalizes the task's attempts."""
     return conn.execute(
-        "SELECT * FROM tasks WHERE status IN ('dispatched','running') "
+        "SELECT * FROM tasks WHERE status = 'running' "
         "AND lease_expires_at IS NOT NULL AND lease_expires_at < ?",
         (utcnow_s(),)).fetchall()
 

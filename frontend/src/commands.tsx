@@ -19,7 +19,8 @@ export type CommandKind =
   | 'retry'
   | 'answer'
   | 'adhoc'
-  | 'config_patch';
+  | 'config_patch'
+  | 'settings_patch';
 
 interface SubmitOptions {
   target?: string | null;

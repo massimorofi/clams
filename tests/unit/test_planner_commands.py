@@ -237,3 +237,31 @@ def test_bad_command_rejected_not_applied(db):
     cid = repo_commands.insert_command(db, "answer", {"question_id": 999}, "op")
     _drain(db)
     assert repo_commands.get(db, cid)["status"] == "rejected"
+
+
+def test_settings_patch_applies_and_persists(db):
+    from clams.db.conn import get_runtime_state
+    from clams.config import Settings
+    import json as _json
+    repo_commands.insert_command(
+        db, "settings_patch", {"settings": {"max_attempts": 7,
+                                            "stall_alert_minutes": 30}},
+        "operator", target=None)
+    assert _drain(db) == 1
+    row = db.execute("SELECT status, result FROM commands WHERE kind="
+                     "'settings_patch'").fetchone()
+    assert row["status"] == "applied", row["result"]
+    ov = _json.loads(get_runtime_state(db, "settings_overrides"))
+    assert ov == {"max_attempts": 7, "stall_alert_minutes": 30}
+
+
+def test_settings_patch_rejects_unknown_and_out_of_range(db):
+    repo_commands.insert_command(db, "settings_patch",
+                                 {"settings": {"api_token": "x"}}, "op")
+    repo_commands.insert_command(db, "settings_patch",
+                                 {"settings": {"max_attempts": 99}}, "op")
+    _drain(db)
+    statuses = [r["status"] for r in db.execute(
+        "SELECT status FROM commands WHERE kind='settings_patch' "
+        "ORDER BY command_id")]
+    assert statuses == ["rejected", "rejected"]

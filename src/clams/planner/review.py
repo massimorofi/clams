@@ -50,7 +50,9 @@ def _apply(conn, msg, settings, *, gh_enabled: bool) -> str:
         row = repo_tasks.on_heartbeat(conn, msg.task_id, msg.attempt,
                                       msg.lease_token,
                                       extend_s=settings.lease_running_extend_s,
-                                      hard_cap_s=settings.max_wall_s)
+                                      hard_cap_s=settings.max_wall_s,
+                                      turns_used=msg.turns_used,
+                                      elapsed_s=msg.elapsed_s)
         return "applied" if row else "fenced"
 
     if t == "task.question":
@@ -83,10 +85,18 @@ def _apply(conn, msg, settings, *, gh_enabled: bool) -> str:
                                     "branch": msg.branch,
                                     "changed_files": msg.changed_files,
                                     "log_tail": msg.log_tail[-2000:],
-                                    "session_ref": msg.session_ref})
+                                    "session_ref": msg.session_ref},
+                                   error_code=getattr(msg, "error_code", ""))
         if row is None:
             log.info("fenced task.result %s a%s", msg.task_id, msg.attempt)
             return "fenced"
+        if row["status"] == "failed" and getattr(msg, "error_code", "") \
+                and msg.error_code.startswith(repo_tasks.CONFIG_CLASS_ERRORS):
+            repo_alerts.raise_alert(
+                conn, f"config:{msg.error_code}", "error",
+                f"task {msg.task_id} failed with config-class error "
+                f"{msg.error_code} — fix the configuration, retries were "
+                f"skipped: {msg.log_tail[:200]}")
         level = "info" if row["status"] == "success" else "warn"
         repo_events.append_event(
             conn, "task", msg.task_id, level,

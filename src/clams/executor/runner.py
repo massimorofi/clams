@@ -138,25 +138,39 @@ class ExecutorRunner:
         except Exception as exc:  # noqa: BLE001
             self._emit_result(msg, "failed", session_ref="", branch="",
                               evidence={"reason": f"worktree: {exc}"},
-                              log_tail=str(exc))
+                              log_tail=str(exc), error_code="infra:worktree")
             self.bus.ack(self.s.stream_tasks, self.s.group_executors, d.id)
             return
 
         self._emit("task.started", msg, session_ref=session_ref,
                    extra={"executor_id": self.executor_id})
-        hb = self._start_heartbeat(msg)
+        hb = self._start_heartbeat(msg, session_ref)
         try:
+            # no duration timeout: a complex task runs as long as it keeps
+            # emitting heartbeats; the agent's own max_turns bounds the work.
+            # Death is detected planner-side (heartbeat silence), not here.
             resp = self.claudio.chat(
                 build_prompt(brief), session_id=session_ref,
                 approval_mode="off", workspace_dir=str(worktree),
-                timeout=brief.max_wall_s)
+                timeout=None)
             final = resp.final_output
-        except (ClaudioUnavailable, ClaudioError) as exc:
+        except ClaudioUnavailable as exc:      # subclass: must come first
             self._stop_heartbeat(hb)
             self._emit_result(msg, "failed", session_ref=session_ref,
                               branch=str(worktree),
                               evidence={"reason": f"claudio: {exc}"},
-                              log_tail=str(exc))
+                              log_tail=str(exc),
+                              error_code="claudio:unavailable")
+            self.bus.ack(self.s.stream_tasks, self.s.group_executors, d.id)
+            return
+        except ClaudioError as exc:
+            self._stop_heartbeat(hb)
+            code = ("claudio:auth" if getattr(exc, "status", 0) in (401, 403)
+                    else "claudio:error")
+            self._emit_result(msg, "failed", session_ref=session_ref,
+                              branch=str(worktree),
+                              evidence={"reason": f"claudio: {exc}"},
+                              log_tail=str(exc), error_code=code)
             self.bus.ack(self.s.stream_tasks, self.s.group_executors, d.id)
             return
         self._stop_heartbeat(hb)
@@ -175,6 +189,8 @@ class ExecutorRunner:
         gate = EvidenceGate(self.wt)
         evidence = gate.run(worktree, brief.model_dump(), brief.base_ref)
         outcome = "success" if evidence["passed"] else "failed"
+        gate_code = "" if outcome == "success" else \
+            f"gate:{str(evidence.get('reason', ''))[:40]}"
         commit_sha = ""
         branch = self.wt.branch_name(msg.task_id, msg.attempt)
         try:
@@ -189,7 +205,7 @@ class ExecutorRunner:
         self._emit_result(msg, outcome, session_ref=session_ref, branch=branch,
                           commit_sha=commit_sha, evidence=evidence,
                           changed_files=evidence.get("changed_files", []),
-                          log_tail=final[-2000:])
+                          log_tail=final[-2000:], error_code=gate_code)
         self.bus.ack(self.s.stream_tasks, self.s.group_executors, d.id)
         if outcome == "success":
             self.wt.remove(brief.repo, msg.task_id, msg.attempt)
@@ -217,21 +233,31 @@ class ExecutorRunner:
     def _emit_result(self, msg: contracts.TaskDispatch, outcome: str, *,
                      session_ref: str, branch: str, evidence: dict,
                      commit_sha: str = "", changed_files: Optional[list] = None,
-                     log_tail: str = "") -> None:
+                     log_tail: str = "", error_code: str = "") -> None:
         self._emit("task.result", msg, session_ref=session_ref,
                    extra={"outcome": outcome, "evidence": evidence,
                           "commit_sha": commit_sha, "branch": branch,
                           "changed_files": changed_files or [],
-                          "log_tail": log_tail})
+                          "log_tail": log_tail, "error_code": error_code})
 
-    def _start_heartbeat(self, msg: contracts.TaskDispatch) -> tuple:
+    def _session_progress(self, session_ref: str) -> int:
+        """Real progress signal: count of session messages (turns/tool calls).
+        -1 when unreadable — the planner's stall probe ignores unknown."""
+        try:
+            return len(self.claudio.session_messages(session_ref, limit=500))
+        except Exception:  # noqa: BLE001
+            return -1
+
+    def _start_heartbeat(self, msg: contracts.TaskDispatch,
+                         session_ref: str) -> tuple:
         done = threading.Event()
 
         def beat():
             t0 = time.monotonic()
             while not done.wait(self.s.heartbeat_interval_s):
                 self._emit("task.heartbeat", msg,
-                           extra={"turns_used": 0,
+                           extra={"turns_used":
+                                      self._session_progress(session_ref),
                                   "elapsed_s": int(time.monotonic() - t0)})
         t = threading.Thread(target=beat, daemon=True)
         t.start()

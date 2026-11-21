@@ -122,7 +122,37 @@ def _apply(conn, row, *, adhoc_handler=None, gh_client=None) -> dict[str, Any]:
     if kind == "config_patch":
         return _config_patch(conn, payload, issuer, gh_client=gh_client)
 
+    if kind == "settings_patch":
+        return _settings_patch(conn, payload, issuer)
+
     raise ValueError(f"unhandled command kind {kind}")
+
+
+def _settings_patch(conn, payload: dict, issuer: str) -> dict:
+    """Runtime tuning of planner-side execution-flow settings.
+
+    Overrides persist in runtime_state and are re-applied by the planner loop
+    at the start of every cycle, so they survive restarts. Env/infra settings
+    (paths, URLs, tokens) are intentionally not editable here.
+    """
+    from ..db.conn import get_runtime_state, set_runtime_state
+    from ..config import EDITABLE_SETTINGS, coerce_setting
+    patch = payload.get("settings") or {}
+    if not isinstance(patch, dict) or not patch:
+        raise ValueError("settings_patch needs payload.settings {name: value}")
+    unknown = [k for k in patch if k not in EDITABLE_SETTINGS]
+    if unknown:
+        raise ValueError(f"not editable at runtime: {', '.join(unknown)}")
+    merged = json.loads(get_runtime_state(conn, "settings_overrides") or "{}")
+    applied = {}
+    for k, v in patch.items():
+        merged[k] = coerce_setting(k, v)
+        applied[k] = merged[k]
+    set_runtime_state(conn, "settings_overrides", json.dumps(merged))
+    repo_events.append_event(conn, "system", "settings", "info",
+                             f"settings_patch by {issuer}: "
+                             + ", ".join(f"{k}={v}" for k, v in applied.items()))
+    return {"applied": applied, "overrides": merged}
 
 
 def _cancel(conn, target: Optional[str], payload: dict, issuer: str) -> dict:

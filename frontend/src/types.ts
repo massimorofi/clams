@@ -147,3 +147,16 @@ export type TranscriptMessage = Record<string, unknown>;
 export interface Transcript {
   messages: TranscriptMessage[];
 }
+
+export interface SettingSpec {
+  type: 'int' | 'float';
+  min: number;
+  max: number;
+  label: string;
+}
+
+export interface ClamsConfig {
+  editable: Record<string, SettingSpec>;
+  effective: Record<string, number>;
+  overrides: Record<string, number>;
+}

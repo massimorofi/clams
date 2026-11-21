@@ -74,6 +74,8 @@ What each address exposes (per `docker-compose.yml`):
 | `127.0.0.1:1075` | `api` :8200 | **Clams UI + REST + SSE** — the SPA at `/`, API under `/api/v1` | local browser (check the bind: `0.0.0.0` = whole LAN) |
 | `127.0.0.1:1072` | `claudio-planner` :8100 | **Claudio-P agent HTTP API** — `/healthz`, `/api/v1/chat`, its own web UI | debugging the planning agent |
 | `127.0.0.1:1073` | `claudio-executor` :8100 | **Claudio-E agent HTTP API** — same surface, headless executor | debugging the executor agent |
+| `127.0.0.1:1076` | `claudio-ui-planner` :8080 | **Claudio web UI for the Planner agent** (chat, sessions, config of Claudio-P) | supervising planning |
+| `127.0.0.1:1077` | `claudio-ui-executor` :8080 | **Claudio web UI for the Executor agent** — watch task sessions live | supervising execution |
 | *(internal)* `redis:6379` | redis | Redis Streams `clams:tasks` / `clams:events` / `clams:dlq` | docker network only — **never published** |
 | *(internal)* `planner`, `executor-runner` | — | no published ports; they only *call* the services above | docker network only |
 

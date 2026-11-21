@@ -137,6 +137,10 @@ class TaskResult(_Base):
     changed_files: list[str] = Field(default_factory=list)
     log_tail: str = ""
     session_ref: str = ""
+    # structured failure class (see executor.runner ERROR_* codes): lets the
+    # planner distinguish retryable failures from config-class ones that
+    # would burn every attempt identically (e.g. claudio:auth)
+    error_code: str = ""
 
 
 class ExecutorAlive(_Base):

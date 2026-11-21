@@ -8,7 +8,7 @@ from typing import Any, Optional
 from .conn import utcnow_s
 
 COMMAND_KINDS = ('pause', 'resume', 'cancel', 'replan', 'retry', 'answer',
-                 'adhoc', 'config_patch')
+                 'adhoc', 'config_patch', 'settings_patch')
 
 
 def insert_command(conn: sqlite3.Connection, kind: str, payload: dict[str, Any],

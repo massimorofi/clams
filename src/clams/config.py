@@ -81,6 +81,9 @@ class Settings(BaseSettings):
     planner_heartbeat_max_age_s: int = 60
     events_batch: int = 100
     events_block_ms: int = 1000
+    # stall probe: alert (never kill) when a running task's heartbeat shows
+    # no turn progress for this long
+    stall_alert_minutes: int = 15
 
     # --- limits (bounded everything) ----------------------------------------------------
     max_attempts: int = 3
@@ -157,3 +160,56 @@ def get_settings() -> Settings:
 
 def reset_settings_cache() -> None:
     get_settings.cache_clear()
+
+
+#: Settings the operator may tune at runtime from the UI (planner-side only;
+#: env/infra settings like paths, URLs and tokens require a container
+#: restart). name -> {type, min, max, label}. Enforced by the settings_patch
+#: command and advertised by GET /api/v1/config so the form is generated
+#: from this single source.
+EDITABLE_SETTINGS: dict[str, dict] = {
+    "max_attempts": {"type": "int", "min": 1, "max": 10,
+                     "label": "Task attempts before failure"},
+    "max_replans": {"type": "int", "min": 0, "max": 10,
+                    "label": "Workflow replans before blocked"},
+    "max_turns": {"type": "int", "min": 1, "max": 500,
+                  "label": "Agent turns per task (the real work bound)"},
+    "max_plan_tasks": {"type": "int", "min": 1, "max": 20,
+                       "label": "Max tasks per plan"},
+    "planning_llm_budget_per_cycle": {"type": "int", "min": 1, "max": 10,
+                                      "label": "Planning LLM calls per cycle"},
+    "planner_cycle_s": {"type": "float", "min": 1, "max": 300,
+                        "label": "Planner cycle (s)"},
+    "intake_every_n_cycles": {"type": "int", "min": 1, "max": 720,
+                              "label": "GitHub intake every N cycles"},
+    "lease_running_extend_s": {"type": "int", "min": 30, "max": 3600,
+                               "label": "Heartbeat grace: requeue after silence (s)"},
+    "stall_alert_minutes": {"type": "int", "min": 1, "max": 1440,
+                            "label": "Stall alert: no turn progress (min)"},
+    "claudio_timeout_s": {"type": "float", "min": 10, "max": 7200,
+                          "label": "Claudio planning call timeout (s)"},
+    "question_expiry_h": {"type": "int", "min": 1, "max": 720,
+                          "label": "Question expiry before blocked (h)"},
+    "outbox_max_attempts": {"type": "int", "min": 1, "max": 20,
+                            "label": "Outbox delivery attempts"},
+    "oldest_ready_alert_s": {"type": "int", "min": 30, "max": 86400,
+                             "label": "Alert: oldest ready task age (s)"},
+    "min_free_disk_mb": {"type": "int", "min": 50, "max": 10_000_000,
+                         "label": "Alert: minimum free disk (MB)"},
+}
+
+
+def coerce_setting(name: str, value):
+    """Validate + coerce one editable setting. Raises ValueError."""
+    spec = EDITABLE_SETTINGS.get(name)
+    if spec is None:
+        raise ValueError(f"setting {name!r} is not editable at runtime")
+    if spec["type"] == "int":
+        v = int(value)
+    elif spec["type"] == "float":
+        v = float(value)
+    else:
+        raise ValueError(f"unknown type {spec['type']}")
+    if not (spec["min"] <= v <= spec["max"]):
+        raise ValueError(f"{name}={v} outside [{spec['min']}, {spec['max']}]")
+    return v

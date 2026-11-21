@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '../api';
 import { useCommand } from '../commands';
 import { Card, Empty, ErrorNote, Loading, SectionTitle, fmtDateTime } from './ui';
@@ -151,6 +151,94 @@ function AddProjectModal({ onClose }: { onClose: () => void }) {
   );
 }
 
+function SettingsCard() {
+  const { data, error, isLoading } = useQuery({
+    queryKey: ['config'],
+    queryFn: api.config,
+  });
+  const { submit, pendingCount } = useCommand();
+  const qc = useQueryClient();
+  const [draft, setDraft] = useState<Record<string, string>>({});
+
+  if (isLoading) return <Loading label="Loading settings…" />;
+  if (error) return <ErrorNote error={error} />;
+  if (!data) return null;
+
+  const { editable, effective, overrides } = data;
+  const valueOf = (k: string) => draft[k] ?? String(effective[k] ?? '');
+  const dirty = Object.keys(editable).filter(
+    (k) => draft[k] !== undefined && draft[k] !== String(effective[k]),
+  );
+  const busy = pendingCount > 0;
+
+  async function save() {
+    const patch: Record<string, number> = {};
+    for (const k of dirty) {
+      const spec = editable[k];
+      const v = spec.type === 'int' ? parseInt(draft[k], 10) : parseFloat(draft[k]);
+      if (Number.isNaN(v) || v < spec.min || v > spec.max) {
+        window.alert(`${spec.label}: must be between ${spec.min} and ${spec.max}`);
+        return;
+      }
+      patch[k] = v;
+    }
+    if (Object.keys(patch).length === 0) return;
+    await submit('settings_patch', {
+      payload: { settings: patch },
+      label: `settings: ${Object.keys(patch).join(', ')}`,
+    });
+    setDraft({});
+    void qc.invalidateQueries({ queryKey: ['config'] });
+  }
+
+  return (
+    <Card>
+      <SectionTitle
+        right={
+          <button
+            onClick={() => void save()}
+            disabled={dirty.length === 0 || busy}
+            className="rounded-md bg-emerald-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {busy ? 'Applying…' : dirty.length ? `Apply (${dirty.length})` : 'Apply'}
+          </button>
+        }
+      >
+        Execution flow settings
+      </SectionTitle>
+      <p className="px-4 pb-3 text-xs text-slate-400">
+        Applied by the planner at the start of the next cycle and persisted across
+        restarts. Paths, URLs and tokens are env-only (restart required). Values
+        marked <span className="text-emerald-500">•</span> differ from defaults.
+      </p>
+      <div className="grid grid-cols-1 gap-3 px-4 pb-4 sm:grid-cols-2 lg:grid-cols-3">
+        {Object.entries(editable).map(([k, spec]) => (
+          <label key={k} className="block text-sm">
+            <span className="mb-1 flex items-center gap-1 font-medium text-slate-700 dark:text-slate-200">
+              {spec.label}
+              {k in overrides && (
+                <span className="text-emerald-500" title="overridden at runtime">•</span>
+              )}
+            </span>
+            <input
+              type="number"
+              min={spec.min}
+              max={spec.max}
+              step={spec.type === 'float' ? 'any' : '1'}
+              value={valueOf(k)}
+              onChange={(e) => setDraft((d) => ({ ...d, [k]: e.target.value }))}
+              className={inputCls}
+            />
+            <span className="mt-0.5 block font-mono text-[10px] text-slate-400">
+              {k} · range {spec.min}–{spec.max}
+            </span>
+          </label>
+        ))}
+      </div>
+    </Card>
+  );
+}
+
 export function ConfigView() {
   const { data, error, isLoading } = useQuery({
     queryKey: ['projects'],
@@ -195,6 +283,8 @@ export function ConfigView() {
     'disabled:opacity-40';
 
   return (
+    <div className="space-y-4">
+    <SettingsCard />
     <Card>
       <SectionTitle
         right={
@@ -291,5 +381,6 @@ export function ConfigView() {
       )}
       {addOpen && <AddProjectModal onClose={() => setAddOpen(false)} />}
     </Card>
+    </div>
   );
 }

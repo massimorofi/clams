@@ -197,3 +197,36 @@ def test_heartbeat_extends(db):
     hb = contracts.TaskHeartbeat(task_id=t, attempt=a, lease_token=tok,
                                  turns_used=3, elapsed_s=60)
     assert apply_event(db, hb, "m10", s) == "applied"
+
+
+def test_stall_probe_alerts_without_killing(db_path):
+    """Alive-but-stuck: heartbeats arrive, turns don't move -> alert + event,
+    task stays running (the planner waits; a human decides)."""
+    import json as _json
+    from clams.bus import InMemoryBus
+    from clams.db import repo_alerts, connect as _connect, migrate as _migrate
+    from clams.db.conn import plus_s
+    from clams.planner.loop import PlannerLoop
+    _c = _connect(db_path); _migrate(_c); _c.close()
+    db = _connect(db_path)
+    s = Settings(_env_file=None, stall_alert_minutes=15, db_path=db_path)
+    pid = repo_projects.upsert_project(db, "o/r")
+    wf = repo_workflows.create_workflow(db, pid, "adhoc", "g")
+    repo_workflows.set_status(db, wf, "running")
+    brief = {"objective": "o", "acceptance": "a", "run": ["echo x"],
+             "writable": ["*.py"], "repo": "o/r", "max_wall_s": 1800}
+    t = repo_tasks.create_task(db, wf, 1, "t1", "o", "a", brief)
+    repo_tasks.promote_ready(db)
+    row = repo_tasks.claim_for_dispatch(db, t, 120)
+    repo_tasks.on_started(db, t, row["attempt"], row["lease_token"], "e1", "s")
+    db.execute("UPDATE tasks SET heartbeat_json=? WHERE task_id=?",
+               (_json.dumps({"turns_used": 5, "elapsed_s": 3600,
+                             "ts": plus_s(-3600), "progress_ts": plus_s(-3600)}),
+                t))
+    loop = PlannerLoop(s, InMemoryBus(), None)
+    loop.conn = db                      # test against the fixture DB
+    assert loop._stall_probe() == 1
+    assert repo_alerts.open_count(db) == 1
+    assert repo_tasks.get_task(db, t)["status"] == "running"   # NOT killed
+    # idempotent: same stalled turn count does not re-alert
+    assert loop._stall_probe() == 0

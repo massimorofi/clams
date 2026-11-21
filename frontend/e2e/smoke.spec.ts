@@ -147,10 +147,14 @@ test.describe('Clams v2 SPA smoke', () => {
     try {
       await authedPage(page);
       await page.getByRole('button', { name: 'Questions' }).click();
-      // scope to OUR card (other open questions may exist on the live board)
-      const card = page.locator('div', { hasText: `E2E-${stamp}: pick a color` })
-                       .locator('form').last();
-      await expect(card).toBeVisible({ timeout: 15_000 });
+      // scope to OUR card: the deepest div containing both our question text
+      // and a form is the Card itself (other open questions may exist)
+      const card = page.locator('div')
+                       .filter({ hasText: `E2E-${stamp}: pick a color` })
+                       .filter({ has: page.locator('form') })
+                       .last();
+      await expect(card.getByText(`E2E-${stamp}: pick a color`))
+             .toBeVisible({ timeout: 15_000 });
       await card.getByPlaceholder('Type an answer…').fill('blue');
       await card.getByRole('button', { name: 'Answer' }).click();
       // poll the DB directly: the answer command's drain can lag behind any
@@ -158,7 +162,7 @@ test.describe('Clams v2 SPA smoke', () => {
       await expect
         .poll(() => sql(`SELECT status FROM questions WHERE
                            idempotency_key='${QK}';`),
-              { timeout: 180_000 })
+              { timeout: 300_000 })
         .toBe('answered');
       // cancel the seeded workflow so the now-ready task is never dispatched
       await command('cancel', wfId);

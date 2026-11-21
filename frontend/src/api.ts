@@ -1,4 +1,5 @@
 import type {
+  ClamsConfig,
   Command,
   CommandAck,
   CommandRequest,
@@ -96,6 +97,8 @@ export const api = {
 
   questions: (status = 'open') =>
     request<Question[]>(`/questions?status=${encodeURIComponent(status)}`),
+
+  config: () => request<ClamsConfig>('/config'),
 
   projects: async (): Promise<Project[]> => {
     const raw = await request<unknown>('/projects');

@@ -45,7 +45,11 @@ services:
              "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8100/healthz').status==200 else 1)"]
       interval: 15s
       retries: 5
-    networks: [clams]
+    networks:
+      clams: {}
+      # alias so the stock claudio/web nginx upstream (claudio-agent:8100)
+      # resolves to THIS backend for its dedicated UI instance
+      ui-planner: { aliases: [claudio-agent] }
     restart: unless-stopped
 
   claudio-executor:
@@ -62,7 +66,28 @@ services:
              "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8100/healthz').status==200 else 1)"]
       interval: 15s
       retries: 5
-    networks: [clams]
+    networks:
+      clams: {}
+      ui-executor: { aliases: [claudio-agent] }
+    restart: unless-stopped
+
+  # Claudio web UIs — one instance per backend (nginx proxies a single
+  # upstream). The UI token is the agent's server.auth_token (paste in the
+  # Claudio UI settings). Planner UI: 1076, Executor UI: 1077.
+  claudio-ui-planner:
+    image: ${CLAUDIO_WEB_IMAGE:-claudio/web:latest}
+    ports: ["127.0.0.1:1076:8080"]
+    depends_on:
+      claudio-planner: {condition: service_healthy}
+    networks: [ui-planner]
+    restart: unless-stopped
+
+  claudio-ui-executor:
+    image: ${CLAUDIO_WEB_IMAGE:-claudio/web:latest}
+    ports: ["127.0.0.1:1077:8080"]
+    depends_on:
+      claudio-executor: {condition: service_healthy}
+    networks: [ui-executor]
     restart: unless-stopped
 
   planner:
@@ -98,5 +123,5 @@ services:
     depends_on:
       planner: {condition: service_healthy}
 
-networks: {clams: {}}
+networks: {clams: {}, ui-planner: {}, ui-executor: {}}
 volumes: {clams-db: {}, redis-data: {}, claudio-sessions: {}, worktrees: {}}
