@@ -17,7 +17,7 @@ def _dispatched(db, s, n_tasks=1):
     ids = []
     for i in range(1, n_tasks + 1):
         brief = {"objective": "o", "acceptance": "a", "run": ["echo x"],
-                 "writable": ["*.py"], "repo": "o/r", "max_wall_s": 1800}
+                 "writable": ["*.py"], "repo": "o/r"}
         ids.append(repo_tasks.create_task(db, wf, i, f"t{i}", "o", "a", brief,
                                           max_attempts=s.max_attempts))
     repo_tasks.promote_ready(db)
@@ -115,7 +115,7 @@ def test_failed_task_blocks_dependents_and_replans(db):
     wf = repo_workflows.create_workflow(db, pid, "adhoc", "g")
     repo_workflows.set_status(db, wf, "running")
     brief = {"objective": "o", "acceptance": "a", "run": ["echo x"],
-             "writable": ["*.py"], "repo": "o/r", "max_wall_s": 1800}
+             "writable": ["*.py"], "repo": "o/r"}
     t1 = repo_tasks.create_task(db, wf, 1, "t1", "o", "a", brief,
                                 max_attempts=1)
     t2 = repo_tasks.create_task(db, wf, 2, "t2", "o", "a", brief,
@@ -150,7 +150,7 @@ def test_blocked_only_workflow_blocks_with_alert(db):
     wf = repo_workflows.create_workflow(db, pid, "adhoc", "g")
     repo_workflows.set_status(db, wf, "running")
     brief = {"objective": "o", "acceptance": "a", "run": ["echo x"],
-             "writable": ["*.py"], "repo": "o/r", "max_wall_s": 1800}
+             "writable": ["*.py"], "repo": "o/r"}
     t1 = repo_tasks.create_task(db, wf, 1, "t1", "o", "a", brief)
     t2 = repo_tasks.create_task(db, wf, 2, "t2", "o", "a", brief)
     for t in (t1,):
@@ -172,7 +172,7 @@ def test_review_skips_workflow_mid_planning(db):
     wf = repo_workflows.create_workflow(db, pid, "adhoc", "g")
     repo_workflows.set_status(db, wf, "planning")
     brief = {"objective": "o", "acceptance": "a", "run": ["echo x"],
-             "writable": ["*.py"], "repo": "o/r", "max_wall_s": 1800}
+             "writable": ["*.py"], "repo": "o/r"}
     t = repo_tasks.create_task(db, wf, 1, "t1", "o", "a", brief)
     repo_tasks.transition(db, t, "ready")
     repo_tasks.transition(db, t, "dispatched")
@@ -214,7 +214,7 @@ def test_stall_probe_alerts_without_killing(db_path):
     wf = repo_workflows.create_workflow(db, pid, "adhoc", "g")
     repo_workflows.set_status(db, wf, "running")
     brief = {"objective": "o", "acceptance": "a", "run": ["echo x"],
-             "writable": ["*.py"], "repo": "o/r", "max_wall_s": 1800}
+             "writable": ["*.py"], "repo": "o/r"}
     t = repo_tasks.create_task(db, wf, 1, "t1", "o", "a", brief)
     repo_tasks.promote_ready(db)
     row = repo_tasks.claim_for_dispatch(db, t, 120)

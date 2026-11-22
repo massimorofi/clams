@@ -24,7 +24,7 @@ def _running_task(db):
     pid = repo_projects.upsert_project(db, "o/r")
     wf = repo_workflows.create_workflow(db, pid, "adhoc", "g")
     brief = {"objective": "o", "acceptance": "a", "run": ["x"],
-             "writable": ["*"], "repo": "o/r", "max_wall_s": 1800}
+             "writable": ["*"], "repo": "o/r"}
     t = repo_tasks.create_task(db, wf, 1, "t", "o", "a", brief,
                                max_attempts=2)
     repo_tasks.promote_ready(db)
@@ -126,7 +126,7 @@ def _running_task_with_dependents(db, max_attempts=1):
     wf = repo_workflows.create_workflow(db, pid, "adhoc", "g")
     repo_workflows.set_status(db, wf, "running")
     brief = {"objective": "o", "acceptance": "a", "run": ["x"],
-             "writable": ["*"], "repo": "o/r", "max_wall_s": 1800}
+             "writable": ["*"], "repo": "o/r"}
     t1 = repo_tasks.create_task(db, wf, 1, "t1", "o", "a", brief,
                                 max_attempts=max_attempts)
     t2 = repo_tasks.create_task(db, wf, 2, "t2", "o", "a", brief,
@@ -158,7 +158,7 @@ def test_question_expiry_blocks_dependents_and_workflow(db):
     wf = repo_workflows.create_workflow(db, pid, "adhoc", "g")
     repo_workflows.set_status(db, wf, "running")
     brief = {"objective": "o", "acceptance": "a", "run": ["x"],
-             "writable": ["*"], "repo": "o/r", "max_wall_s": 1800}
+             "writable": ["*"], "repo": "o/r"}
     t1 = repo_tasks.create_task(db, wf, 1, "t1", "o", "a", brief)
     t2 = repo_tasks.create_task(db, wf, 2, "t2", "o", "a", brief,
                                 depends_on=[1])

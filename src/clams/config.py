@@ -48,7 +48,6 @@ class Settings(BaseSettings):
     claudio_planner_token: str = ""
     claudio_executor_url: str = "http://127.0.0.1:1073"
     claudio_executor_token: str = ""
-    claudio_timeout_s: float = 120.0
     # Root inside which Claudio-E may bind workspaces (worktrees live under it).
     claudio_workspace_root: str = "./work"
     # Owner of provisioned worktrees: the runner (root in Docker) hands files
@@ -88,7 +87,6 @@ class Settings(BaseSettings):
     # --- limits (bounded everything) ----------------------------------------------------
     max_attempts: int = 3
     max_turns: int = 40
-    max_wall_s: int = 1800
     max_replans: int = 3
     max_plan_tasks: int = 7
     planning_llm_budget_per_cycle: int = 3
@@ -186,8 +184,6 @@ EDITABLE_SETTINGS: dict[str, dict] = {
                                "label": "Heartbeat grace: requeue after silence (s)"},
     "stall_alert_minutes": {"type": "int", "min": 1, "max": 1440,
                             "label": "Stall alert: no turn progress (min)"},
-    "claudio_timeout_s": {"type": "float", "min": 10, "max": 7200,
-                          "label": "Claudio planning call timeout (s)"},
     "question_expiry_h": {"type": "int", "min": 1, "max": 720,
                           "label": "Question expiry before blocked (h)"},
     "outbox_max_attempts": {"type": "int", "min": 1, "max": 20,

@@ -43,7 +43,7 @@ def trust_env(base: Optional[dict[str, str]] = None) -> dict[str, str]:
 
 
 def _run(args: list[str], cwd: Optional[Path] = None,
-         timeout: int = 300) -> str:
+         timeout: Optional[int] = None) -> str:
     proc = subprocess.run(args, cwd=str(cwd) if cwd else None,
                           capture_output=True, text=True, timeout=timeout,
                           env=trust_env())
@@ -94,8 +94,7 @@ class WorktreeManager:
         if not (d / ".git").exists():
             d.parent.mkdir(parents=True, exist_ok=True)
             url = self.remote_url_template.format(repo=repo)
-            _run(["git", "clone", "--branch", base_ref, url, str(d)],
-                 timeout=600)
+            _run(["git", "clone", "--branch", base_ref, url, str(d)])
         # scrub any token from the remote URL (idempotent, always clean)
         self._scrub_remote(d)
         self._chown(d.parent)
@@ -112,8 +111,7 @@ class WorktreeManager:
 
     def fetch(self, repo: str) -> None:
         try:
-            _run(["git", "fetch", "--all", "--prune"], cwd=self.repo_dir(repo),
-                 timeout=300)
+            _run(["git", "fetch", "--all", "--prune"], cwd=self.repo_dir(repo))
         except GitError as exc:
             log.warning("fetch failed for %s: %s", repo, exc)
 
@@ -205,4 +203,4 @@ class WorktreeManager:
         return _run(["git", "status", "--porcelain"], cwd=path)
 
     def push(self, path: Path, branch: str) -> None:
-        _run(["git", "push", "-u", "origin", branch], cwd=path, timeout=300)
+        _run(["git", "push", "-u", "origin", branch], cwd=path)

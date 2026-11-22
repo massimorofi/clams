@@ -41,7 +41,7 @@ def _ready_task(db, s, max_attempts=3):
     repo_workflows.set_status(db, wf, "running")
     brief = {"objective": "o", "acceptance": "a", "run": ["echo ok"],
              "writable": ["*.py"], "repo": "o/r", "base_ref": "main",
-             "max_wall_s": 1800}
+             }
     t = repo_tasks.create_task(db, wf, 1, "t", "o", "a", brief,
                                max_attempts=max_attempts)
     repo_tasks.promote_ready(db)

@@ -60,7 +60,6 @@ class Brief(BaseModel):
     repo: str                                     # owner/name
     base_ref: str = "main"
     max_turns: int = 40
-    max_wall_s: int = 1800
     answer: Optional[str] = None                  # set when resuming after question
     session_ref: Optional[str] = None             # set when resuming a session
 

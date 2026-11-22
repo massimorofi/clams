@@ -202,8 +202,7 @@ def claim_for_dispatch(conn: sqlite3.Connection, task_id: str,
         return cur.fetchone()
 
 
-def _running_lease(row: sqlite3.Row, extend_s: int,
-                   started_epoch: Optional[float] = None) -> str:
+def _running_lease(row: sqlite3.Row, extend_s: int) -> str:
     """Lease = now + extend_s. NO wall cap: a task may run as long as it keeps
     proving life (heartbeats). Death is detected by heartbeat silence (the
     reaper), not by elapsed duration; work is bounded by max_turns instead."""
@@ -226,14 +225,14 @@ def on_started(conn: sqlite3.Connection, task_id: str, attempt: int,
         "WHERE task_id=? AND attempt=? AND lease_token=? AND status='dispatched' "
         "RETURNING *",
         (executor_id, session_ref, utcnow_s(),
-         _running_lease(row, extend_s, started_epoch=now_e),
+         _running_lease(row, extend_s),
          utcnow_s(), task_id, attempt, lease_token)) as cur:
         return cur.fetchone()
 
 
 def on_heartbeat(conn: sqlite3.Connection, task_id: str, attempt: int,
                  lease_token: str, extend_s: int = 180,
-                 hard_cap_s: int = 1800, turns_used: int = -1,
+                 turns_used: int = -1,
                  elapsed_s: int = 0) -> Optional[sqlite3.Row]:
     """running stays running; lease extended to now+extend_s (no wall cap).
 

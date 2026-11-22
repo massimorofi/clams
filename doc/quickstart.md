@@ -60,8 +60,6 @@ Key `.env` settings (full list in `.env.example`):
 | `CLAMS_GITHUB_TOKEN` | *(empty)* | **must set** for GitHub intake |
 | `CLAMS_CLAUDIO_PLANNER_TOKEN` | *(empty)* | must equal `server.auth_token` in `config/claudio-planner.yaml` |
 | `CLAMS_CLAUDIO_EXECUTOR_TOKEN` | *(empty)* | must equal `server.auth_token` in `config/claudio-executor.yaml` |
-| `CLAMS_CLAUDIO_TIMEOUT_S` | `120` | raise to **600** — agentic planning runs take minutes |
-| `CLAMS_MAX_WALL_S` | `1800` | per-task wall budget; keep ≤ 2× the Claudio `llm.timeout_seconds` |
 | `CLAMS_WORKTREE_UID/GID` | `1000` | owner of provisioned worktrees (the Claudio agent uid) |
 | `CLAUDIO_IMAGE` | `claudio/agent:latest` | compose interpolation var for the agent image |
 

@@ -141,7 +141,7 @@ def _planner(settings) -> int:
     bus = make_bus(settings.redis_url)
     cp = ClaudioClient(settings.claudio_planner_url,
                        settings.claudio_planner_token,
-                       timeout=settings.claudio_timeout_s)
+)
     ce = ClaudioClient(settings.claudio_executor_url,
                        settings.claudio_executor_token)
     gh = None
@@ -166,7 +166,7 @@ def _executor(settings) -> int:
     bus = make_bus(settings.redis_url)
     cl = ClaudioClient(settings.claudio_executor_url,
                        settings.claudio_executor_token,
-                       timeout=settings.claudio_timeout_s)
+)
     wt = WorktreeManager(settings.work_root,
                           chown_uid=settings.worktree_uid or None,
                           chown_gid=settings.worktree_gid or None)

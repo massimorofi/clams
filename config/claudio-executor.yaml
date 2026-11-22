@@ -31,10 +31,11 @@ llm:
   fallback_model: null
   # NOTE: the /chat endpoint cancels any run exceeding 2x this value
   # (api/chat.py: wait_for(record.task, timeout=llm.timeout_seconds*2)).
-  # Clams no longer enforces a task wall cap, so this is the ONLY run
-  # deadline in the system: 3600 -> 2-hour agentic runs. Tasks that need
-  # more are too coarse — the planner must split them (see PLAN_PROMPT).
-  timeout_seconds: 3600
+  # Clams enforces NO task-duration timeouts, so this is the only run
+  # deadline in the system. Claudio requires a number here (no disable),
+  # so it is set effectively-unbounded (2 days). A wedged run is caught
+  # by the stall probe (alert, never kill), not by a timer.
+  timeout_seconds: 86400
   retry_attempts: 3
   price_input_per_mtok: 0.0
   price_output_per_mtok: 0.0
@@ -62,7 +63,7 @@ model_profiles:
     context_window: 262144
     price_input_per_mtok: 0.0
     price_output_per_mtok: 0.0
-    timeout_seconds: 300
+    timeout_seconds: 1800
   fast-halogen:
     label: "Fast (halogen)"
     provider: openai
@@ -74,7 +75,7 @@ model_profiles:
     context_window: 262144
     price_input_per_mtok: 0.0
     price_output_per_mtok: 0.0
-    timeout_seconds: 300
+    timeout_seconds: 1800
 
 roles:
   # primary omitted -> uses the `llm` section.

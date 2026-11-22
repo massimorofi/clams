@@ -11,14 +11,15 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from .scope import check_scope
 from .worktree import WorktreeManager
 
 
 class EvidenceGate:
-    def __init__(self, wt: WorktreeManager, command_timeout_s: int = 600):
+    def __init__(self, wt: WorktreeManager,
+                 command_timeout_s: Optional[int] = None):
         self.wt = wt
         self.command_timeout_s = command_timeout_s
 

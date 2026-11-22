@@ -31,7 +31,7 @@ llm:
   fallback_model: null
   # /chat cancels runs exceeding 2x this (api/chat.py). Planning calls for big
   # goals exceed the 600s default; 1800 -> 60-minute planning deadline.
-  timeout_seconds: 1800
+  timeout_seconds: 86400
   retry_attempts: 3
   price_input_per_mtok: 0.0
   price_output_per_mtok: 0.0
@@ -59,7 +59,7 @@ model_profiles:
     context_window: 262144
     price_input_per_mtok: 0.0
     price_output_per_mtok: 0.0
-    timeout_seconds: 300
+    timeout_seconds: 1800
   fast-halogen:
     label: "Fast (halogen)"
     provider: openai
@@ -71,7 +71,7 @@ model_profiles:
     context_window: 262144
     price_input_per_mtok: 0.0
     price_output_per_mtok: 0.0
-    timeout_seconds: 300
+    timeout_seconds: 1800
 
 roles:
   # primary omitted -> uses the `llm` section.

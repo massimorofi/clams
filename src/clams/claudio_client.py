@@ -44,7 +44,7 @@ _UNSET = object()   # distinguishes "caller passed nothing" from explicit None
 
 class ClaudioClient:
     def __init__(self, base_url: str, auth_token: str = "",
-                 timeout: float = 120.0,
+                 timeout: Optional[float] = None,
                  transport: Optional[httpx.BaseTransport] = None):
         self.base_url = base_url.rstrip("/")
         self.auth_token = auth_token

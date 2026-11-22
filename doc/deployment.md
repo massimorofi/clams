@@ -102,7 +102,8 @@ never corrupt state.
 **No task-duration timeouts.** A running task is never killed for taking long:
 heartbeats extend the lease without an upper bound, and death is detected by
 *heartbeat silence* (the runner's heartbeat thread dies with the process), not
-by elapsed time. Work is bounded by `max_turns` (the agent's own turn budget).
+by elapsed time. Work is bounded by the agent's own turn budget
+(`agent.max_turns` in the Claudio config).
 A dispatched-but-unclaimed task simply waits in Redis (PEL + XAUTOCLAIM
 redeliver it when an executor returns) — a backlog or a dead executor never
 burns its attempts. An *alive but stuck* agent (heartbeats, no turn progress)
@@ -186,7 +187,7 @@ watchdog pause is auto-cleared (after 3 consecutive healthy probes).
 |---|---|---|
 | Dispatch lease | informational only — an unclaimed task waits in Redis, it is **not** expired | `CLAMS_LEASE_DISPATCH_S` |
 | Running lease (heartbeat grace) | extended by each heartbeat to now+`CLAMS_LEASE_RUNNING_EXTEND_S`; silence ⇒ executor declared dead ⇒ requeue/fail | 180 s |
-| ~~Wall cap~~ | **removed** — no duration kill; `max_wall_s` kept in the brief for informational use only | — |
+| ~~Wall cap~~ | **removed everywhere** — no duration kill in Clams or Claudio | — |
 | Stall alert (no kill) | no turn progress for `CLAMS_STALL_ALERT_MINUTES` → alert + badge | 15 min |
 | Task attempts | `CLAMS_MAX_ATTEMPTS` | 3 |
 | Workflow replans | `CLAMS_MAX_REPLANS` | 3 |
@@ -195,7 +196,7 @@ watchdog pause is auto-cleared (after 3 consecutive healthy probes).
 | Outbox retries → dead | `CLAMS_OUTBOX_MAX_ATTEMPTS` | 5 (exp. backoff base 2 s) |
 | Bus deliveries → DLQ | `CLAMS_DLQ_MAX_DELIVERIES` | 5 |
 | Planning LLM calls / cycle | `CLAMS_PLANNING_LLM_BUDGET_PER_CYCLE` | 3 |
-| Claudio call timeout | `CLAMS_CLAUDIO_TIMEOUT_S` | 120 (**set 600** — agentic planning takes minutes) |
+| Claudio run deadline | `llm.timeout_seconds` × 2 in `config/claudio-*.yaml` — set to 86400×2 (effectively none; Claudio cannot disable it) | 2 days |
 
 New attempt ⇒ new `lease_token` ⇒ stale executors are fenced on every event.
 The reaper returns expired-lease tasks to `ready` (or `failed` when attempts

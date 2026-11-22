@@ -50,7 +50,6 @@ def _apply(conn, msg, settings, *, gh_enabled: bool) -> str:
         row = repo_tasks.on_heartbeat(conn, msg.task_id, msg.attempt,
                                       msg.lease_token,
                                       extend_s=settings.lease_running_extend_s,
-                                      hard_cap_s=settings.max_wall_s,
                                       turns_used=msg.turns_used,
                                       elapsed_s=msg.elapsed_s)
         return "applied" if row else "fenced"

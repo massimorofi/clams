@@ -92,7 +92,6 @@ def build_brief(pt: PlanTask, repo: str, base_ref: str, settings) -> dict:
         "repo": repo,
         "base_ref": base_ref,
         "max_turns": settings.max_turns,
-        "max_wall_s": settings.max_wall_s,
     }
 
 
@@ -132,8 +131,10 @@ def plan_workflow(conn, claudio_p, settings, workflow_id: str,
     plan: Optional[Plan] = None
     for attempt in range(2):  # initial + one repair retry
         try:
+            # no timeout: planning is agentic work too; the stall
+            # probe alerts if it wedges
             reply = claudio_p.chat(prompt, approval_mode="off",
-                                   timeout=settings.claudio_timeout_s)
+                                   timeout=None)
             raw = extract_json(reply.final_output)
             plan = Plan.model_validate(raw)
             validate_plan(plan, max_tasks=settings.max_plan_tasks)

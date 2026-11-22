@@ -78,7 +78,7 @@ def _mk_wf(db):
 
 def _brief():
     return {"objective": "o", "acceptance": "a", "run": ["pytest"],
-            "writable": ["src/**"], "repo": "o/r", "max_wall_s": 1800}
+            "writable": ["src/**"], "repo": "o/r"}
 
 
 def test_task_create_and_list(db):
@@ -143,7 +143,7 @@ def test_on_started_lease_survives_old_created_at(db):
     pid = repo_projects.upsert_project(db, "o/r")
     wf = repo_workflows.create_workflow(db, pid, "adhoc", "g")
     brief = {"objective": "o", "acceptance": "a", "run": ["echo x"],
-             "writable": ["*.py"], "repo": "o/r", "max_wall_s": 1800}
+             "writable": ["*.py"], "repo": "o/r"}
     t = repo_tasks.create_task(db, wf, 1, "t", "o", "a", brief)
     repo_tasks.transition(db, t, "ready")
     row, tok = repo_tasks.claim_for_dispatch(db, t, 120), None
@@ -226,7 +226,7 @@ def test_heartbeat_extends_lease(db):
     tok = row["lease_token"]
     repo_tasks.on_started(db, t, 1, tok, "e1", "s1")
     before = repo_tasks.get_task(db, t)["lease_expires_at"]
-    hb = repo_tasks.on_heartbeat(db, t, 1, tok, extend_s=180, hard_cap_s=1800)
+    hb = repo_tasks.on_heartbeat(db, t, 1, tok, extend_s=180)
     assert hb["lease_expires_at"] >= before
     # fenced heartbeat ignored
     assert repo_tasks.on_heartbeat(db, t, 1, "nope", 180, 1800) is None
