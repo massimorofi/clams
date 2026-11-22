@@ -15,7 +15,8 @@ COPY pyproject.toml README.md ./
 COPY src ./src
 COPY migrations ./migrations
 COPY config ./config
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir . \
+    && pip install --no-cache-dir pytest pytest-asyncio aiosqlite  # evidence-gate run commands execute here
 COPY --from=web /web/dist ./frontend/dist
 COPY clamsctl /usr/local/bin/clamsctl
 RUN chmod +x /usr/local/bin/clamsctl
