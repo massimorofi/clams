@@ -48,8 +48,13 @@ class _Base(BaseModel):
 
 # --------------------------------------------------------------------------- brief
 class Brief(BaseModel):
-    """Immutable per-attempt task brief carried inside task.dispatch."""
-    model_config = ConfigDict(extra="forbid")
+    """Immutable per-attempt task brief carried inside task.dispatch.
+
+    extra="ignore": stored brief_json rows may predate contract changes
+    (e.g. the removed max_wall_s) — an old row must never wedge dispatch.
+    Migrations still strip known-obsolete keys.
+    """
+    model_config = ConfigDict(extra="ignore")
 
     schema_version: int = SCHEMA_VERSION
     objective: str
