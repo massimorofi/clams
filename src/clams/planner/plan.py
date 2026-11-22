@@ -29,6 +29,10 @@ Rules: tasks are ordered (sequence_index = position, 1-based); depends_on may \
 only reference earlier tasks; every task needs >=1 run command (shell, must \
 print output and exit 0 to pass) and >=1 writable glob; acceptance must be \
 objectively checkable.
+Keep each task SMALL: one focused change an agent can finish well under one \
+hour of tool work — split large features into several tasks rather than one. \
+Run commands execute in the executor container which has python3, pytest, \
+git and grep; they must be non-interactive and finish within 5 minutes.
 
 Goal (repo {repo}, base ref {base_ref}):
 {goal}

@@ -53,7 +53,8 @@ services:
     restart: unless-stopped
 
   claudio-executor:
-    image: ${CLAUDIO_IMAGE:-claudio/agent:latest}
+    # executor-side agent: derived image with pytest for evidence-gate runs
+    image: ${CLAUDIO_EXECUTOR_IMAGE:-claudio/agent-exec:latest}
     ports: ["127.0.0.1:1073:8100"]
     env_file: .env.claudio-executor
     volumes:

@@ -31,8 +31,10 @@ llm:
   fallback_model: null
   # NOTE: the /chat endpoint cancels any run exceeding 2x this value
   # (api/chat.py: wait_for(record.task, timeout=llm.timeout_seconds*2)).
-  # 1800 -> 60-minute run deadline, matching CLAMS_MAX_WALL_S (3600s) in .env.
-  timeout_seconds: 1800
+  # Clams no longer enforces a task wall cap, so this is the ONLY run
+  # deadline in the system: 3600 -> 2-hour agentic runs. Tasks that need
+  # more are too coarse — the planner must split them (see PLAN_PROMPT).
+  timeout_seconds: 3600
   retry_attempts: 3
   price_input_per_mtok: 0.0
   price_output_per_mtok: 0.0
