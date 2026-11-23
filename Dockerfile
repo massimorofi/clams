@@ -16,7 +16,11 @@ COPY src ./src
 COPY migrations ./migrations
 COPY config ./config
 RUN pip install --no-cache-dir . \
-    && pip install --no-cache-dir pytest pytest-asyncio aiosqlite croniter  # evidence-gate run commands execute here
+    # evidence-gate run commands execute here: pytest plus claudio's own
+    # backend/core deps (see claudio-backend|core/pyproject.toml) so the
+    # suites the briefs run can import and collect
+    && pip install --no-cache-dir pytest pytest-asyncio aiosqlite croniter \
+       "google-adk[openai]>=2.0,<3" mcp fastapi "uvicorn[standard]" pyyaml pypdf httpx
 COPY --from=web /web/dist ./frontend/dist
 COPY clamsctl /usr/local/bin/clamsctl
 RUN chmod +x /usr/local/bin/clamsctl

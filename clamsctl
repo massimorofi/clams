@@ -24,8 +24,12 @@ rows = [json.loads(l) for l in sys.argv[1].splitlines() if l.strip()]
 tty = sys.stdout.isatty()
 G, R, Y, Z = ("\033[32m","\033[31m","\033[33m","\033[0m") if tty else ("","","","")
 def short(s):
-    m = re.match(r"(\d+)\s+(second|minute|hour|day)", s or "")
-    return f"{m[1]}{m[2][0]}" if m else (s or "")
+    s = s or ""
+    m = re.match(r"(\d+)\s+(second|minute|hour|day)", s)
+    if m: return f"{m[1]}{m[2][0]}"
+    if s.startswith("About a minute"): return "1m"
+    if s.startswith("Less than a second"): return "<1s"
+    return s
 out, ok = [], 0
 for c in sorted(rows, key=lambda c: c.get("Service","")):
     h = (c.get("Health") or "").lower(); st = (c.get("State") or "").lower()
