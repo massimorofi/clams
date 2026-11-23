@@ -203,9 +203,11 @@ def claim_for_dispatch(conn: sqlite3.Connection, task_id: str,
 
 
 def _running_lease(row: sqlite3.Row, extend_s: int) -> str:
-    """Lease = now + extend_s. NO wall cap: a task may run as long as it keeps
-    proving life (heartbeats). Death is detected by heartbeat silence (the
-    reaper), not by elapsed duration; work is bounded by max_turns instead."""
+    """Lease = now + extend_s. NO wall cap: a task may run as long as its
+    session evidence keeps advancing. The lease is set at on_started and
+    renewed ONLY by the watchdog (renew_lease) from external evidence —
+    executor heartbeats are metrics, never lease proof. Death is detected by
+    the watchdog's evidence checks, not by elapsed duration."""
     import time
     return epoch_to_iso(time.time() + extend_s)
 
@@ -213,16 +215,20 @@ def _running_lease(row: sqlite3.Row, extend_s: int) -> str:
 def on_started(conn: sqlite3.Connection, task_id: str, attempt: int,
                lease_token: str, executor_id: str,
                session_ref: str, extend_s: int = 180) -> Optional[sqlite3.Row]:
-    """dispatched -> running, fenced on (task_id, attempt, lease_token)."""
+    """dispatched -> running, fenced on (task_id, attempt, lease_token).
+
+    Also re-adopts an already-running task with the SAME attempt+token: an
+    autoclaimed runner restarts the chat with a fresh session_ref, and the
+    watchdog's session evidence must follow it (live case: runner recreated
+    mid-task, DB kept pointing at the dead session)."""
     row = get_task(conn, task_id)
     if row is None:
         return None
-    import time
-    now_e = time.time()
     with conn.execute(
         "UPDATE tasks SET status='running', executor_id=?, session_ref=?, "
         "started_at=?, lease_expires_at=?, updated_at=? "
-        "WHERE task_id=? AND attempt=? AND lease_token=? AND status='dispatched' "
+        "WHERE task_id=? AND attempt=? AND lease_token=? "
+        "AND status IN ('dispatched','running') "
         "RETURNING *",
         (executor_id, session_ref, utcnow_s(),
          _running_lease(row, extend_s),
@@ -231,14 +237,14 @@ def on_started(conn: sqlite3.Connection, task_id: str, attempt: int,
 
 
 def on_heartbeat(conn: sqlite3.Connection, task_id: str, attempt: int,
-                 lease_token: str, extend_s: int = 180,
-                 turns_used: int = -1,
+                 lease_token: str, *, turns_used: int = -1,
                  elapsed_s: int = 0) -> Optional[sqlite3.Row]:
-    """running stays running; lease extended to now+extend_s (no wall cap).
+    """Metrics only — the lease is renewed by the watchdog from session
+    evidence (renew_lease), never by executor beats.
 
     The heartbeat payload (turns_used = session message count, -1 unknown)
-    is stored so the planner's stall probe can detect an alive-but-stuck
-    agent (turns not advancing) and alert — never kill.
+    is stored so the watchdog's liveness monitor and the turn-budget check
+    can see an alive-but-stuck agent — alert only, never kill.
     """
     row = get_task(conn, task_id)
     if row is None or row["status"] != "running":
@@ -249,7 +255,7 @@ def on_heartbeat(conn: sqlite3.Connection, task_id: str, attempt: int,
     # stall probe measures "no progress", not "no heartbeat"
     now = utcnow_s()
     prev = {}
-    if row["status"] == "running" and "heartbeat_json" in row.keys():
+    if "heartbeat_json" in row.keys():
         try:
             prev = json.loads(row["heartbeat_json"] or "{}")
         except ValueError:
@@ -259,10 +265,42 @@ def on_heartbeat(conn: sqlite3.Connection, task_id: str, attempt: int,
     hb = json.dumps({"turns_used": turns_used, "elapsed_s": elapsed_s,
                      "ts": now, "progress_ts": progress_ts})
     return conn.execute(
-        "UPDATE tasks SET lease_expires_at=?, updated_at=?, heartbeat_json=? "
+        "UPDATE tasks SET updated_at=?, heartbeat_json=? "
         "WHERE task_id=? RETURNING *",
-        (_running_lease(row, extend_s), now, hb,
-         task_id)).fetchone()
+        (now, hb, task_id)).fetchone()
+
+
+def renew_lease(conn: sqlite3.Connection, task_id: str, attempt: int,
+                lease_token: str, extend_s: int) -> Optional[sqlite3.Row]:
+    """Watchdog-side lease renewal, fenced on (attempt, lease_token).
+
+    Called only when external evidence (Claudio session growth) proves the
+    task is alive. running-only; a reaped/re-dispatched task's stale token
+    can never renew."""
+    row = get_task(conn, task_id)
+    if (row is None or row["status"] != "running"
+            or row["attempt"] != attempt or row["lease_token"] != lease_token):
+        return None
+    return conn.execute(
+        "UPDATE tasks SET lease_expires_at=?, updated_at=? "
+        "WHERE task_id=? AND status='running' AND attempt=? AND lease_token=? "
+        "RETURNING *",
+        (_running_lease(row, extend_s), utcnow_s(),
+         task_id, attempt, lease_token)).fetchone()
+
+
+def requeue_infra(conn: sqlite3.Connection, task_id: str) -> Optional[sqlite3.Row]:
+    """Infra fault (claudio unreachable): running -> ready WITHOUT burning the
+    attempt. claim_for_dispatch increments attempt at claim time, so we give
+    it back and the next claim reuses the same number. The lease token is
+    cleared, so a zombie executor's late result stays fenced even when the
+    same attempt number is re-dispatched."""
+    row = get_task(conn, task_id)
+    if row is None or row["status"] != "running":
+        return None
+    extra = {"lease_token": None, "lease_expires_at": None,
+             "executor_id": None, "attempt": max(0, row["attempt"] - 1)}
+    return transition(conn, task_id, "ready", **extra)
 
 
 def on_question(conn: sqlite3.Connection, task_id: str, attempt: int,
@@ -275,6 +313,12 @@ def on_question(conn: sqlite3.Connection, task_id: str, attempt: int,
 #: bad credentials, missing repo) — retrying only burns attempts and time.
 #: The task goes straight to `failed` with an actionable alert instead.
 CONFIG_CLASS_ERRORS = ("claudio:auth", "claudio:config", "infra:config")
+
+#: transient infrastructure faults (claudio container down/unreachable):
+#: not the agent's fault — requeue WITHOUT burning the attempt. Infinite
+#: retry is safe because the watchdog pauses dispatch while claudio is
+#: critically failing its health probe.
+INFRA_ERROR_CODES = ("claudio:unavailable",)
 
 
 def on_result(conn: sqlite3.Connection, task_id: str, attempt: int,
@@ -302,6 +346,14 @@ def on_result(conn: sqlite3.Connection, task_id: str, attempt: int,
     if outcome == "needs_input":
         return transition(conn, task_id, "waiting_input", **extra)
     config_class = error_code.startswith(CONFIG_CLASS_ERRORS)
+    if error_code.startswith(INFRA_ERROR_CODES):
+        # infra fault: free requeue, attempt preserved (give back the number
+        # claim_for_dispatch took at claim time)
+        extra["lease_token"] = None
+        extra["lease_expires_at"] = None
+        extra["executor_id"] = None
+        extra["attempt"] = max(0, row["attempt"] - 1)
+        return transition(conn, task_id, "ready", **extra)
     # failed / gate fail: retry if attempts remain (config-class never does)
     if not config_class and row["attempt"] < row["max_attempts"]:
         extra["lease_token"] = None
@@ -346,10 +398,11 @@ def expire_waiting_input(conn: sqlite3.Connection, hours: int) -> list[str]:
 
 
 def expired_leases(conn: sqlite3.Connection) -> list[sqlite3.Row]:
-    """Running tasks whose heartbeat went silent (lease = last proof of life
-    + grace). Dispatched tasks are NOT expired: an unclaimed message simply
-    waits in Redis (PEL + XAUTOCLAIM redeliver it when an executor returns),
-    so a backlog or a dead executor never penalizes the task's attempts."""
+    """Running tasks whose lease lapsed — last-resort net only: the watchdog
+    renews leases from session evidence every probe, so this fires only if
+    the planner itself was dead longer than the lease TTL. Dispatched tasks
+    are NOT expired: an unclaimed message simply waits in Redis (PEL +
+    XAUTOCLAIM redeliver it when an executor returns)."""
     return conn.execute(
         "SELECT * FROM tasks WHERE status = 'running' "
         "AND lease_expires_at IS NOT NULL AND lease_expires_at < ?",

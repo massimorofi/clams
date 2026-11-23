@@ -7,5 +7,5 @@ from .conn import (  # noqa: F401
 from . import (  # noqa: F401
     repo_projects, repo_workflows, repo_tasks, repo_questions,
     repo_commands, repo_outbox, repo_events, repo_executors,
-    repo_alerts, repo_runtime,
+    repo_alerts, repo_runtime, repo_stall_evidence,
 )

@@ -104,6 +104,18 @@ class ClaudioClient:
         except httpx.HTTPError:
             return False
 
+    def active_run(self, session_id: str) -> Optional[str]:
+        """The session's currently-active run_id, or None. Never raises —
+        used for best-effort cooperative cancellation of a running agent."""
+        try:
+            with self._client(timeout=10.0) as c:
+                r = c.get(f"/api/v1/sessions/{session_id}/active_run")
+                if r.status_code >= 400:
+                    return None
+                return (r.json() or {}).get("run_id") or None
+        except (httpx.HTTPError, ValueError):
+            return None
+
     def session_messages(self, session_id: str, limit: int = 200) -> list[dict]:
         try:
             with self._client(timeout=15.0) as c:

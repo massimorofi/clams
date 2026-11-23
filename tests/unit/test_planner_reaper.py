@@ -63,7 +63,7 @@ def test_question_expiry_blocks(db):
 def _wd(db, bus=None, cp=None, ce=None):
     s = Settings(_env_file=None, watchdog_probe_interval_s=0,
                  watchdog_healthy_probes_to_resume=2,
-                 oldest_ready_alert_s=100)
+                 oldest_ready_alert_s=100, model_server_url="")
     return Watchdog(bus or InMemoryBus(), cp, ce, s,
                     disk_path=str(db.execute("PRAGMA database_list")
                                   .fetchone()[2]) or ".")

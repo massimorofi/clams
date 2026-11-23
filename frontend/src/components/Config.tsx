@@ -172,11 +172,15 @@ function SettingsCard() {
   const busy = pendingCount > 0;
 
   async function save() {
-    const patch: Record<string, number> = {};
+    const patch: Record<string, number | string> = {};
     for (const k of dirty) {
       const spec = editable[k];
+      if (spec.type === 'str') {
+        patch[k] = draft[k];
+        continue;
+      }
       const v = spec.type === 'int' ? parseInt(draft[k], 10) : parseFloat(draft[k]);
-      if (Number.isNaN(v) || v < spec.min || v > spec.max) {
+      if (Number.isNaN(v) || v < spec.min! || v > spec.max!) {
         window.alert(`${spec.label}: must be between ${spec.min} and ${spec.max}`);
         return;
       }
@@ -221,16 +225,17 @@ function SettingsCard() {
               )}
             </span>
             <input
-              type="number"
-              min={spec.min}
-              max={spec.max}
+              type={spec.type === 'str' ? 'text' : 'number'}
+              min={spec.type === 'str' ? undefined : spec.min}
+              max={spec.type === 'str' ? undefined : spec.max}
               step={spec.type === 'float' ? 'any' : '1'}
               value={valueOf(k)}
               onChange={(e) => setDraft((d) => ({ ...d, [k]: e.target.value }))}
               className={inputCls}
             />
             <span className="mt-0.5 block font-mono text-[10px] text-slate-400">
-              {k} · range {spec.min}–{spec.max}
+              {k}
+              {spec.type !== 'str' && ` · range ${spec.min}–${spec.max}`}
             </span>
           </label>
         ))}

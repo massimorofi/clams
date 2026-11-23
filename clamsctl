@@ -24,7 +24,18 @@ case "${1:-}" in
            "${DC[@]}" exec -T planner sqlite3 /data/clams.db ".backup /data/backup.db"
            "${DC[@]}" cp planner:/data/backup.db "backups/clams-$(date +%Y%m%d-%H%M%S).db" ;;
   pause|resume) need; "${DC[@]}" exec -T planner clams command "$1" --by operator ;;
+  monitor) need
+           echo "== containers =="; "${DC[@]}" ps
+           for s in planner executor-runner api redis claudio-planner claudio-executor; do
+             echo "== logs $s (last 15m, errors/warnings) =="
+             "${DC[@]}" logs --since 15m "$s" 2>&1 \
+               | grep -E "ERROR|WARNING|Traceback| 500" | tail -n 20 || true
+           done
+           echo "== DLQ sample =="
+           "${DC[@]}" exec -T redis redis-cli XRANGE clams:dlq - + COUNT 5 || true
+           echo "== planner report =="
+           "${DC[@]}" exec -T planner clams monitor ;;
   down)    need; confirm "Remove containers (volumes kept)?"; "${DC[@]}" down ;;
   nuke)    need; confirm "DELETE ALL DATA incl. DB and queues?"; "${DC[@]}" down -v ;;
-  *) echo "Usage: clamsctl {start|stop|restart [svc]|rebuild|status|logs [svc]|migrate|backup|pause|resume|down|nuke}"; exit 1 ;;
+  *) echo "Usage: clamsctl {start|stop|restart [svc]|rebuild|status|logs [svc]|migrate|backup|pause|resume|monitor|down|nuke}"; exit 1 ;;
 esac

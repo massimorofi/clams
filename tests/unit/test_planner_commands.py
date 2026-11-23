@@ -45,6 +45,36 @@ def test_cancel_task_and_workflow(db):
     assert repo_commands.get(db, cid)["status"] == "rejected"
 
 
+def test_cancel_stops_claudio_run_and_clears_lease(db):
+    """Issue #135.3: cancel must actually stop the running agent (best-effort
+    claudio run cancel) and clear the lease so late results fence off."""
+    from clams.planner.commands import drain_commands
+
+    class FakeCE:
+        def __init__(self):
+            self.cancelled: list[str] = []
+
+        def active_run(self, session_ref):
+            return "run-42"
+
+        def cancel(self, run_id):
+            self.cancelled.append(run_id)
+            return True
+
+    wf, t = _wf_with_task(db)
+    db.execute("UPDATE tasks SET session_ref='sess-9', lease_token='tok', "
+               "lease_expires_at='2099-01-01T00:00:00+00:00' WHERE task_id=?",
+               (t,))
+    ce = FakeCE()
+    repo_commands.insert_command(db, "cancel", {}, "op", target=wf)
+    assert drain_commands(db, claudio_e=ce) == 1
+    row = repo_tasks.get_task(db, t)
+    assert row["status"] == "cancelled"
+    assert row["lease_token"] is None and row["lease_expires_at"] is None
+    assert ce.cancelled == ["run-42"]
+    assert repo_workflows.get_workflow(db, wf)["status"] == "cancelled"
+
+
 def test_replan_sets_planning(db):
     wf, _ = _wf_with_task(db, status="review")
     repo_commands.insert_command(db, "replan", {}, "op", target=wf)

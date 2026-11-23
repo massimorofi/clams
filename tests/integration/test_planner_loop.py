@@ -39,7 +39,7 @@ class FakeP:
 def loop(tmp_path):
     s = Settings(_env_file=None, db_path=str(tmp_path / "c.db"),
                  planner_cycle_s=0.01, events_block_ms=0,
-                 watchdog_probe_interval_s=0)
+                 watchdog_probe_interval_s=0, model_server_url="")
     bus = InMemoryBus()
     lp = PlannerLoop(s, bus, FakeP())
     lp.outbox = OutboxRelay(bus)

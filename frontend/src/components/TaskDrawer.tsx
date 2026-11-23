@@ -2,6 +2,9 @@ import { useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { api } from '../api';
 import type { EvidenceCheck, TaskDetail } from '../types';
+import { useCommand } from '../commands';
+
+const TERMINAL_TASK = new Set(['success', 'failed', 'cancelled']);
 import {
   Badge,
   Card,
@@ -184,6 +187,7 @@ export function TaskDrawer({ taskId, onClose }: { taskId: string; onClose: () =>
     queryKey: ['task', taskId],
     queryFn: () => api.task(taskId),
   });
+  const { submit } = useCommand();
 
   return (
     <div className="fixed inset-0 z-50">
@@ -198,6 +202,26 @@ export function TaskDrawer({ taskId, onClose }: { taskId: string; onClose: () =>
           </div>
           <div className="flex items-center gap-2">
             {data ? <Badge status={data.status} /> : null}
+            {data && !TERMINAL_TASK.has(data.status) ? (
+              <button
+                onClick={() => {
+                  if (
+                    window.confirm(
+                      `Cancel this task?\n\nA running agent is stopped ` +
+                        `best-effort; dependents will be blocked.`,
+                    )
+                  ) {
+                    void submit('cancel', {
+                      target: taskId,
+                      label: `cancel task ${shortId(taskId, 8)}`,
+                    });
+                  }
+                }}
+                className="rounded-md border border-rose-300 px-2.5 py-1 text-sm text-rose-600 hover:bg-rose-50 dark:border-rose-800 dark:text-rose-400 dark:hover:bg-rose-950"
+              >
+                Cancel
+              </button>
+            ) : null}
             <button
               onClick={onClose}
               aria-label="Close task panel"

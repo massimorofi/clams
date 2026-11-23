@@ -14,7 +14,7 @@ from clams.db.conn import db_integrity_ok, plus_s, utcnow_s
 
 
 def test_migrations_apply_once(db):
-    assert schema_version(db) == 5   # 001..005
+    assert schema_version(db) == 6   # 001..006
     assert migrate(db) == []          # idempotent
     assert db_integrity_ok(db)
 
@@ -154,7 +154,7 @@ def test_on_started_lease_survives_old_created_at(db):
     started = repo_tasks.on_started(db, t, 1, tok, "e1", "s1", extend_s=180)
     assert started is not None and started["started_at"] is not None
     assert started["lease_expires_at"] > utcnow_s()   # not clamped to the past
-    hb = repo_tasks.on_heartbeat(db, t, 1, tok, extend_s=180)
+    hb = repo_tasks.on_heartbeat(db, t, 1, tok)
     assert hb is not None and hb["lease_expires_at"] > utcnow_s()
 
 
@@ -218,7 +218,9 @@ def test_on_result_needs_input_and_resume(db):
     assert brief["answer"] == "use sqlite" and brief["session_ref"] == "s1"
 
 
-def test_heartbeat_extends_lease(db):
+def test_heartbeat_writes_metrics_not_lease(db):
+    """Executor beats are metrics only: the lease is renewed exclusively by
+    the watchdog (renew_lease) from session evidence."""
     wf = _mk_wf(db)
     t = repo_tasks.create_task(db, wf, 1, "a", "o", "a", _brief())
     repo_tasks.promote_ready(db)
@@ -226,10 +228,57 @@ def test_heartbeat_extends_lease(db):
     tok = row["lease_token"]
     repo_tasks.on_started(db, t, 1, tok, "e1", "s1")
     before = repo_tasks.get_task(db, t)["lease_expires_at"]
-    hb = repo_tasks.on_heartbeat(db, t, 1, tok, extend_s=180)
-    assert hb["lease_expires_at"] >= before
+    hb = repo_tasks.on_heartbeat(db, t, 1, tok, turns_used=7, elapsed_s=60)
+    assert hb is not None
+    assert hb["lease_expires_at"] == before          # lease untouched
+    assert json.loads(hb["heartbeat_json"])["turns_used"] == 7
     # fenced heartbeat ignored
-    assert repo_tasks.on_heartbeat(db, t, 1, "nope", 180, 1800) is None
+    assert repo_tasks.on_heartbeat(db, t, 1, "nope", turns_used=8) is None
+
+
+def test_renew_lease_fenced(db):
+    wf = _mk_wf(db)
+    t = repo_tasks.create_task(db, wf, 1, "a", "o", "a", _brief())
+    repo_tasks.promote_ready(db)
+    row = repo_tasks.claim_for_dispatch(db, t, 120)
+    tok = row["lease_token"]
+    repo_tasks.on_started(db, t, 1, tok, "e1", "s1")
+    assert repo_tasks.renew_lease(db, t, 1, "wrong", 600) is None
+    assert repo_tasks.renew_lease(db, t, 2, tok, 600) is None
+    r = repo_tasks.renew_lease(db, t, 1, tok, 600)
+    assert r is not None and r["lease_expires_at"] > repo_tasks.utcnow_s()
+
+
+def test_requeue_infra_preserves_attempt(db):
+    """Infra fault requeue gives back the attempt number claim_for_dispatch
+    took, so the next claim reuses it (outages don't burn the budget)."""
+    wf = _mk_wf(db)
+    t = repo_tasks.create_task(db, wf, 1, "a", "o", "a", _brief(),
+                               max_attempts=3)
+    repo_tasks.promote_ready(db)
+    row = repo_tasks.claim_for_dispatch(db, t, 120)   # attempt 1
+    repo_tasks.on_started(db, t, 1, row["lease_token"], "e1", "s")
+    # simulate being on attempt 2
+    db.execute("UPDATE tasks SET attempt=2 WHERE task_id=?", (t,))
+    r = repo_tasks.requeue_infra(db, t)
+    assert r["status"] == "ready" and r["attempt"] == 1
+    assert r["lease_token"] is None and r["lease_expires_at"] is None
+    again = repo_tasks.claim_for_dispatch(db, t, 120)
+    assert again["attempt"] == 2                      # same number reused
+
+
+def test_on_result_infra_code_preserves_attempt(db):
+    wf = _mk_wf(db)
+    t = repo_tasks.create_task(db, wf, 1, "a", "o", "a", _brief(),
+                               max_attempts=3)
+    repo_tasks.promote_ready(db)
+    row = repo_tasks.claim_for_dispatch(db, t, 120)
+    tok = row["lease_token"]
+    repo_tasks.on_started(db, t, 1, tok, "e1", "s")
+    r = repo_tasks.on_result(db, t, 1, tok, "failed", False,
+                             {"log_tail": "claudio down"},
+                             error_code="claudio:unavailable")
+    assert r["status"] == "ready" and r["attempt"] == 0  # gave attempt back
 
 
 def test_lease_expiry_requeue(db):
@@ -259,9 +308,9 @@ def test_dispatched_never_expires(db):
     assert repo_tasks.expired_leases(db) == []
 
 
-def test_no_wall_cap_on_heartbeat(db):
-    """Regression (timeout removal): heartbeats extend the lease forever —
-    even for a task created long ago with a small max_wall_s."""
+def test_no_wall_cap_on_renew(db):
+    """Regression (timeout removal): watchdog renewals extend the lease
+    forever — even for a task created long ago."""
     import time
     from clams.db.conn import epoch_to_iso
     wf = _mk_wf(db)
@@ -272,9 +321,9 @@ def test_no_wall_cap_on_heartbeat(db):
     db.execute("UPDATE tasks SET created_at=?, started_at=? WHERE task_id=?",
                (epoch_to_iso(time.time() - 30 * 3600),
                 epoch_to_iso(time.time() - 30 * 3600), t))
-    hb = repo_tasks.on_heartbeat(db, t, 1, row["lease_token"], extend_s=180)
-    assert hb is not None
-    assert hb["lease_expires_at"] > repo_tasks.utcnow_s()  # not clamped
+    r = repo_tasks.renew_lease(db, t, 1, row["lease_token"], 600)
+    assert r is not None
+    assert r["lease_expires_at"] > repo_tasks.utcnow_s()  # not clamped
 
 
 def test_config_class_error_fails_fast(db):

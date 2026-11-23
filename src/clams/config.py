@@ -80,9 +80,12 @@ class Settings(BaseSettings):
     planner_heartbeat_max_age_s: int = 60
     events_batch: int = 100
     events_block_ms: int = 1000
-    # stall probe: alert (never kill) when a running task's heartbeat shows
-    # no turn progress for this long
+    # stall probe: alert (never kill) when a running task's session evidence
+    # shows no progress for this long
     stall_alert_minutes: int = 15
+    # frozen past this long -> escalate the stall alert warn -> error (the
+    # watchdog keeps renewing; a human decides via the UI)
+    stall_escalate_minutes: int = 60
 
     # --- limits (bounded everything) ----------------------------------------------------
     max_attempts: int = 3
@@ -90,8 +93,8 @@ class Settings(BaseSettings):
     max_replans: int = 3
     max_plan_tasks: int = 7
     planning_llm_budget_per_cycle: int = 3
-    lease_dispatch_s: int = 120
-    lease_running_extend_s: int = 180
+    lease_dispatch_s: int = 600
+    lease_running_extend_s: int = 600
     question_expiry_h: int = 24
     outbox_max_attempts: int = 5
     outbox_backoff_base_s: int = 2
@@ -104,6 +107,14 @@ class Settings(BaseSettings):
     watchdog_healthy_probes_to_resume: int = 3
     oldest_ready_alert_s: int = 300
     min_free_disk_mb: int = 500
+    # model server reachability probe (OpenAI-compatible base URL); empty = off
+    model_server_url: str = "http://192.168.1.172:8731/v1"
+    max_db_size_mb: int = 500
+    # session messages fetched per running task for liveness evidence
+    evidence_tail_limit: int = 200
+    # executor-runner death signal: its beat thread dies with the process, so
+    # heartbeat silence beyond this + frozen session evidence = orphaned task
+    orphan_silence_s: int = 180
 
     # --- misc ----------------------------------------------------------------------------
     role: str = "planner"
@@ -133,6 +144,8 @@ class Settings(BaseSettings):
             raise ConfigError("max_plan_tasks must be between 1 and 7")
         if self.lease_dispatch_s < 10:
             raise ConfigError("lease_dispatch_s must be >= 10")
+        if self.lease_running_extend_s < 30:
+            raise ConfigError("lease_running_extend_s must be >= 30")
         if self.dlq_max_deliveries < 1:
             raise ConfigError("dlq_max_deliveries must be >= 1")
 
@@ -180,10 +193,18 @@ EDITABLE_SETTINGS: dict[str, dict] = {
                         "label": "Planner cycle (s)"},
     "intake_every_n_cycles": {"type": "int", "min": 1, "max": 720,
                               "label": "GitHub intake every N cycles"},
-    "lease_running_extend_s": {"type": "int", "min": 30, "max": 3600,
-                               "label": "Heartbeat grace: requeue after silence (s)"},
+    "lease_running_extend_s": {"type": "int", "min": 30, "max": 7200,
+                               "label": "Lease TTL: watchdog renews from session evidence (s)"},
     "stall_alert_minutes": {"type": "int", "min": 1, "max": 1440,
-                            "label": "Stall alert: no turn progress (min)"},
+                            "label": "Stall alert: no session progress (min)"},
+    "stall_escalate_minutes": {"type": "int", "min": 5, "max": 1440,
+                               "label": "Stall escalation to error (min)"},
+    "max_db_size_mb": {"type": "int", "min": 10, "max": 10_000_000,
+                       "label": "Alert: max DB+WAL size (MB)"},
+    "orphan_silence_s": {"type": "int", "min": 60, "max": 3600,
+                         "label": "Orphan requeue: executor beat silence (s)"},
+    "model_server_url": {"type": "str",
+                         "label": "Model server URL ('' disables probe)"},
     "question_expiry_h": {"type": "int", "min": 1, "max": 720,
                           "label": "Question expiry before blocked (h)"},
     "outbox_max_attempts": {"type": "int", "min": 1, "max": 20,
@@ -204,6 +225,8 @@ def coerce_setting(name: str, value):
         v = int(value)
     elif spec["type"] == "float":
         v = float(value)
+    elif spec["type"] == "str":
+        return str(value)
     else:
         raise ValueError(f"unknown type {spec['type']}")
     if not (spec["min"] <= v <= spec["max"]):

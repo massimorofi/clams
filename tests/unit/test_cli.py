@@ -22,8 +22,19 @@ def test_migrate_then_status(env, capsys):
     assert main(["migrate"]) == 0
     capsys.readouterr()
     assert main(["status"]) == 0
+    out = capsys.readouterr().out
+    assert "== clams status ==" in out
+    assert "Schema      v6" in out
+    assert "Planner" in out and "no heartbeat" in out
+    assert "Alerts      none open" in out
+
+
+def test_status_json(env, capsys):
+    assert main(["migrate"]) == 0
+    capsys.readouterr()
+    assert main(["status", "--json"]) == 0
     out = json.loads(capsys.readouterr().out)
-    assert out["schema_version"] == 5
+    assert out["schema_version"] == 6
 
 
 def test_command_pause(env, capsys):

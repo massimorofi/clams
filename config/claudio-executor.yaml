@@ -19,6 +19,14 @@ server:
   auth_token: dev-token-change-me
   cors_origins:
     - http://localhost:8080
+    # Claudio web UIs (same-origin proxy needs no CORS; these are for the
+    # "call the agent directly" mode configured in the UI's backend settings)
+    - http://localhost:1076
+    - http://localhost:1077
+    - http://127.0.0.1:1076
+    - http://127.0.0.1:1077
+    - http://192.168.1.172:1076
+    - http://192.168.1.172:1077
   expose_raw_config: false
 
 llm:

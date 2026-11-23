@@ -33,6 +33,24 @@ Put the token in `.env` as `CLAMS_GITHUB_TOKEN=…` and recreate the planner
 (`./clamsctl restart planner`). Without a token Clams still runs — GitHub
 intake/projection are simply skipped (ad-hoc workflows only).
 
+### Where the token must reach
+
+`CLAMS_GITHUB_TOKEN` covers Clams' own API calls (intake, board projection).
+Git itself needs the token in **two more places**:
+
+- **executor-runner** pushes task branches after a passing gate
+  (`src/clams/executor/worktree.py`); remotes are deliberately token-free, so
+  compose mounts `config/clams-gitconfig` as `GIT_CONFIG_GLOBAL` in the clams
+  containers and its credential helper feeds `$CLAMS_GITHUB_TOKEN` to git at
+  push time. No extra setup — just keep `CLAMS_GITHUB_TOKEN` in `.env`.
+- **Claudio agent containers** (only if the agent runs `git`/`gh` itself):
+  set `GITHUB_TOKEN`/`GH_TOKEN`, the `GIT_AUTHOR_*`/`GIT_COMMITTER_*` identity
+  and the credential-helper `GIT_CONFIG_*` block in `.env.claudio-executor` /
+  `.env.claudio-planner` (template: `.env.claudio.example`). Without the
+  identity, the agent's `git commit` fails with *"Please tell me who you are"*.
+  Recreate (not just restart) after editing:
+  `docker compose up -d --force-recreate claudio-executor`.
+
 ## 2. Create the Projects V2 board
 
 1. GitHub → your repo/org → **Projects → New project → Table board** (a

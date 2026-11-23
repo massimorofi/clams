@@ -47,9 +47,9 @@ def _apply(conn, msg, settings, *, gh_enabled: bool) -> str:
         return "applied"
 
     if t == "task.heartbeat":
+        # metrics only — the watchdog renews the lease from session evidence
         row = repo_tasks.on_heartbeat(conn, msg.task_id, msg.attempt,
                                       msg.lease_token,
-                                      extend_s=settings.lease_running_extend_s,
                                       turns_used=msg.turns_used,
                                       elapsed_s=msg.elapsed_s)
         return "applied" if row else "fenced"
@@ -96,12 +96,21 @@ def _apply(conn, msg, settings, *, gh_enabled: bool) -> str:
                 f"task {msg.task_id} failed with config-class error "
                 f"{msg.error_code} — fix the configuration, retries were "
                 f"skipped: {msg.log_tail[:200]}")
+        infra_requeue = (row["status"] == "ready" and getattr(msg, "error_code", "")
+                         and msg.error_code.startswith(repo_tasks.INFRA_ERROR_CODES))
+        if infra_requeue:
+            repo_alerts.raise_alert(
+                conn, f"infra:{msg.task_id}", "warn",
+                f"task {msg.task_id} requeued without burning attempt "
+                f"{msg.attempt}: infrastructure fault ({msg.error_code}) — "
+                "claudio unreachable")
         level = "info" if row["status"] == "success" else "warn"
         repo_events.append_event(
             conn, "task", msg.task_id, level,
             f"attempt {msg.attempt} -> {row['status']}"
+            + (" (infra requeue, attempt preserved)" if infra_requeue else "")
             + (f" ({msg.evidence.get('reason', '')})"
-               if row["status"] == "ready" else ""))
+               if row["status"] == "ready" and not infra_requeue else ""))
         if row["status"] == "failed":
             strand_dependents(conn, row["workflow_id"])
         if gh_enabled:

@@ -1,5 +1,5 @@
 """`clams` command line: planner | executor | api | migrate | healthcheck |
-status | command."""
+status | monitor | command."""
 from __future__ import annotations
 
 import argparse
@@ -33,7 +33,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     hc = sub.add_parser("healthcheck", help="container healthcheck")
     hc.add_argument("role", choices=["planner", "executor", "api"])
 
-    sub.add_parser("status", help="print a status snapshot")
+    st = sub.add_parser("status", help="print a status snapshot")
+    st.add_argument("--json", action="store_true", help="machine-readable")
+
+    mon = sub.add_parser("monitor",
+                         help="zero-LLM monitoring report (read-only)")
+    mon.add_argument("--json", action="store_true", help="machine-readable")
+    mon.add_argument("--since-hours", type=int, default=24,
+                     help="rolling window for rates/failures (default 24)")
 
     cmd = sub.add_parser("command", help="issue a control command")
     cmd.add_argument("kind", choices=["pause", "resume"])
@@ -54,7 +61,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.cmd == "healthcheck":
         return _healthcheck(settings, args.role)
     if args.cmd == "status":
-        return _status(settings)
+        return _status(settings, as_json=args.json)
+    if args.cmd == "monitor":
+        return _monitor(settings, as_json=args.json,
+                        since_hours=args.since_hours)
     if args.cmd == "command":
         return _command(settings, args.kind, args.by)
     if args.cmd == "planner":
@@ -106,22 +116,224 @@ def _healthcheck(settings, role: str) -> int:
     return 1
 
 
-def _status(settings) -> int:
-    from .db import (connect, repo_executors, repo_outbox, repo_runtime,
-                     repo_tasks, repo_workflows, schema_version)
+# status line grouping: which statuses count as "still in flight" per table
+_ACTIVE_BY_TABLE = {
+    "workflows": ("intake", "planning", "running", "review", "blocked",
+                  "paused"),
+    "tasks": ("pending", "ready", "dispatched", "running", "waiting_input",
+              "blocked"),
+    "outbox": ("pending", "inflight"),
+}
+
+
+def _fmt_age(seconds) -> str:
+    """Human duration: 7s / 4m 03s / 2h 05m."""
+    if seconds is None:
+        return "never"
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m {s % 60:02d}s"
+    return f"{s // 3600}h {s % 3600 // 60:02d}m"
+
+
+def _fmt_counts(counts: dict, active: tuple) -> str:
+    act = {k: n for k, n in counts.items() if n and k in active}
+    term = {k: n for k, n in counts.items() if n and k not in active}
+    def grp(d):
+        return ", ".join(f"{n} {k}" for k, n in sorted(d.items())) or "none"
+    return f"in flight: {grp(act)}  |  terminal: {grp(term)}"
+
+
+def _status(settings, as_json: bool = False) -> int:
+    from .db import (connect, repo_alerts, repo_executors, repo_outbox,
+                     repo_runtime, repo_tasks, repo_workflows,
+                     schema_version)
+    from .db.conn import iso_to_epoch
+    import time as _time
     conn = connect(settings.db_path, read_only=True)
+    hb_age = repo_runtime.heartbeat_age_s(conn)
+    paused = repo_runtime.is_paused(conn)
+    paused_by = repo_runtime.paused_by(conn) or ""
+    executors = [dict(r) for r in repo_executors.list_executors(conn)]
+    alerts = [dict(a) for a in repo_alerts.list_open(conn)]
     out = {
         "schema_version": schema_version(conn),
-        "paused": repo_runtime.is_paused(conn),
-        "paused_by": repo_runtime.paused_by(conn),
-        "planner_heartbeat_age_s": repo_runtime.heartbeat_age_s(conn),
+        "paused": paused,
+        "paused_by": paused_by,
+        "planner_heartbeat_age_s": hb_age,
         "workflows": repo_workflows.counts_by_status(conn),
         "tasks": repo_tasks.counts_by_status(conn),
         "outbox": repo_outbox.counts(conn),
-        "executors": [dict(r) for r in repo_executors.list_executors(conn)],
+        "executors": executors,
+        "alerts": alerts,
     }
     conn.close()
-    print(json.dumps(out, indent=2))
+    if as_json:
+        print(json.dumps(out, indent=2))
+        return 0
+
+    max_age = settings.planner_heartbeat_max_age_s
+    if hb_age is None:
+        planner = f"DOWN — no heartbeat recorded (max age {max_age}s)"
+    elif hb_age > max_age:
+        planner = (f"STALE — last heartbeat {_fmt_age(hb_age)} ago "
+                   f"(max {max_age}s)")
+    else:
+        planner = f"alive — last heartbeat {_fmt_age(hb_age)} ago"
+    sched = f"PAUSED (by {paused_by or 'unknown'})" if paused else "active"
+    lines = [
+        "== clams status ==",
+        f"  Planner     {planner}",
+        f"  Scheduling  {sched}",
+        f"  Schema      v{out['schema_version']}",
+        f"  Workflows   {_fmt_counts(out['workflows'], _ACTIVE_BY_TABLE['workflows'])}",
+        f"  Tasks       {_fmt_counts(out['tasks'], _ACTIVE_BY_TABLE['tasks'])}",
+        f"  Outbox      {_fmt_counts(out['outbox'], _ACTIVE_BY_TABLE['outbox'])}",
+    ]
+    idle_max = 3 * settings.executor_alive_interval_s
+    if executors:
+        lines.append(f"  Executors   {len(executors)} registered "
+                     f"(offline if silent > {idle_max}s):")
+        for e in executors:
+            seen = (None if not e.get("last_seen")
+                    else _time.time() - iso_to_epoch(e["last_seen"]))
+            state = "online " if seen is not None and seen <= idle_max \
+                else "offline"
+            lines.append(f"                {e['executor_id']}  {state} "
+                         f"v{e.get('version')} cap={e.get('capacity')} "
+                         f"seen {_fmt_age(seen)} ago")
+    else:
+        lines.append("  Executors   none registered")
+    if alerts:
+        lines.append(f"  Alerts      {len(alerts)} open:")
+        for a in alerts:
+            lines.append(f"                [{a['severity']}] {a['probe']}: "
+                         f"{(a['message'] or '')[:110]}")
+    else:
+        lines.append("  Alerts      none open")
+    print("\n".join(lines))
+    return 0
+
+
+def _monitor(settings, as_json: bool = False, since_hours: int = 24) -> int:
+    """Zero-LLM monitoring report: gate-failure histogram, rolling success
+    rate, turn cost, backlog, open alerts, running-task lease table, recent
+    stall evidence. Read-only."""
+    import time as _time
+    from .db import (connect, repo_alerts, repo_stall_evidence, repo_tasks,
+                     repo_workflows)
+    from .db.conn import iso_to_epoch
+    conn = connect(settings.db_path, read_only=True)
+    cutoff = _time.time() - since_hours * 3600
+
+    gate_by_exit: dict[str, int] = {}
+    gate_reasons: dict[str, int] = {}
+    successes = failures = window_success = window_fail = 0
+    turns_ok: list[int] = []
+    for r in conn.execute("SELECT * FROM tasks").fetchall():
+        in_window = (iso_to_epoch(r["updated_at"]) >= cutoff
+                     if r["updated_at"] else False)
+        if r["status"] == "success":
+            successes += 1
+            window_success += int(in_window)
+            try:
+                t = int(json.loads(
+                    r["heartbeat_json"] or "{}").get("turns_used", -1))
+                if t >= 0:
+                    turns_ok.append(t)
+            except ValueError:
+                pass
+        elif r["status"] == "failed":
+            failures += 1
+            window_fail += int(in_window)
+            try:
+                ev = json.loads(
+                    r["result_json"] or "{}").get("evidence", {})
+            except ValueError:
+                ev = {}
+            reason = str(ev.get("reason", ""))[:80]
+            if reason:
+                gate_reasons[reason] = gate_reasons.get(reason, 0) + 1
+            for c in ev.get("checks", []):
+                if c.get("check") == "run" and c.get("exit"):
+                    k = f"exit {c['exit']}"
+                    gate_by_exit[k] = gate_by_exit.get(k, 0) + 1
+    terminal = successes + failures
+    out = {
+        "window_hours": since_hours,
+        "success_rate": {
+            "overall": round(successes / terminal, 3) if terminal else None,
+            "window": (round(window_success / (window_success + window_fail), 3)
+                       if window_success + window_fail else None),
+            "successes": successes, "failures": failures,
+        },
+        "gate_failures": {"by_exit": gate_by_exit,
+                          "top_reasons": dict(
+                              sorted(gate_reasons.items(),
+                                     key=lambda kv: -kv[1])[:5])},
+        "turns_per_success": {
+            "avg": round(sum(turns_ok) / len(turns_ok), 1) if turns_ok else None,
+            "max": max(turns_ok) if turns_ok else None},
+        "ready_backlog": {
+            "count": conn.execute("SELECT COUNT(*) n FROM tasks "
+                                  "WHERE status='ready'").fetchone()["n"],
+            "oldest_age_s": repo_tasks.oldest_ready_age_s(conn)},
+        "workflows": repo_workflows.counts_by_status(conn),
+        "alerts": [dict(a) for a in repo_alerts.list_open(conn)],
+        "running_tasks": [],
+        "stall_evidence": [],
+    }
+    for r in repo_tasks.by_status(conn, "running", "dispatched"):
+        hb = {}
+        try:
+            hb = json.loads(r["heartbeat_json"] or "{}")
+        except ValueError:
+            pass
+        remaining = None
+        if r["lease_expires_at"]:
+            remaining = int(iso_to_epoch(r["lease_expires_at"]) - _time.time())
+        out["running_tasks"].append({
+            "task_id": r["task_id"], "status": r["status"],
+            "attempt": r["attempt"], "max_attempts": r["max_attempts"],
+            "lease_expires_at": r["lease_expires_at"],
+            "lease_remaining_s": remaining,
+            "turns_used": hb.get("turns_used"),
+            "elapsed_s": hb.get("elapsed_s"),
+            "session_ref": r["session_ref"]})
+    for e in repo_stall_evidence.list_recent(conn, limit=10):
+        out["stall_evidence"].append({
+            "task_id": e["task_id"], "attempt": e["attempt"],
+            "updated_at": e["updated_at"]})
+    conn.close()
+
+    if as_json:
+        print(json.dumps(out, indent=2))
+        return 0
+    w = out["window_hours"]
+    print(f"== success (overall / last {w}h): "
+          f"{out['success_rate']['overall']} / {out['success_rate']['window']}"
+          f"  [{successes} ok, {failures} failed]")
+    print(f"== gate failures by exit: {out['gate_failures']['by_exit'] or '—'}")
+    for reason, n in out["gate_failures"]["top_reasons"].items():
+        print(f"   {n}x {reason}")
+    print(f"== turns/success: {out['turns_per_success']}")
+    print(f"== ready backlog: {out['ready_backlog']}")
+    print(f"== workflows: {out['workflows']}")
+    print(f"== open alerts ({len(out['alerts'])}):")
+    for a in out["alerts"]:
+        print(f"   [{a['severity']}] {a['probe']}: {a['message'][:110]}")
+    print(f"== running/dispatched tasks:")
+    for t in out["running_tasks"]:
+        print(f"   {t['task_id'][:8]} {t['status']} a{t['attempt']}/"
+              f"{t['max_attempts']} lease_left={t['lease_remaining_s']}s "
+              f"turns={t['turns_used']}")
+    if out["stall_evidence"]:
+        print("== recent stall evidence (clams monitor --json | jq, or "
+              "stall_evidence table):")
+        for e in out["stall_evidence"]:
+            print(f"   {e['task_id'][:8]} a{e['attempt']} @ {e['updated_at']}")
     return 0
 
 

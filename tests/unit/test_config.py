@@ -12,8 +12,10 @@ def test_defaults_match_plan():
     assert s.stream_events == "clams:events"
     assert s.max_attempts == 3
     assert s.max_replans == 3
-    assert s.lease_dispatch_s == 120
-    assert s.lease_running_extend_s == 180
+    assert s.lease_dispatch_s == 600
+    assert s.lease_running_extend_s == 600
+    assert s.stall_escalate_minutes == 60
+    assert s.max_db_size_mb == 500
     assert s.api_port == 8200
     assert s.msg_max_bytes == 16384
     assert s.planner_cycle_s == 5.0

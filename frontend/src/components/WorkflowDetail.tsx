@@ -2,6 +2,9 @@ import { useQuery } from '@tanstack/react-query';
 import { api } from '../api';
 import { Badge, Card, Empty, ErrorNote, Loading, SectionTitle, fmtDateTime, shortId } from './ui';
 import { DagGraph, statusHex } from './DagGraph';
+import { useCommand } from '../commands';
+
+const TERMINAL_WF = new Set(['done', 'failed', 'cancelled']);
 
 export function WorkflowDetailView({
   id,
@@ -16,6 +19,7 @@ export function WorkflowDetailView({
     queryKey: ['workflow', id],
     queryFn: () => api.workflow(id),
   });
+  const { submit, pendingCount } = useCommand();
 
   if (isLoading) return <Loading label="Loading workflow…" />;
   if (error) return <ErrorNote error={error} />;
@@ -39,6 +43,30 @@ export function WorkflowDetailView({
           {data.gh_issue_number ? ` · issue #${data.gh_issue_number}` : ''}
           {data.replans ? ` · ${data.replans} replans` : ''}
         </span>
+        {!TERMINAL_WF.has(data.status) && (
+          <button
+            disabled={pendingCount > 0}
+            onClick={() => {
+              if (
+                window.confirm(
+                  'Cancel this ENTIRE workflow?\n\n' +
+                    'Running agent work is aborted (best-effort stop of the ' +
+                    'Claudio run), all non-terminal tasks become cancelled and ' +
+                    'dispatch stops. This is for extreme cases and cannot be ' +
+                    'undone.',
+                )
+              ) {
+                void submit('cancel', {
+                  target: id,
+                  label: `cancel workflow ${shortId(id, 8)}`,
+                });
+              }
+            }}
+            className="ml-auto rounded-md border border-rose-300 px-3 py-1.5 text-sm font-medium text-rose-600 hover:bg-rose-50 disabled:opacity-50 dark:border-rose-800 dark:text-rose-400 dark:hover:bg-rose-950"
+          >
+            Cancel workflow
+          </button>
+        )}
       </div>
 
       <Card className="p-4">

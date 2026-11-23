@@ -6,9 +6,11 @@
 4 plan workflows in intake/planning (bounded LLM budget)
 5 promote ready + dispatch
 6 consume clams:events (batch, block) -> idempotent fenced apply
-7 reap expired leases + question expiry
+6b watchdog liveness: renew leases from session evidence, stall alerts,
+   infra requeues (attempt preserved) — before the reaper on purpose
+7 reap expired leases (last-resort net) + question expiry
 8 outbox relay
-9 watchdog probes (interval)
+9 watchdog probes (interval) + alert hygiene
 """
 from __future__ import annotations
 
@@ -52,7 +54,6 @@ class PlannerLoop:
         self.watchdog = Watchdog(bus, claudio_p, claudio_e, settings)
         self._stop = threading.Event()
         self._cycle_n = 0
-        self._stall_seen: dict[str, dict] = {}   # task_id -> alerted turns
         if hasattr(bus, "ensure_group"):
             bus.ensure_group(settings.stream_events, settings.group_planner)
 
@@ -66,7 +67,7 @@ class PlannerLoop:
 
         # 1. commands (interrupt priority, applied even when paused)
         stats["commands"] = commands_mod.drain_commands(
-            self.conn, gh_client=self.gh_client)
+            self.conn, gh_client=self.gh_client, claudio_e=self.ce)
 
         # 2-5. planning work only when not paused
         if not paused:
@@ -85,7 +86,15 @@ class PlannerLoop:
         # 6. consume events
         stats["events"] = self._consume_events()
 
-        # 7. reaper
+        # 6b. evidence-based lease renewal + stall policy. BEFORE the reaper:
+        # a just-restarted planner must renew from session evidence before a
+        # stale-but-alive lease can burn an attempt.
+        lv = self.watchdog.maybe_check_liveness(self.conn)
+        if lv:
+            stats["liveness"] = lv
+
+        # 7. reaper (last-resort net: fires only if the planner itself was
+        # dead longer than the lease TTL)
         gh_on = self.gh_client is not None
         stats["reaped"] = len(reaper_mod.reap_expired_leases(
             self.conn, s, gh_enabled=gh_on))
@@ -93,9 +102,6 @@ class PlannerLoop:
 
         # 7b. self-heal workflows stranded by pre-fix failures
         stats["swept"] = self._sweep_deadlocked()
-
-        # 7c. stall probe: alert (never kill) on alive-but-stuck tasks
-        stats["stalled"] = self._stall_probe()
 
         # 8. outbox relay
         if self.outbox is not None:
@@ -181,44 +187,6 @@ class PlannerLoop:
             with immediate(self.conn):
                 set_runtime_state(self.conn, "settings_effective",
                                   json.dumps(overrides))
-
-    def _stall_probe(self) -> int:
-        """Alert when a running task's heartbeat shows no turn progress for
-        stall_alert_minutes. Detection, not punishment: the task keeps its
-        lease as long as heartbeats arrive — a human decides what to do."""
-        from ..db import repo_alerts
-        cutoff = time.time() - self.s.stall_alert_minutes * 60
-        rows = self.conn.execute(
-            "SELECT task_id, heartbeat_json FROM tasks WHERE status='running' "
-            "AND heartbeat_json IS NOT NULL").fetchall()
-        n = 0
-        for r in rows:
-            try:
-                hb = json.loads(r["heartbeat_json"])
-            except ValueError:
-                continue
-            turns = hb.get("turns_used", -1)
-            if turns < 0:
-                continue                      # progress unknown: don't judge
-            # remember the turn count we last alerted on, per task
-            seen = self._stall_seen.setdefault(r["task_id"], {})
-            if seen.get("turns") == turns:    # already alerted for this stall
-                continue
-            from ..db.conn import iso_to_epoch
-            if iso_to_epoch(hb.get("progress_ts") or hb["ts"]) > cutoff:
-                continue                      # progress is recent enough
-            self._stall_seen[r["task_id"]] = {"turns": turns}
-            with immediate(self.conn):
-                repo_alerts.raise_alert(
-                    self.conn, f"stall:{r['task_id']}", "warn",
-                    f"task {r['task_id']} alive but no turn progress for "
-                    f"{self.s.stall_alert_minutes} min (turns={turns}) — "
-                    "check the session transcript; cancel or retry if stuck")
-                repo_events.append_event(
-                    self.conn, "task", r["task_id"], "warn",
-                    f"stalled: no turn progress {self.s.stall_alert_minutes}m")
-            n += 1
-        return n
 
     def _maybe_prune(self) -> None:
         import time

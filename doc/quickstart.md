@@ -69,13 +69,23 @@ What each address exposes (per `docker-compose.yml`):
 
 | Host address | Container | What it is | Reachable from |
 |---|---|---|---|
-| `127.0.0.1:1075` | `api` :8200 | **Clams UI + REST + SSE** — the SPA at `/`, API under `/api/v1` | local browser (check the bind: `0.0.0.0` = whole LAN) |
-| `127.0.0.1:1072` | `claudio-planner` :8100 | **Claudio-P agent HTTP API** — `/healthz`, `/api/v1/chat`, its own web UI | debugging the planning agent |
-| `127.0.0.1:1073` | `claudio-executor` :8100 | **Claudio-E agent HTTP API** — same surface, headless executor | debugging the executor agent |
-| `127.0.0.1:1076` | `claudio-ui-planner` :8080 | **Claudio web UI for the Planner agent** (chat, sessions, config of Claudio-P) | supervising planning |
-| `127.0.0.1:1077` | `claudio-ui-executor` :8080 | **Claudio web UI for the Executor agent** — watch task sessions live | supervising execution |
+| `:1075` | `api` :8200 | **Clams UI + REST + SSE** — the SPA at `/`, API under `/api/v1` | whole LAN |
+| `:1072` | `claudio-planner` :8100 | **Claudio-P agent HTTP API** — `/healthz`, `/api/v1/chat` | whole LAN — debugging the planning agent |
+| `:1073` | `claudio-executor` :8100 | **Claudio-E agent HTTP API** — same surface, headless executor | whole LAN — debugging the executor agent |
+| `:1076` | `claudio-ui-planner` :8080 | **Claudio web UI for the Planner agent** (chat, sessions, config of Claudio-P) | whole LAN — supervising planning |
+| `:1077` | `claudio-ui-executor` :8080 | **Claudio web UI for the Executor agent** — watch task sessions live | whole LAN — supervising execution |
 | *(internal)* `redis:6379` | redis | Redis Streams `clams:tasks` / `clams:events` / `clams:dlq` | docker network only — **never published** |
 | *(internal)* `planner`, `executor-runner` | — | no published ports; they only *call* the services above | docker network only |
+
+**Claudio web UIs (1076/1077) — backend URL:** open the UI and, when asked for
+a backend, **leave the URL empty** (or clear it in the UI's backend settings).
+Empty = *same origin*: the request goes to `/api/…` on the UI's own port and
+the UI's nginx proxies it to the right agent (1076 → Planner, 1077 →
+Executor). Entering an absolute URL like `http://<host>:8100` will **fail
+with "Failed to fetch"** — port 8100 is the container-internal port and is
+not published. If you really want to call an agent directly, use the published
+ports: `http://<machine-lan-ip>:1072` (planner) or `:1073` (executor). The
+token is the agent's `server.auth_token` (see §4.2).
 
 Inside the `clams` docker network, services address each other by name
 (`http://claudio-planner:8100`, `redis://redis:6379/0`) — this is wired in the
@@ -129,7 +139,7 @@ For a local endpoint an empty/`local` key is fine.
 
 ```bash
 ./clamsctl rebuild      # build clams:local, pull base layers, recreate all
-./clamsctl status       # every service "healthy" + JSON snapshot
+./clamsctl status       # every service "healthy" + status report
 ```
 
 Checklist:
@@ -137,7 +147,7 @@ Checklist:
 - [ ] `docker compose -p clams ps` → 6 services, all healthy
 - [ ] `curl -s localhost:1075/readyz` → `{"status":"ready","db":true}`
 - [ ] UI at `http://localhost:1075` renders the Overview after the token is set
-- [ ] `clams status` JSON shows `planner_heartbeat_age_s` < 60
+- [ ] `clams status` shows `Planner alive` (heartbeat < 60 s)
 - [ ] Register a project ([GitHub setup](github.md)) and drop a card in **Ready** —
       within ~60 s a workflow appears in the UI and the card moves to *In progress*
 

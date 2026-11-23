@@ -1,0 +1,10 @@
+# Global gitconfig for the Clams containers (mounted as GIT_CONFIG_GLOBAL by
+# docker-compose). Supplies the credentials `git push` of task branches needs
+# in the executor-runner (src/clams/executor/worktree.py): remotes are scrubbed
+# from tokens on purpose, so auth comes from this helper instead. The `!`
+# helper runs through sh, which expands $CLAMS_GITHUB_TOKEN from the runner's
+# environment (set in .env) at push time.
+# NOTE: the value must use double quotes with escaped inner quotes — this
+# image's git rejects or mangles the single-quoted form.
+[credential "https://github.com"]
+	helper = "!f() { [ \"$1\" = get ] || exit 0; echo username=x-access-token; echo \"password=$CLAMS_GITHUB_TOKEN\"; }; f"

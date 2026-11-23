@@ -19,15 +19,17 @@ _BOARD_URL_RE = re.compile(
     r"github\.com/(?:users/|organizations/|orgs/)?([^/]+)/projects/(\d+)")
 
 
-def drain_commands(conn, *, adhoc_handler=None, gh_client=None) -> int:
-    """Apply all new commands. Returns count applied."""
+def drain_commands(conn, *, adhoc_handler=None, gh_client=None,
+                   claudio_e=None) -> int:
+    """Apply all new commands. Returns count applied. claudio_e (if given)
+    enables cooperative cancellation of in-flight agent runs."""
     rows = repo_commands.fetch_new(conn)
     n = 0
     for row in rows:
         try:
             with immediate(conn):
                 result = _apply(conn, row, adhoc_handler=adhoc_handler,
-                                gh_client=gh_client)
+                                gh_client=gh_client, claudio_e=claudio_e)
             repo_commands.mark(conn, row["command_id"], "applied", result)
             n += 1
         except Exception as exc:  # noqa: BLE001
@@ -38,7 +40,8 @@ def drain_commands(conn, *, adhoc_handler=None, gh_client=None) -> int:
     return n
 
 
-def _apply(conn, row, *, adhoc_handler=None, gh_client=None) -> dict[str, Any]:
+def _apply(conn, row, *, adhoc_handler=None, gh_client=None,
+           claudio_e=None) -> dict[str, Any]:
     kind = row["kind"]
     target = row["target"]
     payload = json.loads(row["payload"]) if row["payload"] else {}
@@ -57,7 +60,7 @@ def _apply(conn, row, *, adhoc_handler=None, gh_client=None) -> dict[str, Any]:
         return {"resumed": ok}
 
     if kind == "cancel":
-        return _cancel(conn, target, payload, issuer)
+        return _cancel(conn, target, payload, issuer, claudio_e=claudio_e)
 
     if kind == "replan":
         wf = repo_workflows.get_workflow(conn, target or "")
@@ -155,17 +158,34 @@ def _settings_patch(conn, payload: dict, issuer: str) -> dict:
     return {"applied": applied, "overrides": merged}
 
 
-def _cancel(conn, target: Optional[str], payload: dict, issuer: str) -> dict:
+def _stop_agent_run(claudio_e, session_ref: str) -> bool:
+    """Best-effort: ask Claudio to abort the session's in-flight run so the
+    agent actually stops instead of burning turns until its chat call ends.
+    The DB cancel already fenced the task; this is the courtesy stop."""
+    if claudio_e is None or not session_ref:
+        return False
+    run_id = claudio_e.active_run(session_ref)
+    return bool(run_id) and claudio_e.cancel(run_id)
+
+
+def _cancel(conn, target: Optional[str], payload: dict, issuer: str,
+            *, claudio_e=None) -> dict:
     if not target:
         raise ValueError("cancel needs a target (workflow or task id)")
     task = repo_tasks.get_task(conn, target)
     if task is not None:
         if task["status"] in TERMINAL_TASK:
             raise ValueError(f"task {target} already {task['status']}")
-        repo_tasks.transition(conn, target, "cancelled")
+        was_running = task["status"] == "running"
+        repo_tasks.transition(conn, target, "cancelled",
+                              lease_token=None, lease_expires_at=None,
+                              executor_id=None)
         repo_questions.cancel_open_for_task(conn, target)
         repo_events.append_event(conn, "task", target, "info",
                                  f"cancelled by {issuer}")
+        if was_running and _stop_agent_run(claudio_e, task["session_ref"]):
+            repo_events.append_event(conn, "task", target, "info",
+                                     "claudio run cancelled")
         # a cancelled task strands its dependents just like a failure; the
         # loop's sweep reviews the workflow once all tasks are terminal
         from .review import strand_dependents
@@ -174,13 +194,22 @@ def _cancel(conn, target: Optional[str], payload: dict, issuer: str) -> dict:
     wf = repo_workflows.get_workflow(conn, target)
     if wf is None:
         raise ValueError(f"unknown cancel target {target}")
+    stopped = 0
     for t in repo_tasks.list_tasks(conn, target):
         if t["status"] not in TERMINAL_TASK:
-            repo_tasks.transition(conn, t["task_id"], "cancelled")
+            was_running = t["status"] == "running"
+            repo_tasks.transition(conn, t["task_id"], "cancelled",
+                                  lease_token=None, lease_expires_at=None,
+                                  executor_id=None)
+            if was_running and _stop_agent_run(claudio_e, t["session_ref"]):
+                stopped += 1
     repo_workflows.set_status(conn, target, "cancelled")
     repo_events.append_event(conn, "workflow", target, "info",
-                             f"cancelled by {issuer}")
-    return {"workflow": target, "status": "cancelled"}
+                             f"cancelled by {issuer}"
+                             + (f" ({stopped} running agent run(s) stopped)"
+                                if stopped else ""))
+    return {"workflow": target, "status": "cancelled",
+            "agent_runs_stopped": stopped}
 
 
 def _resolve_board(gh_client, board_url: str) -> dict:

@@ -190,26 +190,53 @@ def test_executor_alive_upserts(db):
     assert row["capacity"] == 2
 
 
-def test_heartbeat_extends(db):
+def test_heartbeat_records_metrics_without_lease(db):
     s = Settings(_env_file=None)
     wf, [(t, a, tok)] = _dispatched(db, s)
     _started(db, s, t, a, tok)
+    before = repo_tasks.get_task(db, t)["lease_expires_at"]
     hb = contracts.TaskHeartbeat(task_id=t, attempt=a, lease_token=tok,
                                  turns_used=3, elapsed_s=60)
     assert apply_event(db, hb, "m10", s) == "applied"
+    row = repo_tasks.get_task(db, t)
+    assert row["lease_expires_at"] == before     # beats never touch the lease
+    assert json.loads(row["heartbeat_json"])["turns_used"] == 3
 
 
-def test_stall_probe_alerts_without_killing(db_path):
-    """Alive-but-stuck: heartbeats arrive, turns don't move -> alert + event,
-    task stays running (the planner waits; a human decides)."""
-    import json as _json
+def test_infra_error_result_alerts_and_preserves_attempt(db):
+    s = Settings(_env_file=None)
+    wf, [(t, a, tok)] = _dispatched(db, s)
+    _started(db, s, t, a, tok)
+    res = contracts.TaskResult(task_id=t, attempt=a, lease_token=tok,
+                               outcome="failed", evidence={},
+                               error_code="claudio:unavailable")
+    assert apply_event(db, res, "m11", s) == "applied"
+    row = repo_tasks.get_task(db, t)
+    assert row["status"] == "ready" and row["attempt"] == 0
+    from clams.db import repo_alerts
+    open_probes = [a["probe"] for a in repo_alerts.list_open(db)]
+    assert f"infra:{t}" in open_probes
+
+
+def test_stall_alerts_without_killing(db_path):
+    """Alive-but-stuck: claudio healthy, session evidence frozen -> alert +
+    bundle + event, lease keeps renewing, task stays running (a human
+    decides cancel/retry from the evidence)."""
     from clams.bus import InMemoryBus
     from clams.db import repo_alerts, connect as _connect, migrate as _migrate
-    from clams.db.conn import plus_s
-    from clams.planner.loop import PlannerLoop
+    from clams.planner.watchdog import Watchdog
+
+    class FrozenCE:
+        def health(self):
+            return True
+        def session_messages(self, ref, limit=200):
+            return [{"role": "user", "content": "x",
+                     "ts": "2026-01-01T00:00:00+00:00"}]
+
     _c = _connect(db_path); _migrate(_c); _c.close()
     db = _connect(db_path)
-    s = Settings(_env_file=None, stall_alert_minutes=15, db_path=db_path)
+    s = Settings(_env_file=None, stall_alert_minutes=0, db_path=db_path,
+                 model_server_url="")
     pid = repo_projects.upsert_project(db, "o/r")
     wf = repo_workflows.create_workflow(db, pid, "adhoc", "g")
     repo_workflows.set_status(db, wf, "running")
@@ -219,14 +246,10 @@ def test_stall_probe_alerts_without_killing(db_path):
     repo_tasks.promote_ready(db)
     row = repo_tasks.claim_for_dispatch(db, t, 120)
     repo_tasks.on_started(db, t, row["attempt"], row["lease_token"], "e1", "s")
-    db.execute("UPDATE tasks SET heartbeat_json=? WHERE task_id=?",
-               (_json.dumps({"turns_used": 5, "elapsed_s": 3600,
-                             "ts": plus_s(-3600), "progress_ts": plus_s(-3600)}),
-                t))
-    loop = PlannerLoop(s, InMemoryBus(), None)
-    loop.conn = db                      # test against the fixture DB
-    assert loop._stall_probe() == 1
+    wd = Watchdog(InMemoryBus(), None, FrozenCE(), s, disk_path=".")
+    assert wd.check_liveness(db) == 0      # first observation: baseline
+    assert wd.check_liveness(db) == 1      # frozen -> warn alert + bundle
     assert repo_alerts.open_count(db) == 1
     assert repo_tasks.get_task(db, t)["status"] == "running"   # NOT killed
-    # idempotent: same stalled turn count does not re-alert
-    assert loop._stall_probe() == 0
+    # idempotent: same severity does not re-alert
+    assert wd.check_liveness(db) == 0

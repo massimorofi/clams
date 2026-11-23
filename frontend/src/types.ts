@@ -149,14 +149,14 @@ export interface Transcript {
 }
 
 export interface SettingSpec {
-  type: 'int' | 'float';
-  min: number;
-  max: number;
+  type: 'int' | 'float' | 'str';
+  min?: number;
+  max?: number;
   label: string;
 }
 
 export interface ClamsConfig {
   editable: Record<string, SettingSpec>;
-  effective: Record<string, number>;
-  overrides: Record<string, number>;
+  effective: Record<string, number | string>;
+  overrides: Record<string, number | string>;
 }
