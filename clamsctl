@@ -16,7 +16,32 @@ case "${1:-}" in
   rebuild) need; "${DC[@]}" pull --ignore-buildable || true
            "${DC[@]}" build --pull
            "${DC[@]}" up -d --wait --force-recreate ;;
-  status)  need; "${DC[@]}" ps
+  status)  need
+           ps_json=$("${DC[@]}" ps --format json 2>/dev/null || true)
+           python3 -c '
+import sys, json, re
+rows = [json.loads(l) for l in sys.argv[1].splitlines() if l.strip()]
+tty = sys.stdout.isatty()
+G, R, Y, Z = ("\033[32m","\033[31m","\033[33m","\033[0m") if tty else ("","","","")
+def short(s):
+    m = re.match(r"(\d+)\s+(second|minute|hour|day)", s or "")
+    return f"{m[1]}{m[2][0]}" if m else (s or "")
+out, ok = [], 0
+for c in sorted(rows, key=lambda c: c.get("Service","")):
+    h = (c.get("Health") or "").lower(); st = (c.get("State") or "").lower()
+    if h == "healthy" or (not h and st == "running"):
+        ok += 1; icon, col = "✔", G
+    elif h == "starting" or st in ("created","restarting"):
+        icon, col = "…", Y
+    else:
+        icon, col = "✘", R
+    label = "Healthy" if h == "healthy" else ("Up" if not h and st == "running" else (h or st or "?").capitalize())
+    out.append((icon, col, c.get("Name","?"), label, short(c.get("RunningFor",""))))
+print(f"[+] clams status {ok}/{len(rows)} healthy")
+w = max((len(n) for _,_,n,_,_ in out), default=0)
+for icon, col, name, label, a in out:
+    print(f" {col}{icon}{Z} Container {name:<{w}}  {col}{label}{Z}  {a}")
+' "$ps_json"
            "${DC[@]}" exec -T planner clams status || true ;;
   logs)    need; "${DC[@]}" logs -f --tail=200 ${2:-} ;;
   migrate) need; "${DC[@]}" run --rm planner clams migrate ;;

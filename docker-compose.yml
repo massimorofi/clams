@@ -37,6 +37,9 @@ services:
 
   claudio-planner:
     image: ${CLAUDIO_IMAGE:-claudio/agent:latest}
+    # locally built from the claudio repo — not on any registry, so
+    # `clamsctl rebuild`'s pull step must skip it
+    pull_policy: never
     ports: ["1072:8100"]
     env_file: .env.claudio-planner
     volumes:
@@ -58,6 +61,7 @@ services:
   claudio-executor:
     # executor-side agent: derived image with pytest for evidence-gate runs
     image: ${CLAUDIO_EXECUTOR_IMAGE:-claudio/agent-exec:latest}
+    pull_policy: never
     ports: ["1073:8100"]
     env_file: .env.claudio-executor
     volumes:
@@ -80,6 +84,7 @@ services:
   # Claudio UI settings). Planner UI: 1076, Executor UI: 1077.
   claudio-ui-planner:
     image: ${CLAUDIO_WEB_IMAGE:-claudio/web:latest}
+    pull_policy: never
     ports: ["1076:8080"]
     depends_on:
       claudio-planner: {condition: service_healthy}
@@ -88,6 +93,7 @@ services:
 
   claudio-ui-executor:
     image: ${CLAUDIO_WEB_IMAGE:-claudio/web:latest}
+    pull_policy: never
     ports: ["1077:8080"]
     depends_on:
       claudio-executor: {condition: service_healthy}
