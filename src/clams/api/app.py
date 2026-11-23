@@ -15,7 +15,8 @@ from pydantic import BaseModel, Field
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from starlette.middleware.cors import CORSMiddleware
 
-from ..claudio_client import ClaudioClient, ClaudioUnavailable
+from ..claudio_client import (ClaudioClient, ClaudioUnavailable,
+                              SessionNotFound)
 from ..db import (repo_alerts, repo_commands, repo_events, repo_executors,
                   repo_outbox, repo_projects, repo_questions, repo_runtime,
                   repo_tasks, repo_workflows, connect)
@@ -140,8 +141,15 @@ def create_app(settings, *, claudio_p: Optional[ClaudioClient] = None,
                                 status_code=502)
         try:
             return {"messages": client.session_messages(ref)}
+        except SessionNotFound:
+            # `detail` (not `error`): the frontend surfaces this text
+            return JSONResponse(
+                {"detail": "transcript no longer available — the agent "
+                           "session was pruned or predates session "
+                           "persistence"},
+                status_code=410)
         except ClaudioUnavailable as exc:
-            return JSONResponse({"error": str(exc)}, status_code=502)
+            return JSONResponse({"detail": str(exc)}, status_code=502)
 
     @app.get(f"{API_PREFIX}/questions")
     def questions(status: str = "open",

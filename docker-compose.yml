@@ -44,6 +44,8 @@ services:
     env_file: .env.claudio-planner
     volumes:
       - claudio-sessions:/sessions
+      # transcripts live here — without this a rebuild wipes every session
+      - claudio-planner-data:/srv/claudio/claudio-backend/data
       # image config wins over env vars; bind our copy (raised run deadline)
       - ./config/claudio-planner.yaml:/srv/claudio/claudio-backend/config/config.yaml
     healthcheck:
@@ -66,6 +68,8 @@ services:
     env_file: .env.claudio-executor
     volumes:
       - claudio-sessions:/sessions
+      # transcripts live here — without this a rebuild wipes every session
+      - claudio-executor-data:/srv/claudio/claudio-backend/data
       - worktrees:/work
       # image config wins over env vars; bind our copy so /work is an allowed root
       - ./config/claudio-executor.yaml:/srv/claudio/claudio-backend/config/config.yaml
@@ -137,4 +141,4 @@ services:
       planner: {condition: service_healthy}
 
 networks: {clams: {}, ui-planner: {}, ui-executor: {}}
-volumes: {clams-db: {}, redis-data: {}, claudio-sessions: {}, worktrees: {}}
+volumes: {clams-db: {}, redis-data: {}, claudio-sessions: {}, claudio-planner-data: {}, claudio-executor-data: {}, worktrees: {}}

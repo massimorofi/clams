@@ -96,6 +96,29 @@ def test_transcript_no_session(client):
     assert c.get(f"/api/v1/tasks/{t1}/transcript").json() == {"messages": []}
 
 
+def test_transcript_session_gone(app_db):
+    """claudio 404 (pruned/lost session) -> 410 with a readable detail,
+    not a generic 502 Bad Gateway."""
+    from clams.claudio_client import SessionNotFound
+
+    class DeadAgent:
+        def session_messages(self, session_id, limit=200):
+            raise SessionNotFound(f"no session {session_id}", status=404)
+
+    conn, path = app_db
+    s = Settings(_env_file=None, db_path=path, api_token=TOKEN)
+    app = create_app(s, claudio_e=DeadAgent())
+    with TestClient(app) as c:
+        c.headers["Authorization"] = f"Bearer {TOKEN}"
+        _, t1, _ = _seed(conn)
+        conn.execute("UPDATE tasks SET session_ref='gone-123' "
+                     "WHERE task_id=?", (t1,))
+        conn.commit()
+        r = c.get(f"/api/v1/tasks/{t1}/transcript")
+        assert r.status_code == 410
+        assert "no longer available" in r.json()["detail"]
+
+
 def test_questions_inbox(client):
     c, conn = client
     _, t1, _ = _seed(conn)

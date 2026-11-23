@@ -31,6 +31,11 @@ class ClaudioUnavailable(ClaudioError):
     pass
 
 
+class SessionNotFound(ClaudioError):
+    """The agent session id does not exist — pruned, or lost when its
+    container was recreated before session storage was persisted."""
+
+
 @dataclass
 class ChatResponse:
     run_id: str
@@ -121,6 +126,9 @@ class ClaudioClient:
             with self._client(timeout=15.0) as c:
                 r = c.get(f"/api/v1/sessions/{session_id}/messages",
                           params={"limit": limit})
+                if r.status_code == 404:
+                    raise SessionNotFound(f"no session {session_id}",
+                                          status=404)
                 r.raise_for_status()
                 data = r.json()
                 return data.get("messages", data if isinstance(data, list) else [])
