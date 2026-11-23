@@ -1,34 +1,16 @@
-# Claudio backend configuration — TEMPLATE
-#
-# Copy to `claudio-backend/config/config.yaml` for a host-native run, or let the
-# container entrypoint seed it into the config volume on first boot.
-#
-# The live config file is gitignored because it holds secrets. Every value here is
-# a placeholder or a safe default; replace the CHANGE_ME entries before starting.
-#
-# Precedence: defaults < this file < CLAUDIO__SECTION__KEY environment variables.
-# NOTE: env overrides only support exactly two levels (section + key). Deeper
-# values such as `agent.tools.enabled` cannot be set from the environment and
-# must live in this YAML.
-
 server:
-  # 0.0.0.0 inside the container so nginx can reach it; 127.0.0.1 for a
-  # host-native run you do not want exposed on the LAN.
   host: 0.0.0.0
   port: 8100
   auth_token: dev-token-change-me
   cors_origins:
-    - http://localhost:8080
-    # Claudio web UIs (same-origin proxy needs no CORS; these are for the
-    # "call the agent directly" mode configured in the UI's backend settings)
-    - http://localhost:1076
-    - http://localhost:1077
-    - http://127.0.0.1:1076
-    - http://127.0.0.1:1077
-    - http://192.168.1.172:1076
-    - http://192.168.1.172:1077
+  - http://localhost:8080
+  - http://localhost:1076
+  - http://localhost:1077
+  - http://127.0.0.1:1076
+  - http://127.0.0.1:1077
+  - http://192.168.1.172:1076
+  - http://192.168.1.172:1077
   expose_raw_config: false
-
 llm:
   provider: openai
   model: halogen-qwen3.8-flash-next
@@ -36,28 +18,16 @@ llm:
   base_url: http://192.168.1.172:8731/v1
   temperature: 0.2
   max_tokens: 16384
+  context_window: null
   fallback_model: null
-  # /chat cancels runs exceeding 2x this (api/chat.py). Planning calls for big
-  # goals exceed the 600s default; 1800 -> 60-minute planning deadline.
   timeout_seconds: 86400
   retry_attempts: 3
   price_input_per_mtok: 0.0
   price_output_per_mtok: 0.0
-
-# --- Multi-LLM profiles and roles ----------------------------------------
-# The `llm` section above IS the implicit primary profile. Additional named
-# profiles go here; `roles` assigns each role to a profile. Any role left
-# unset (or pointing at nothing) falls back to the `llm` section, so a config
-# with no model_profiles/roles behaves exactly as a single-model setup.
-#
-# This example mirrors the current deployment: the worker and fast roles both
-# point at the halogen model. Because the fast profile is the same model and
-# endpoint as the primary, automatic routing short-circuits to primary (see
-# doc/model-routing.md). To route simple requests to a genuinely different
-# fast model, give `fast` a distinct profile and keep auto_routing_enabled true.
+  reasoning_effort: ''
 model_profiles:
   worker-halogen:
-    label: "Worker (halogen)"
+    label: Worker (halogen)
     provider: openai
     model: halogen-qwen3.8-flash-next
     base_url: http://192.168.1.172:8731/v1
@@ -68,8 +38,9 @@ model_profiles:
     price_input_per_mtok: 0.0
     price_output_per_mtok: 0.0
     timeout_seconds: 1800
+    reasoning_effort: ''
   fast-halogen:
-    label: "Fast (halogen)"
+    label: Fast (halogen)
     provider: openai
     model: halogen-qwen3.8-flash-next
     base_url: http://192.168.1.172:8731/v1
@@ -80,35 +51,29 @@ model_profiles:
     price_input_per_mtok: 0.0
     price_output_per_mtok: 0.0
     timeout_seconds: 1800
-
+    reasoning_effort: ''
 roles:
-  # primary omitted -> uses the `llm` section.
-  worker: worker-halogen   # delegated subtasks via delegate_task
-  fast: fast-halogen       # one-shot jobs (compaction, fixer, learning)
-
+  primary: null
+  worker: worker-halogen
+  fast: fast-halogen
 agent:
-  name: claudio
+  name: Planner
   instructions_file: instructions.md
   instructions: null
   max_turns: 150
   max_auto_continues: 10
   max_budget_usd: 100.0
+  max_model_calls: 0
+  max_run_seconds: 0
+  max_run_tokens: 0
+  reasoning_effort_high: ''
+  reasoning_effort_low: ''
   approval_mode: on_request
-  # When true, the agent's run_command executes on the HOST machine (outside
-  # the Docker container) via the host executor daemon, instead of inside the
-  # container. The daemon must be running and listening on the socket below.
-  # This gives the agent real host access (bounded by the executor's allowed
-  # roots); leave false to keep commands sandboxed inside the container.
   host_execution_enabled: true
   host_execution_socket: /run/claudio-host/host-exec.sock
-  # When true, a fast-model classifier routes clearly simple, tool-free requests
-  # to the `fast` role. No effect while `fast` == primary (as in this example).
-  auto_routing_enabled: true
-  subagent_approval_mode: one_gate # one_gate | passthrough
-  # Inside the container the agent edits the bind-mounted /workspace.
   default_workspace_dir: /workspace
   workspace_allowed_roots:
-    - /workspace
+  - /workspace
   context_window: 262144
   compaction_reserve: 8192
   compaction_timeout_seconds: 300
@@ -116,33 +81,38 @@ agent:
   strict_tools: false
   skills_enabled: true
   skills_dir: ./skills
+  gortex_manifest_path: ''
+  auto_routing_enabled: true
+  router_deterministic_first: true
+  max_read_concurrency: 4
+  streaming_enabled: false
+  subagent_approval_mode: one_gate
   tools:
     enabled:
-      - read_file
-      - list_dir
-      - web_search
-      - delegate_task
-      - write_file
-      - run_command
-      - edit_file
-      - web_fetch
-      - rewind_files
-      - todo_write
+    - read_file
+    - list_dir
+    - web_search
+    - delegate_task
+    - write_file
+    - run_command
+    - edit_file
+    - web_fetch
+    - rewind_files
+    - todo_write
     disabled: []
   subagents:
     code_worker:
-      description: "Implements a narrow, well-scoped coding task in the workspace"
-      instructions: >-
-        Complete only the requested task. Inspect relevant files first, make the
-        smallest necessary changes, and report files changed and checks run.
+      description: Implements a narrow, well-scoped coding task in the workspace
+      instructions_file: null
+      instructions: Complete only the requested task. Inspect relevant files first,
+        make the smallest necessary changes, and report files changed and checks run.
         Do not delegate, broaden scope, or run unrelated commands.
       tools:
-        - read_file
-        - write_file
-        - edit_file
-        - run_command
+      - read_file
+      - write_file
+      - edit_file
+      - run_command
       max_turns: 8
-
 search:
   provider: auto
   brave_api_key: ''
@@ -152,38 +122,26 @@ search:
   country: us
   min_relevance: 0.2
   timeout_seconds: 12
-
 mcp:
   servers:
-    - id: SkillMD.com
-      transport: streamable_http
-      command:
-        - https://api.skillmd.com/mcp
-      url: https://api.skillmd.com/mcp
-      enabled: true
-    # Gortex code-intelligence MCP (issue #54, Option B). Ships DISABLED so a
-    # fresh deploy that does not run the gortex container is unaffected. When
-    # enabled it points at the gortex daemon's Streamable HTTP MCP endpoint on the
-    # internal bridge (the `gortex` compose service, profile "gortex"). To turn it
-    # on: set CLAUDIO_GORTEX_ENABLED=true in .env (or `docker compose --profile
-    # gortex up -d`), flip `enabled: true`, then restart the agent. The daemon
-    # indexes the same /workspace mount the agent uses so returned paths match.
-    # See doc/docker.md §9.
-    - id: gortex
-      transport: streamable_http
-      command: []
-      url: http://gortex:7411/mcp
-      # Must match the gortex container's GORTEX_DAEMON_HTTP_TOKEN (Gortex
-      # requires a bearer token for its non-localhost /mcp bind). Change it.
-      headers:
-        Authorization: Bearer claudio-gortex-internal-token
-      enabled: false
-
+  - id: SkillMD.com
+    transport: streamable_http
+    command:
+    - https://api.skillmd.com/mcp
+    url: https://api.skillmd.com/mcp
+    enabled: true
+    headers: {}
+  - id: gortex
+    transport: streamable_http
+    command: []
+    url: http://gortex:7411/mcp
+    enabled: false
+    headers:
+      Authorization: Bearer claudio-gortex-internal-token
 monitoring:
   log_level: INFO
   log_retention_days: 7
   metrics_snapshot_interval_seconds: 5
-
 autonomous:
   enabled: false
   report_only: true
@@ -206,8 +164,8 @@ autonomous:
     schedule: 0 3 * * *
     vacuum_size: 200M
     temp_dirs:
-      - /tmp
-      - /var/tmp
+    - /tmp
+    - /var/tmp
     audit_retention_days: 90
     apt_update: true
     vacuum_logs: true
@@ -235,7 +193,6 @@ autonomous:
       enabled: false
       url: ''
   command_allowlist: null
-
 self_improvement:
   enabled: true
   capture_enabled: true
@@ -245,3 +202,21 @@ self_improvement:
   max_learnings: 5000
   retention_days: 180
   max_auto_skills: 20
+engine:
+  kind: adk
+  startup_timeout_seconds: 30
+  run_timeout_seconds: 1800
+  opencode:
+    model: null
+    config_dir: null
+    server_mode: standalone
+    binary: opencode
+    provider_name: claudio
+    output_token_limit: 16000
+    context_token_limit: 131072
+  claude_code:
+    model: null
+    config_dir: null
+    permission_mode: acceptEdits
+    binary: claude
+    allow_openai_endpoint: false

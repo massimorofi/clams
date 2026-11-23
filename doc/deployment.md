@@ -81,9 +81,12 @@ Streams: `clams:tasks` (planner → executors, group `executors`),
 Volumes: `clams-db` (SQLite, planner-owned; API mounts rw for the commands
 insert only), `worktrees` (shared between executor-runner and claudio-executor
 — this is how the agent sees the worktrees), `claudio-sessions` (agent session
-state), `redis-data` (AOF). Bind mounts: `config/claudio-planner.yaml` and
-`config/claudio-executor.yaml` over each container's image `config.yaml`
-(the YAML wins over `CLAUDIO__*` env vars).
+state), `redis-data` (AOF), `claudio-planner-data` / `claudio-executor-data`
+(session transcripts + agent state — without these a rebuild wipes every
+session). Bind mounts: the directories `config/agents/planner` and
+`config/agents/executor` over each container's image config dir (the YAML
+wins over `CLAUDIO__*` env vars; directory, not file, so UI config edits can
+`rename()` over `config.yaml` — a file bind mount fails EBUSY).
 
 ## 3. Scaling
 

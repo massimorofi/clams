@@ -41,10 +41,11 @@ $EDITOR config/clams.yaml
 
 Three config layers, in order of precedence:
 
-1. **`config/claudio-planner.yaml` / `config/claudio-executor.yaml`** —
-   bind-mounted *over* the Claudio image's own `config.yaml`. The YAML wins
-   over `CLAUDIO__*` env vars, so the LLM endpoint, auth token, approval mode
-   and allowed workspace roots are set **here**.
+1. **`config/agents/planner/config.yaml` / `config/agents/executor/config.yaml`** —
+   bind-mounted (whole directory, so UI config edits can `rename()` over
+   `config.yaml`) *over* the Claudio image's own config dir. The YAML wins
+   over `CLAUDIO__*` env vars, so the LLM endpoint, auth token, approval mode,
+   agent name and allowed workspace roots are set **here**.
    > ⚠ YAML gotcha: quote `approval_mode: "off"` — bare `off` parses as boolean
    > and silently blanks the whole config (auth included).
 2. **`.env.claudio-planner` / `.env.claudio-executor`** — `CLAUDIO__*` env vars;
@@ -58,8 +59,8 @@ Key `.env` settings (full list in `.env.example`):
 |---|---|---|
 | `CLAMS_API_TOKEN` | *(empty)* | **must set** — protects the API/UI |
 | `CLAMS_GITHUB_TOKEN` | *(empty)* | **must set** for GitHub intake |
-| `CLAMS_CLAUDIO_PLANNER_TOKEN` | *(empty)* | must equal `server.auth_token` in `config/claudio-planner.yaml` |
-| `CLAMS_CLAUDIO_EXECUTOR_TOKEN` | *(empty)* | must equal `server.auth_token` in `config/claudio-executor.yaml` |
+| `CLAMS_CLAUDIO_PLANNER_TOKEN` | *(empty)* | must equal `server.auth_token` in `config/agents/planner/config.yaml` |
+| `CLAMS_CLAUDIO_EXECUTOR_TOKEN` | *(empty)* | must equal `server.auth_token` in `config/agents/executor/config.yaml` |
 | `CLAMS_WORKTREE_UID/GID` | `1000` | owner of provisioned worktrees (the Claudio agent uid) |
 | `CLAUDIO_IMAGE` | `claudio/agent:latest` | compose interpolation var for the agent image |
 
@@ -72,20 +73,18 @@ What each address exposes (per `docker-compose.yml`):
 | `:1075` | `api` :8200 | **Clams UI + REST + SSE** — the SPA at `/`, API under `/api/v1` | whole LAN |
 | `:1072` | `claudio-planner` :8100 | **Claudio-P agent HTTP API** — `/healthz`, `/api/v1/chat` | whole LAN — debugging the planning agent |
 | `:1073` | `claudio-executor` :8100 | **Claudio-E agent HTTP API** — same surface, headless executor | whole LAN — debugging the executor agent |
-| `:1076` | `claudio-ui-planner` :8080 | **Claudio web UI for the Planner agent** (chat, sessions, config of Claudio-P) | whole LAN — supervising planning |
-| `:1077` | `claudio-ui-executor` :8080 | **Claudio web UI for the Executor agent** — watch task sessions live | whole LAN — supervising execution |
+| `:1076` | `claudio-ui` :8080 | **Claudio web UI** — one instance, backend switchable between Planner and Executor | whole LAN — supervising planning & execution |
 | *(internal)* `redis:6379` | redis | Redis Streams `clams:tasks` / `clams:events` / `clams:dlq` | docker network only — **never published** |
 | *(internal)* `planner`, `executor-runner` | — | no published ports; they only *call* the services above | docker network only |
 
-**Claudio web UIs (1076/1077) — backend URL:** open the UI and, when asked for
-a backend, **leave the URL empty** (or clear it in the UI's backend settings).
-Empty = *same origin*: the request goes to `/api/…` on the UI's own port and
-the UI's nginx proxies it to the right agent (1076 → Planner, 1077 →
-Executor). Entering an absolute URL like `http://<host>:8100` will **fail
-with "Failed to fetch"** — port 8100 is the container-internal port and is
-not published. If you really want to call an agent directly, use the published
-ports: `http://<machine-lan-ip>:1072` (planner) or `:1073` (executor). The
-token is the agent's `server.auth_token` (see §4.2).
+**Claudio web UI (1076) — backend URL:** by default **leave the URL empty**
+(or clear it in the UI's backend settings). Empty = *same origin*: requests go
+to `/api/…` on port 1076 and the UI's nginx proxies them to the **Planner**
+agent. To drive the **Executor**, set the backend URL to
+`http://<machine-lan-ip>:1073` (direct mode — both agents' CORS already allow
+the 1076 origin); switch back to empty for the Planner. Never use `:8100` —
+that port is container-internal and will fail with "Failed to fetch". The
+token is the selected agent's `server.auth_token` (see §4.2).
 
 Inside the `clams` docker network, services address each other by name
 (`http://claudio-planner:8100`, `redis://redis:6379/0`) — this is wired in the

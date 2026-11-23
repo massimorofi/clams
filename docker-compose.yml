@@ -46,8 +46,11 @@ services:
       - claudio-sessions:/sessions
       # transcripts live here — without this a rebuild wipes every session
       - claudio-planner-data:/srv/claudio/claudio-backend/data
-      # image config wins over env vars; bind our copy (raised run deadline)
-      - ./config/claudio-planner.yaml:/srv/claudio/claudio-backend/config/config.yaml
+      # image config wins over env vars; bind our copy (raised run deadline).
+      # Mount the DIRECTORY, not the file: claudio persists UI config edits
+      # (e.g. agent name) by rename() over config.yaml, which fails EBUSY
+      # when the file itself is a bind mount.
+      - ./config/agents/planner:/srv/claudio/claudio-backend/config
     healthcheck:
       test: ["CMD", "python", "-c",
              "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8100/healthz').status==200 else 1)"]
@@ -56,7 +59,7 @@ services:
     networks:
       clams: {}
       # alias so the stock claudio/web nginx upstream (claudio-agent:8100)
-      # resolves to THIS backend for its dedicated UI instance
+      # resolves to THIS backend — the single UI's default (planner) backend
       ui-planner: { aliases: [claudio-agent] }
     restart: unless-stopped
 
@@ -71,8 +74,9 @@ services:
       # transcripts live here — without this a rebuild wipes every session
       - claudio-executor-data:/srv/claudio/claudio-backend/data
       - worktrees:/work
-      # image config wins over env vars; bind our copy so /work is an allowed root
-      - ./config/claudio-executor.yaml:/srv/claudio/claudio-backend/config/config.yaml
+      # image config wins over env vars; bind our copy so /work is an allowed
+      # root. Directory mount — see planner note re: rename()/EBUSY.
+      - ./config/agents/executor:/srv/claudio/claudio-backend/config
     healthcheck:
       test: ["CMD", "python", "-c",
              "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8100/healthz').status==200 else 1)"]
@@ -80,28 +84,20 @@ services:
       retries: 5
     networks:
       clams: {}
-      ui-executor: { aliases: [claudio-agent] }
     restart: unless-stopped
 
-  # Claudio web UIs — one instance per backend (nginx proxies a single
-  # upstream). The UI token is the agent's server.auth_token (paste in the
-  # Claudio UI settings). Planner UI: 1076, Executor UI: 1077.
-  claudio-ui-planner:
+  # Single Claudio web UI on 1076. Its nginx proxies same-origin /api to
+  # claudio-agent (alias -> claudio-planner). To drive the executor, set the
+  # backend URL to http://localhost:1073 in the UI's backend settings
+  # (direct mode; both agents' CORS already allow the 1076 origin). The UI
+  # token is the selected agent's server.auth_token.
+  claudio-ui:
     image: ${CLAUDIO_WEB_IMAGE:-claudio/web:latest}
     pull_policy: never
     ports: ["1076:8080"]
     depends_on:
       claudio-planner: {condition: service_healthy}
     networks: [ui-planner]
-    restart: unless-stopped
-
-  claudio-ui-executor:
-    image: ${CLAUDIO_WEB_IMAGE:-claudio/web:latest}
-    pull_policy: never
-    ports: ["1077:8080"]
-    depends_on:
-      claudio-executor: {condition: service_healthy}
-    networks: [ui-executor]
     restart: unless-stopped
 
   planner:
@@ -140,5 +136,5 @@ services:
     depends_on:
       planner: {condition: service_healthy}
 
-networks: {clams: {}, ui-planner: {}, ui-executor: {}}
+networks: {clams: {}, ui-planner: {}}
 volumes: {clams-db: {}, redis-data: {}, claudio-sessions: {}, claudio-planner-data: {}, claudio-executor-data: {}, worktrees: {}}

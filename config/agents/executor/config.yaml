@@ -91,7 +91,7 @@ roles:
   fast: fast-halogen       # one-shot jobs (compaction, fixer, learning)
 
 agent:
-  name: claudio
+  name: Executor-1
   instructions_file: instructions.md
   instructions: null
   max_turns: 150

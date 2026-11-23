@@ -1,0 +1,265 @@
+# Claudio backend configuration — TEMPLATE
+#
+# Copy to `claudio-backend/config/config.yaml` for a host-native run, or let the
+# container entrypoint seed it into the config volume on first boot.
+#
+# The live config file is gitignored because it holds secrets. Every value here is
+# a placeholder or a safe default; replace the CHANGE_ME entries before starting.
+#
+# Precedence: defaults < this file < CLAUDIO__SECTION__KEY environment variables.
+# NOTE: env overrides only support exactly two levels (section + key). Deeper
+# values such as `agent.tools.enabled` cannot be set from the environment and
+# must live in this YAML.
+
+server:
+  # 0.0.0.0 inside the container so nginx can reach it; 127.0.0.1 for a
+  # host-native run you do not want exposed on the LAN.
+  host: 0.0.0.0
+  port: 8100
+  auth_token: dev-token-change-me
+  cors_origins:
+    - http://localhost:8080
+  expose_raw_config: false
+
+llm:
+  provider: openai
+  model: halogen-qwen3.8-flash-next
+  api_key: local
+  base_url: http://192.168.1.172:8731/v1
+  temperature: 0.2
+  max_tokens: 16384
+  fallback_model: null
+  timeout_seconds: 300
+  retry_attempts: 3
+  price_input_per_mtok: 0.0
+  price_output_per_mtok: 0.0
+
+# --- Multi-LLM profiles and roles ----------------------------------------
+# The `llm` section above IS the implicit primary profile. Additional named
+# profiles go here; `roles` assigns each role to a profile. Any role left
+# unset (or pointing at nothing) falls back to the `llm` section, so a config
+# with no model_profiles/roles behaves exactly as a single-model setup.
+#
+# This example mirrors the current deployment: the worker and fast roles both
+# point at the halogen model. Because the fast profile is the same model and
+# endpoint as the primary, automatic routing short-circuits to primary (see
+# doc/model-routing.md). To route simple requests to a genuinely different
+# fast model, give `fast` a distinct profile and keep auto_routing_enabled true.
+model_profiles:
+  worker-halogen:
+    label: "Worker (halogen)"
+    provider: openai
+    model: halogen-qwen3.8-flash-next
+    base_url: http://192.168.1.172:8731/v1
+    api_key: local
+    temperature: 0.2
+    max_tokens: 16384
+    context_window: 262144
+    price_input_per_mtok: 0.0
+    price_output_per_mtok: 0.0
+    timeout_seconds: 300
+  fast-halogen:
+    label: "Fast (halogen)"
+    provider: openai
+    model: halogen-qwen3.8-flash-next
+    base_url: http://192.168.1.172:8731/v1
+    api_key: local
+    temperature: 0.2
+    max_tokens: 16384
+    context_window: 262144
+    price_input_per_mtok: 0.0
+    price_output_per_mtok: 0.0
+    timeout_seconds: 300
+
+roles:
+  # primary omitted -> uses the `llm` section.
+  worker: worker-halogen   # delegated subtasks via delegate_task
+  fast: fast-halogen       # one-shot jobs (compaction, fixer, learning)
+
+agent:
+  name: claudio
+  instructions_file: instructions.md
+  instructions: null
+  max_turns: 150
+  max_auto_continues: 10
+  max_budget_usd: 100.0
+  approval_mode: on_request
+  # When true, the agent's run_command executes on the HOST machine (outside
+  # the Docker container) via the host executor daemon, instead of inside the
+  # container. The daemon must be running and listening on the socket below.
+  # This gives the agent real host access (bounded by the executor's allowed
+  # roots); leave false to keep commands sandboxed inside the container.
+  host_execution_enabled: true
+  host_execution_socket: /run/claudio-host/host-exec.sock
+  # When true, a fast-model classifier routes clearly simple, tool-free requests
+  # to the `fast` role. No effect while `fast` == primary (as in this example).
+  auto_routing_enabled: true
+  subagent_approval_mode: one_gate # one_gate | passthrough
+  # Inside the container the agent edits the bind-mounted /workspace.
+  default_workspace_dir: /workspace
+  workspace_allowed_roots:
+    - /workspace
+  context_window: 262144
+  compaction_reserve: 8192
+  compaction_timeout_seconds: 300
+  max_output_chars: 8000
+  strict_tools: false
+  skills_enabled: true
+  skills_dir: ./skills
+  tools:
+    enabled:
+      - read_file
+      - list_dir
+      - web_search
+      - delegate_task
+      - write_file
+      - run_command
+      - edit_file
+      - web_fetch
+      - rewind_files
+      - todo_write
+      # Compound read-only tools (issue #58 Inc 2): collapse multi-step
+      # read/search sequences into single deterministic calls.
+      - batch_read
+      - search_with_context
+      - locate_symbol
+    disabled: []
+  subagents:
+    code_worker:
+      description: "Implements a narrow, well-scoped coding task in the workspace"
+      instructions: >-
+        Complete only the requested task. Inspect relevant files first, make the
+        smallest necessary changes, and report files changed and checks run.
+        Do not delegate, broaden scope, or run unrelated commands.
+      tools:
+        - read_file
+        - write_file
+        - edit_file
+        - run_command
+      max_turns: 8
+
+search:
+  provider: auto
+  brave_api_key: ''
+  serper_api_key: ''
+  tavily_api_key: ''
+  language: en
+  country: us
+  min_relevance: 0.2
+  timeout_seconds: 12
+
+mcp:
+  servers:
+    - id: SkillMD.com
+      transport: streamable_http
+      command:
+        - https://api.skillmd.com/mcp
+      url: https://api.skillmd.com/mcp
+      enabled: true
+    # Gortex code-intelligence MCP (issue #54, Option B). Ships DISABLED so a
+    # fresh deploy that does not run the gortex container is unaffected. When
+    # enabled it points at the gortex daemon's Streamable HTTP MCP endpoint on the
+    # internal bridge (the `gortex` compose service, profile "gortex"). To turn it
+    # on: set CLAUDIO_GORTEX_ENABLED=true in .env (or `docker compose --profile
+    # gortex up -d`), flip `enabled: true`, then restart the agent. The daemon
+    # indexes the same /workspace mount the agent uses so returned paths match.
+    # See doc/docker.md §9.
+    - id: gortex
+      transport: streamable_http
+      command: []
+      url: http://gortex:7411/mcp
+      # Must match the gortex container's GORTEX_DAEMON_HTTP_TOKEN (Gortex
+      # requires a bearer token for its non-localhost /mcp bind). Change it.
+      headers:
+        Authorization: Bearer claudio-gortex-internal-token
+      enabled: false
+
+monitoring:
+  log_level: INFO
+  log_retention_days: 7
+  metrics_snapshot_interval_seconds: 5
+
+autonomous:
+  enabled: false
+  report_only: true
+  max_fix_attempts: 3
+  health_check:
+    enabled: true
+    interval_minutes: 10
+    disk_warn_percent: 85.0
+    disk_crit_percent: 95.0
+    mem_crit_percent: 95.0
+    swap_warn_percent: 80.0
+    load_warn_factor: 1.0
+    load_crit_factor: 2.0
+    backup_path: ''
+    backup_max_age_hours: 26.0
+    journal_lookback_minutes: 15
+    script: ''
+  maintenance:
+    enabled: false
+    schedule: 0 3 * * *
+    vacuum_size: 200M
+    temp_dirs:
+      - /tmp
+      - /var/tmp
+    audit_retention_days: 90
+    apt_update: true
+    vacuum_logs: true
+    temp_cleanup: true
+    autoremove: true
+    full_upgrade: false
+    docker_prune: false
+    script: ''
+  recovery:
+    enabled: false
+    expected_services: []
+    restart_allowlist: []
+  notification:
+    enabled: false
+    email:
+      enabled: false
+      smtp_host: ''
+      smtp_port: 587
+      username: ''
+      password: ''
+      from_addr: ''
+      to_addr: ''
+      use_tls: true
+    webhook:
+      enabled: false
+      url: ''
+  command_allowlist: null
+
+self_improvement:
+  enabled: true
+  capture_enabled: true
+  consolidation_schedule: 0 4 * * 1
+  promotion_threshold: 3
+  auto_promote: false
+  max_learnings: 5000
+  retention_days: 180
+  max_auto_skills: 20
+
+# Pluggable backend engine (issue #57). Deployment-wide: one engine per backend
+# process. `adk` is the default and needs no extra CLI. Selecting `opencode` or
+# `claude_code` requires the matching backend image (see compose.engine-*.yaml)
+# and a backend restart; it is not a per-session choice. The CLAUDIO_ENGINE
+# environment variable overrides `kind` at runtime.
+engine:
+  kind: adk                    # adk | opencode | claude_code
+  startup_timeout_seconds: 30
+  run_timeout_seconds: 1800
+  opencode:
+    model: null                # default: resolved Claudio primary profile
+    config_dir: null           # default: private path under backend data
+    server_mode: standalone
+    binary: opencode
+  claude_code:
+    model: null                # mapped to a supported Claude Code model id
+    config_dir: null
+    permission_mode: default   # default | acceptEdits | plan
+    binary: claude
+    # Claude Code needs an Anthropic Messages (/v1/messages) endpoint. Set true
+    # ONLY after verifying the configured endpoint serves that protocol.
+    allow_openai_endpoint: false
