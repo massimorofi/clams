@@ -1,0 +1,28 @@
+diff --git a/claudio-backend/tests/conftest.py b/claudio-backend/tests/conftest.py
+new file mode 100644
+index 0000000..68fee01
+--- /dev/null
++++ b/claudio-backend/tests/conftest.py
+@@ -0,0 +1,22 @@
++"""Make the backend test suite importable from a bare environment.
++
++The Clams evidence gate (and any CI run) may invoke pytest in a container
++where neither ``claudio_backend`` nor ``claudio_core`` is pip-installed.
++Many test modules import both at module level, so collection dies with
++``ModuleNotFoundError: No module named 'claudio_core'`` (27 collection
++errors, live finding claudio#58 T2 gate). The pyproject ``pythonpath``
++only covers ``src`` and only when rootdir resolves to claudio-backend.
++
++Computing both source trees from ``__file__`` makes collection work
++regardless of cwd, rootdir or PYTHONPATH.
++"""
++from __future__ import annotations
++
++import sys
++from pathlib import Path
++
++_BACKEND = Path(__file__).resolve().parents[1]   # .../claudio-backend
++for _p in (_BACKEND / "src", _BACKEND.parent / "claudio-core" / "src"):
++    _s = str(_p)
++    if _p.is_dir() and _s not in sys.path:
++        sys.path.insert(0, _s)

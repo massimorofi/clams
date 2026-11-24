@@ -31,6 +31,21 @@ def dispatch_ready(conn, bus, settings) -> list[str]:
             if claimed is None:
                 continue
             brief = json.loads(claimed["brief_json"])
+            # operator-edited executor prompt (if any) rides the dispatch so
+            # the bus-only executor never reads the DB; absent -> built-in
+            # default in the executor
+            from ..prompts import get_override
+            override = get_override(conn, "executor_task")
+            if override:
+                brief["prompt_template"] = override
+            # retry work reuse: tell attempt N>1 exactly why attempt N-1
+            # failed the gate (the executor seeds from its branch)
+            if claimed["attempt"] > 1:
+                from .plan import failure_summary
+                fs = failure_summary(claimed["result_json"],
+                                     claimed["error_log"])
+                if fs:
+                    brief["prior_failure"] = fs
             msg = contracts.TaskDispatch(
                 task_id=task_id, workflow_id=claimed["workflow_id"],
                 attempt=claimed["attempt"], lease_token=claimed["lease_token"],

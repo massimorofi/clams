@@ -67,6 +67,12 @@ class Brief(BaseModel):
     max_turns: int = 40
     answer: Optional[str] = None                  # set when resuming after question
     session_ref: Optional[str] = None             # set when resuming a session
+    # operator-edited executor prompt template (clams.prompts), injected by
+    # the planner at dispatch time so the bus-only executor needs no DB read
+    prompt_template: Optional[str] = None
+    # compact summary of why the previous attempt failed the gate, injected
+    # at dispatch time for attempt > 1 (retry work reuse)
+    prior_failure: Optional[str] = None
 
     @field_validator("schema_version")
     @classmethod

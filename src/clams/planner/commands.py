@@ -128,6 +128,12 @@ def _apply(conn, row, *, adhoc_handler=None, gh_client=None,
     if kind == "settings_patch":
         return _settings_patch(conn, payload, issuer)
 
+    if kind == "prompt_patch":
+        return _prompt_patch(conn, payload, issuer)
+
+    if kind == "apply_plan":
+        return _apply_plan(conn, payload, issuer, target)
+
     raise ValueError(f"unhandled command kind {kind}")
 
 
@@ -156,6 +162,83 @@ def _settings_patch(conn, payload: dict, issuer: str) -> dict:
                              f"settings_patch by {issuer}: "
                              + ", ".join(f"{k}={v}" for k, v in applied.items()))
     return {"applied": applied, "overrides": merged}
+
+
+def _prompt_patch(conn, payload: dict, issuer: str) -> dict:
+    """Install (or reset) an operator prompt template.
+
+    Overrides persist in runtime_state and are read at every render, so they
+    take effect from the next planning call / dispatch onward. An empty or
+    null template resets that prompt to the built-in default.
+    """
+    from .. import prompts
+    name = payload.get("name")
+    if not isinstance(name, str) or name not in prompts.PROMPTS:
+        raise ValueError(f"prompt_patch needs payload.name in "
+                         f"{', '.join(prompts.PROMPTS)}")
+    template = payload.get("template")
+    if template is not None and not isinstance(template, str):
+        raise ValueError("prompt_patch payload.template must be a string or null")
+    error = prompts.validate(name, template)
+    if error:
+        raise ValueError(error)
+    merged = prompts.set_override(conn, name, template)
+    action = "reset to default" if not template else "updated"
+    repo_events.append_event(conn, "system", "prompts", "info",
+                             f"prompt_patch by {issuer}: {name} {action}")
+    return {"name": name, "action": action,
+            "overridden": sorted(merged.keys())}
+
+
+def _apply_plan(conn, payload: dict, issuer: str,
+                target: Optional[str]) -> dict:
+    """Install an operator-approved plan directly — no LLM call.
+
+    Closes the loop for plans authored by the planner agent (or by hand):
+    the plan must pass the exact validation LLM plans go through, then the
+    swap mirrors plan_workflow (old task set superseded atomically). NOTE:
+    runs inside drain_commands' BEGIN IMMEDIATE — must not open its own.
+    """
+    from .. import contracts
+    from ..config import get_settings
+    from .plan import build_brief
+
+    wf_id = payload.get("workflow_id") or target or ""
+    wf = repo_workflows.get_workflow(conn, wf_id)
+    if wf is None:
+        raise ValueError(f"unknown workflow {wf_id}")
+    if wf["status"] not in ("failed", "blocked", "review", "running"):
+        raise ValueError(f"workflow {wf_id} not replannable from {wf['status']}")
+    raw = payload.get("plan")
+    if not isinstance(raw, dict):
+        raise ValueError("apply_plan needs payload.plan {tasks: [...]}")
+    s = get_settings()
+    try:
+        plan = contracts.Plan.model_validate(raw)
+        contracts.validate_plan(plan, max_tasks=s.max_plan_tasks)
+    except Exception as exc:  # noqa: BLE001 - surfaced as command rejection
+        raise ValueError(f"invalid plan: {str(exc)[:300]}") from exc
+    row = conn.execute("SELECT repo FROM projects WHERE project_id=?",
+                       (wf["project_id"],)).fetchone()
+    repo = row["repo"] if row else "unknown/repo"
+    base_ref = "main"
+    for p in s.load_projects_yaml().get("projects", []):
+        if p.get("repo") == repo:
+            base_ref = p.get("base_ref", "main")
+            break
+    n_old = repo_tasks.delete_workflow_tasks(conn, wf_id)
+    for i, pt in enumerate(plan.tasks, start=1):
+        repo_tasks.create_task(
+            conn, wf_id, i, pt.title, pt.objective, pt.acceptance,
+            build_brief(pt, repo, base_ref, s),
+            depends_on=pt.depends_on, max_attempts=s.max_attempts)
+    repo_workflows.set_plan(conn, wf_id, plan.model_dump(), status="running")
+    repo_events.append_event(
+        conn, "workflow", wf_id, "warn",
+        f"apply_plan by {issuer}: replaced {n_old} tasks with "
+        f"{len(plan.tasks)}")
+    log.info("apply_plan on %s by %s: %d tasks", wf_id, issuer, len(plan.tasks))
+    return {"workflow": wf_id, "tasks": len(plan.tasks), "replaced": n_old}
 
 
 def _stop_agent_run(claudio_e, session_ref: str) -> bool:

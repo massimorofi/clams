@@ -10,46 +10,16 @@ import logging
 import re
 from typing import Any, Optional
 
-from .. import contracts
+from .. import contracts, prompts
 from ..contracts import Plan, PlanTask, PlanValidationError, validate_plan
 from ..db import (repo_alerts, repo_events, repo_tasks, repo_workflows)
-from ..db.conn import immediate
+from ..db.conn import immediate, iso_to_epoch
 
 log = logging.getLogger("clams.plan")
 
-PLAN_PROMPT = """You are the planning agent of Clams. Decompose the goal below \
-into 1-{max_tasks} sequential tasks for autonomous execution in a git worktree.
-
-Return ONLY a JSON object, no prose, matching:
-{{"tasks": [{{"title": str, "objective": str, "acceptance": str,
-"run": [str, ...], "writable": [glob, ...], "forbidden": [glob, ...],
-"depends_on": [sequence_index, ...]}}]}}
-
-Rules: tasks are ordered (sequence_index = position, 1-based); depends_on may \
-only reference earlier tasks; every task needs >=1 run command (shell, must \
-print output and exit 0 to pass) and >=1 writable glob; acceptance must be \
-objectively checkable.
-Keep each task SMALL: one focused change an agent can finish well under one \
-hour of tool work — split large features into several tasks rather than one. \
-Run commands execute in the executor container which has python3, pytest, \
-git and grep; they must be non-interactive and finish within 5 minutes.
-
-Goal (repo {repo}, base ref {base_ref}):
-{goal}
-"""
-
-REPAIR_SUFFIX = """
-
-IMPORTANT: your previous attempt was invalid: {error}
-Fix exactly that and return the corrected JSON object only — no prose.
-"""
-
-REPLAN_SUFFIX = """
-
-This is a REPLAN after a previous attempt failed. Prior task outcomes:
-{prior}
-Do not redo work already marked success; focus the new plan on what failed.
-"""
+# The prompt templates are operator-editable (UI Configuration tab ->
+# Prompts); the built-in defaults and the render/override machinery live in
+# clams.prompts.
 
 
 def extract_json(text: str) -> dict[str, Any]:
@@ -95,6 +65,57 @@ def build_brief(pt: PlanTask, repo: str, base_ref: str, settings) -> dict:
     }
 
 
+def failure_summary(result_json: Optional[str],
+                    error_log: Optional[str] = None) -> str:
+    """Compact 'why did this attempt fail' line from the evidence gate result.
+
+    Gate-check evidence beats a bare error_log: gate/env failures look
+    identical to code failures otherwise. Returns '' when nothing is known.
+    """
+    detail = ""
+    if result_json:
+        try:
+            res = json.loads(result_json)
+            ev = res.get("evidence") or {}
+            parts = []
+            for c in ev.get("checks", []):
+                if c.get("ok"):
+                    continue
+                cmd = str(c.get("cmd") or c.get("check") or "")[:100]
+                tail = [ln for ln in str(c.get("output_tail") or "")
+                        .splitlines() if ln.strip()]
+                last = f" | {tail[-1][:160]}" if tail else ""
+                parts.append(f"gate `{cmd}` exit "
+                             f"{c.get('exit', c.get('detail', '?'))}{last}")
+            if parts:
+                detail = "; ".join(parts[:3])[:400]
+            if not detail:
+                detail = str(ev.get("reason") or res.get("log_tail") or "")[:200]
+        except Exception:  # noqa: BLE001 - malformed result_json must not wedge anything
+            detail = ""
+    if not detail:
+        detail = (error_log or "")[:200]
+    return detail
+
+
+def _prior_task_line(t) -> str:
+    """One replan-context line per prior task: status, attempt budget,
+    duration, and WHY it failed."""
+    detail = failure_summary(t["result_json"], t["error_log"])
+    extra = f" (attempt {t['attempt']}/{t['max_attempts']}"
+    if t["started_at"] and t["updated_at"]:
+        try:
+            mins = (iso_to_epoch(t["updated_at"])
+                    - iso_to_epoch(t["started_at"])) / 60
+            if mins >= 1:
+                extra += f", ~{mins:.0f}m"
+        except Exception:  # noqa: BLE001
+            pass
+    extra += ")"
+    return (f"- [{t['status']}] {t['title']}{extra}"
+            + (f": {detail}" if detail else ""))
+
+
 def plan_workflow(conn, claudio_p, settings, workflow_id: str,
                   repo: str, base_ref: str = "main") -> str:
     """Plan one workflow. Returns new workflow status.
@@ -110,21 +131,12 @@ def plan_workflow(conn, claudio_p, settings, workflow_id: str,
     prior = repo_tasks.list_tasks(conn, workflow_id)
     prior_ctx = ""
     if prior:
-        lines = []
-        for t in prior:
-            detail = (t["error_log"] or "")[:200]
-            if not detail and t["result_json"]:
-                try:
-                    detail = str(json.loads(t["result_json"])
-                                 .get("log_tail", ""))[:200]
-                except Exception:  # noqa: BLE001
-                    detail = ""
-            lines.append(f"- [{t['status']}] {t['title']}"
-                         + (f": {detail}" if detail else ""))
-        prior_ctx = REPLAN_SUFFIX.format(prior="\n".join(lines))
-    base_prompt = (PLAN_PROMPT.format(max_tasks=settings.max_plan_tasks,
-                                      repo=repo, base_ref=base_ref,
-                                      goal=goal)
+        lines = [_prior_task_line(t) for t in prior]
+        prior_ctx = prompts.render(conn, "plan_replan",
+                                   prior="\n".join(lines))
+    base_prompt = (prompts.render(conn, "plan",
+                                  max_tasks=settings.max_plan_tasks,
+                                  repo=repo, base_ref=base_ref, goal=goal)
                    + prior_ctx)
     prompt = base_prompt
     errors: list[str] = []
@@ -144,7 +156,8 @@ def plan_workflow(conn, claudio_p, settings, workflow_id: str,
             plan = None
             # keep the full original prompt (goal + schema) — a bare error
             # message gives the model nothing to repair against
-            prompt = base_prompt + REPAIR_SUFFIX.format(error=errors[-1])
+            prompt = base_prompt + prompts.render(conn, "plan_repair",
+                                                  error=errors[-1])
     if plan is None:
         with immediate(conn):
             repo_workflows.set_status(conn, workflow_id, "blocked")

@@ -223,3 +223,19 @@ def test_sse_no_history_replay(client):
     th.join()
     data = [json.loads(l[6:]) for l in lines if l.startswith("data:")]
     assert [d["message"] for d in data] == ["new-one"]
+
+
+def test_prompts_catalog(client):
+    c, conn = client
+    r = c.get("/api/v1/prompts")
+    assert r.status_code == 200
+    names = {p["name"] for p in r.json()["prompts"]}
+    assert {"plan", "plan_repair", "plan_replan", "executor_task"} <= names
+    plan = next(p for p in r.json()["prompts"] if p["name"] == "plan")
+    assert plan["override"] is None and plan["effective"] == plan["default"]
+    # an override shows up
+    from clams import prompts
+    prompts.set_override(conn, "plan", "x {goal} {max_tasks} {repo} {base_ref}")
+    plan = next(p for p in c.get("/api/v1/prompts").json()["prompts"]
+                if p["name"] == "plan")
+    assert plan["override"].startswith("x ")

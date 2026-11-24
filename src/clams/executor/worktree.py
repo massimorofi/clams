@@ -178,6 +178,18 @@ class WorktreeManager:
         return n
 
     # ---------------------------------------------------------------- queries
+    def ref_exists(self, repo: str, ref: str) -> bool:
+        """True when the base clone has `ref` (branch/tag). Used to seed a
+        retry from the previous attempt's branch instead of base_ref."""
+        d = self.repo_dir(repo)
+        if not (d / ".git").exists():
+            return False
+        try:
+            _run(["git", "rev-parse", "--verify", "--quiet", ref], cwd=d)
+            return True
+        except GitError:
+            return False
+
     def head_commit(self, path: Path) -> str:
         return _run(["git", "rev-parse", "HEAD"], cwd=path).strip()
 

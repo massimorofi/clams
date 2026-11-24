@@ -20,7 +20,8 @@ export type CommandKind =
   | 'answer'
   | 'adhoc'
   | 'config_patch'
-  | 'settings_patch';
+  | 'settings_patch'
+  | 'prompt_patch';
 
 interface SubmitOptions {
   target?: string | null;

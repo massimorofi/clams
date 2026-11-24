@@ -181,6 +181,13 @@ def create_app(settings, *, claudio_p: Optional[ClaudioClient] = None,
         return {"editable": EDITABLE_SETTINGS, "effective": effective,
                 "overrides": overrides}
 
+    @app.get(f"{API_PREFIX}/prompts")
+    def prompts_catalog(ro: sqlite3.Connection = Depends(ro_dep)):
+        """Prompt templates: built-in defaults + operator overrides.
+        Edits go back through POST /commands kind=prompt_patch."""
+        from ..prompts import catalog
+        return {"prompts": catalog(ro)}
+
     # ---------------------------------------------------------- commands
     @app.post(f"{API_PREFIX}/commands", status_code=202)
     def post_command(body: CommandBody,

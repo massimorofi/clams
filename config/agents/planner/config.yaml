@@ -22,8 +22,8 @@ llm:
   fallback_model: null
   timeout_seconds: 86400
   retry_attempts: 3
-  price_input_per_mtok: 0.0
-  price_output_per_mtok: 0.0
+  price_input_per_mtok: 0
+  price_output_per_mtok: 0
   reasoning_effort: ''
 model_profiles:
   worker-halogen:
@@ -35,8 +35,8 @@ model_profiles:
     temperature: 0.2
     max_tokens: 16384
     context_window: 262144
-    price_input_per_mtok: 0.0
-    price_output_per_mtok: 0.0
+    price_input_per_mtok: 0
+    price_output_per_mtok: 0
     timeout_seconds: 1800
     reasoning_effort: ''
   fast-halogen:
@@ -48,8 +48,8 @@ model_profiles:
     temperature: 0.2
     max_tokens: 16384
     context_window: 262144
-    price_input_per_mtok: 0.0
-    price_output_per_mtok: 0.0
+    price_input_per_mtok: 0
+    price_output_per_mtok: 0
     timeout_seconds: 1800
     reasoning_effort: ''
 roles:
@@ -62,14 +62,19 @@ agent:
   instructions: null
   max_turns: 150
   max_auto_continues: 10
-  max_budget_usd: 100.0
+  max_budget_usd: 100
   max_model_calls: 0
   max_run_seconds: 0
   max_run_tokens: 0
   reasoning_effort_high: ''
   reasoning_effort_low: ''
-  approval_mode: on_request
-  host_execution_enabled: true
+  approval_mode: 'off'
+  # Clams never runs the host-executor side (no socket is mounted into this
+  # container), so host execution can only ever fail with
+  # "Host command execution failed: [Errno 2]". Commands run inside the agent
+  # container; orchestrator visibility comes from the read-only Clams API via
+  # the clams-control-plane skill (see skills_dir below).
+  host_execution_enabled: false
   host_execution_socket: /run/claudio-host/host-exec.sock
   default_workspace_dir: /workspace
   workspace_allowed_roots:
@@ -80,7 +85,9 @@ agent:
   max_output_chars: 8000
   strict_tools: false
   skills_enabled: true
-  skills_dir: ./skills
+  # absolute path inside the bind-mounted config dir (compose mounts
+  # ./config/agents/planner here), so skills live in the repo and survive rebuilds
+  skills_dir: /srv/claudio/claudio-backend/config/skills
   gortex_manifest_path: ''
   auto_routing_enabled: true
   router_deterministic_first: true
@@ -149,14 +156,14 @@ autonomous:
   health_check:
     enabled: true
     interval_minutes: 10
-    disk_warn_percent: 85.0
-    disk_crit_percent: 95.0
-    mem_crit_percent: 95.0
-    swap_warn_percent: 80.0
-    load_warn_factor: 1.0
-    load_crit_factor: 2.0
+    disk_warn_percent: 85
+    disk_crit_percent: 95
+    mem_crit_percent: 95
+    swap_warn_percent: 80
+    load_warn_factor: 1
+    load_crit_factor: 2
     backup_path: ''
-    backup_max_age_hours: 26.0
+    backup_max_age_hours: 26
     journal_lookback_minutes: 15
     script: ''
   maintenance:

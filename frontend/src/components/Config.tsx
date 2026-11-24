@@ -2,8 +2,9 @@ import { useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '../api';
 import { useCommand } from '../commands';
+import { Markdown } from './Markdown';
 import { Card, Empty, ErrorNote, Loading, SectionTitle, fmtDateTime } from './ui';
-import type { Project } from '../types';
+import type { Project, PromptInfo } from '../types';
 
 function enabledLabel(v: unknown): string {
   if (v === true || v === 1) return 'enabled';
@@ -244,6 +245,193 @@ function SettingsCard() {
   );
 }
 
+function PromptEditor({
+  prompt,
+  busy,
+  onDone,
+}: {
+  prompt: PromptInfo;
+  busy: boolean;
+  onDone: () => void;
+}) {
+  const { submit } = useCommand();
+  const [draft, setDraft] = useState(prompt.effective);
+  const dirty = draft !== prompt.effective;
+
+  async function save(template: string) {
+    await submit('prompt_patch', {
+      payload: { name: prompt.name, template },
+      label: `prompt: ${prompt.name}`,
+    });
+    onDone();
+  }
+
+  const btn =
+    'rounded-md px-3 py-1.5 text-sm font-medium disabled:cursor-not-allowed disabled:opacity-50';
+
+  return (
+    <div className="space-y-3 border-t border-slate-200 px-4 py-4 dark:border-slate-800">
+      <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
+        <div>
+          <span className="mb-1 block text-xs font-medium text-slate-500">
+            Edit (Markdown / plain text)
+          </span>
+          <textarea
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            spellCheck={false}
+            rows={16}
+            className={inputCls + ' resize-y leading-relaxed'}
+          />
+        </div>
+        <div>
+          <span className="mb-1 block text-xs font-medium text-slate-500">
+            Preview
+          </span>
+          <div className="h-full min-h-[24rem] overflow-auto rounded-md border border-slate-200 bg-slate-50 p-3 dark:border-slate-700 dark:bg-slate-900/60">
+            <Markdown text={draft} />
+          </div>
+        </div>
+      </div>
+      <div className="flex flex-wrap items-center gap-1.5">
+        <span className="text-xs text-slate-400">Placeholders:</span>
+        {prompt.placeholders.map((p) => (
+          <button
+            key={p}
+            type="button"
+            title={`Insert {${p}} at the end`}
+            onClick={() => setDraft((d) => `${d}{${p}}`)}
+            className="rounded border border-slate-300 px-1.5 py-0.5 font-mono text-[11px] text-slate-600 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
+          >
+            {`{${p}}`}
+          </button>
+        ))}
+      </div>
+      <div className="flex flex-wrap justify-end gap-2">
+        {prompt.override !== null && (
+          <button
+            onClick={() => void save('')}
+            disabled={busy}
+            className={btn + ' border border-amber-300 text-amber-700 hover:bg-amber-50 dark:border-amber-800 dark:text-amber-400 dark:hover:bg-amber-950'}
+          >
+            Revert to built-in default
+          </button>
+        )}
+        <button
+          onClick={onDone}
+          className={btn + ' border border-slate-300 text-slate-600 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800'}
+        >
+          Close
+        </button>
+        <button
+          onClick={() => void save(draft)}
+          disabled={!dirty || busy}
+          className={btn + ' bg-emerald-600 text-white hover:bg-emerald-700'}
+        >
+          {busy ? 'Submitting…' : 'Save'}
+        </button>
+      </div>
+      <p className="text-xs text-slate-400">
+        Saved templates are applied by the planner on the next cycle and take
+        effect from the next planning call / task dispatch onward. Tasks
+        already running keep the prompt they started with.
+      </p>
+    </div>
+  );
+}
+
+function PromptsCard() {
+  const { data, error, isLoading } = useQuery({
+    queryKey: ['prompts'],
+    queryFn: api.prompts,
+  });
+  const { pendingCount } = useCommand();
+  const [open, setOpen] = useState<string | null>(null);
+  const [showDefault, setShowDefault] = useState(false);
+
+  if (isLoading) return <Loading label="Loading prompts…" />;
+  if (error) return <ErrorNote error={error} />;
+  const prompts = data?.prompts ?? [];
+  const busy = pendingCount > 0;
+
+  return (
+    <Card>
+      <SectionTitle>Prompt templates ({prompts.length})</SectionTitle>
+      <p className="px-4 pb-3 text-xs text-slate-400">
+        Planner and executor prompts. Edit the Markdown and push it back to the
+        backend — overrides persist and are marked{' '}
+        <span className="text-emerald-500">•</span>. The JSON schema block in
+        the planner prompt must stay valid.
+      </p>
+      {prompts.length === 0 ? (
+        <Empty>No prompt templates exposed by the backend.</Empty>
+      ) : (
+        <div className="divide-y divide-slate-100 dark:divide-slate-800/60">
+          {prompts.map((p) => (
+            <div key={p.name}>
+              <button
+                type="button"
+                onClick={() => {
+                  setOpen(open === p.name ? null : p.name);
+                  setShowDefault(false);
+                }}
+                className="flex w-full items-center justify-between gap-3 px-4 py-3 text-left hover:bg-slate-50 dark:hover:bg-slate-800/40"
+              >
+                <span className="flex items-center gap-2 text-sm font-medium text-slate-800 dark:text-slate-100">
+                  {p.label}
+                  {p.override !== null && (
+                    <span className="text-emerald-500" title="customized">•</span>
+                  )}
+                </span>
+                <span className="flex items-center gap-2 text-xs text-slate-400">
+                  <span className="font-mono">{p.name}</span>
+                  <span>{open === p.name ? '▾' : '▸'}</span>
+                </span>
+              </button>
+              {open === p.name && (
+                <div className="px-4 pb-4">
+                  <p className="mb-2 text-xs text-slate-400">{p.description}</p>
+                  {!showDefault && p.override !== null && (
+                    <div className="mb-2 rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-800 dark:border-emerald-900 dark:bg-emerald-950 dark:text-emerald-300">
+                      Currently overridden — showing your custom template.
+                    </div>
+                  )}
+                  {showDefault ? (
+                    <div className="border-t border-slate-200 px-4 py-4 dark:border-slate-800">
+                      <pre className="overflow-auto whitespace-pre-wrap rounded-md bg-slate-100 p-3 font-mono text-xs text-slate-700 dark:bg-slate-800 dark:text-slate-300">
+                        {p.default}
+                      </pre>
+                      <button
+                        onClick={() => setShowDefault(false)}
+                        className="mt-2 rounded-md border border-slate-300 px-3 py-1.5 text-sm text-slate-600 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
+                      >
+                        Back to editor
+                      </button>
+                    </div>
+                  ) : (
+                    <PromptEditor
+                      key={`${p.name}:${open}`}
+                      prompt={p}
+                      busy={busy}
+                      onDone={() => setOpen(null)}
+                    />
+                  )}
+                  <button
+                    onClick={() => setShowDefault(true)}
+                    className="mt-2 text-xs text-slate-400 underline hover:text-slate-600 dark:hover:text-slate-300"
+                  >
+                    Show built-in default
+                  </button>
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </Card>
+  );
+}
+
 export function ConfigView() {
   const { data, error, isLoading } = useQuery({
     queryKey: ['projects'],
@@ -290,6 +478,7 @@ export function ConfigView() {
   return (
     <div className="space-y-4">
     <SettingsCard />
+    <PromptsCard />
     <Card>
       <SectionTitle
         right={

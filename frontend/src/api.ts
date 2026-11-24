@@ -5,6 +5,7 @@ import type {
   CommandRequest,
   Overview,
   Project,
+  PromptsCatalog,
   Question,
   TaskDetail,
   Transcript,
@@ -99,6 +100,8 @@ export const api = {
     request<Question[]>(`/questions?status=${encodeURIComponent(status)}`),
 
   config: () => request<ClamsConfig>('/config'),
+
+  prompts: () => request<PromptsCatalog>('/prompts'),
 
   projects: async (): Promise<Project[]> => {
     const raw = await request<unknown>('/projects');

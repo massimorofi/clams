@@ -160,3 +160,17 @@ export interface ClamsConfig {
   effective: Record<string, number | string>;
   overrides: Record<string, number | string>;
 }
+
+export interface PromptInfo {
+  name: string;
+  label: string;
+  description: string;
+  placeholders: string[];
+  default: string;
+  override: string | null;
+  effective: string;
+}
+
+export interface PromptsCatalog {
+  prompts: PromptInfo[];
+}

@@ -16,7 +16,7 @@ import time
 import uuid
 from typing import Any, Optional
 
-from .. import contracts
+from .. import contracts, prompts
 from ..bus import Bus, Delivered
 from ..claudio_client import ClaudioClient, ClaudioError, ClaudioUnavailable
 from .evidence import EvidenceGate
@@ -29,29 +29,39 @@ NEEDS_INPUT_RE = re.compile(
     re.MULTILINE)
 
 
+def prompt_vars(brief: contracts.Brief) -> dict:
+    """Placeholder values for the executor prompt template (clams.prompts)."""
+    forbidden_line = (
+        f"Forbidden paths (never touch): {', '.join(brief.forbidden)}\n"
+        if brief.forbidden else "")
+    answer_block = (
+        f"\nThe human answered your earlier question: {brief.answer}\n"
+        if brief.answer else "")
+    prior_failure_block = (
+        "PREVIOUS ATTEMPT FAILED THE EVIDENCE GATE:\n"
+        f"{brief.prior_failure}\n"
+        "The previous attempt's committed work is already on this branch — "
+        "inspect it first and fix exactly these failures instead of redoing "
+        "the task from scratch.\n\n"
+        if brief.prior_failure else "")
+    return {
+        "objective": brief.objective,
+        "acceptance": brief.acceptance,
+        "prior_failure_block": prior_failure_block,
+        "writable": ", ".join(brief.writable),
+        "forbidden_line": forbidden_line,
+        "run": "; ".join(brief.run),
+        "max_turns": brief.max_turns,
+        "answer_block": answer_block,
+    }
+
+
 def build_prompt(brief: contracts.Brief) -> str:
-    parts = [
-        f"Objective: {brief.objective}",
-        f"Acceptance criteria: {brief.acceptance}",
-        "",
-        "You work in the current directory (a git worktree). Commit all changes.",
-        f"Writable paths: {', '.join(brief.writable)}",
-    ]
-    if brief.forbidden:
-        parts.append(f"Forbidden paths (never touch): {', '.join(brief.forbidden)}")
-    parts += [
-        f"Verification commands that MUST pass: {'; '.join(brief.run)}",
-        f"Max turns: {brief.max_turns}.",
-    ]
-    if brief.answer:
-        parts += ["", f"The human answered your earlier question: {brief.answer}"]
-    parts += [
-        "",
-        "If you cannot proceed without a human decision, reply with a line",
-        "'NEEDS_INPUT: <question>' (optionally followed by 'OPTIONS: a | b').",
-        "Otherwise do the work and finish with a short summary.",
-    ]
-    return "\n".join(parts)
+    # the planner may ship an operator-edited template on the brief; the
+    # built-in default reproduces the historical prompt byte-for-byte
+    template = brief.prompt_template or prompts.PROMPTS["executor_task"].default
+    return prompts.render_template(template, "executor_task",
+                                   **prompt_vars(brief))
 
 
 def detect_needs_input(text: str) -> Optional[tuple[str, list[str]]]:
@@ -117,6 +127,17 @@ class ExecutorRunner:
             self._handle(d)
 
     # ---------------------------------------------------------------- handlers
+    def _retry_base(self, brief, task_id: str, attempt: int) -> str:
+        """Base ref for a new worktree: attempt N>1 seeds from attempt N-1's
+        branch when it exists (work reuse), else falls back to base_ref."""
+        if attempt > 1:
+            prev = self.wt.branch_name(task_id, attempt - 1)
+            if self.wt.ref_exists(brief.repo, prev):
+                log.info("task %s attempt %d: seeding from %s",
+                         task_id, attempt, prev)
+                return prev
+        return brief.base_ref
+
     def _handle(self, d: Delivered) -> None:
         try:
             msg = contracts.parse_message(d.payload)
@@ -143,8 +164,13 @@ class ExecutorRunner:
         session_ref = str(uuid.uuid4())
         worktree: Optional[Any] = None
         try:
+            # retry work reuse: seed attempt N>1 from attempt N-1's branch so
+            # correct work is kept and the agent fixes only what failed
+            # (live finding, claudio#58 T2: a 90-min committed attempt was
+            # redone from scratch because the retry started from base_ref)
+            base = self._retry_base(brief, msg.task_id, msg.attempt)
             worktree, branch = self.wt.add(brief.repo, msg.task_id,
-                                           msg.attempt, brief.base_ref)
+                                           msg.attempt, base)
         except Exception as exc:  # noqa: BLE001
             self._emit_result(msg, "failed", session_ref="", branch="",
                               evidence={"reason": f"worktree: {exc}"},
