@@ -192,6 +192,148 @@ def create_task(conn: sqlite3.Connection, workflow_id: str, sequence_index: int,
     return task_id
 
 
+def reconcile_plan(conn: sqlite3.Connection, workflow_id: str,
+                   planned: list[dict[str, Any]]) -> dict[str, Any]:
+    """Apply a (re)plan to ``workflow_id`` in place, preserving task identity.
+
+    Why not delete-and-reinsert: ``delete_workflow_tasks`` mints brand-new
+    ``task_id``s on every replan, so the outbox key
+    ``gh:gh_subissue:<task_id>:created`` looks unseen and GitHub mints a
+    duplicate sub-issue for work that already has one. Identity here is
+    ``normalize_plan_key(title)``: a plan entry that matches an existing row
+    UPDATES that row and keeps its ``task_id`` (and therefore its
+    ``gh_issue_number``) forever.
+
+    Rules:
+      * matched entry -> UPDATE in place of sequence_index, objective,
+        acceptance, brief_json, depends_on, max_attempts, plan_key,
+        updated_at. ``task_id``, ``gh_issue_number`` and ``status`` are never
+        written by a match.
+      * duplicate plan_keys inside ONE incoming plan collapse; first wins.
+      * existing rows whose plan_key is absent from the new plan are reported
+        as ``stale`` and set to 'cancelled' unless already terminal. Nothing is
+        ever DELETEd here (that is what keeps GitHub sub-issues mapped).
+      * unmatched entries are inserted via ``create_task``.
+
+    ``sequence_index`` is UNIQUE per workflow, so renumbering runs in two
+    passes: matched rows are first parked on private scratch indices (a
+    re-ordered plan can never transiently collide with itself), then written
+    back in ascending order. A leftover cancelled row sitting on a needed slot
+    is parked too — its row stays, only its ordering slot moves.
+
+    Stdlib only (sqlite3/json), like the rest of this module. The caller owns
+    the transaction (wrap in ``conn.immediate``), as elsewhere here.
+
+    Note a re-added title matches its cancelled row and is therefore NOT
+    resurrected: status is left alone, so reviving planned work stays an
+    explicit decision for the caller (planner side, out of scope here).
+
+    Returns {'created': [task_id...], 'reused': {plan_key: task_id},
+             'stale': [task_id...]}.
+    """
+    rows = list_tasks(conn, workflow_id)
+
+    def row_key(row: sqlite3.Row) -> str:
+        # rows predating migration 009 may have a NULL plan_key
+        return row["plan_key"] or normalize_plan_key(row["title"])
+
+    # winner per plan_key: list_tasks is ORDER BY sequence_index, so the
+    # lowest sequence_index wins, matching the dedupe rule in 009.
+    existing: dict[str, sqlite3.Row] = {}
+    for r in rows:
+        existing.setdefault(row_key(r), r)
+
+    entries: dict[str, dict[str, Any]] = {}
+    for entry in (planned or []):
+        key = normalize_plan_key(str(entry.get("title") or ""))
+        if key not in entries:          # duplicate plan_key: first occurrence wins
+            entries[key] = entry
+
+    def as_int(value: Any, default: int) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    now = utcnow_s()
+    scratch = min([0] + [r["sequence_index"] for r in rows]) - 1
+
+    def park(task_id: str) -> None:
+        """Move a row off the sequence_index ladder onto a private slot."""
+        nonlocal scratch
+        scratch -= 1
+        conn.execute("UPDATE tasks SET sequence_index=?, updated_at=? "
+                     "WHERE task_id=?", (scratch, now, task_id))
+
+    def vacate(seq: int, keep: Optional[str]) -> None:
+        """Free ``seq``: whoever else in this workflow holds it gets parked."""
+        sql = ("SELECT task_id FROM tasks WHERE workflow_id=? AND sequence_index=?"
+               + (" AND task_id<>?" if keep else ""))
+        vals: list[Any] = [workflow_id, seq] + ([keep] if keep else [])
+        holder = conn.execute(sql, vals).fetchone()
+        if holder is not None:
+            park(holder["task_id"])
+
+    taken: set[int] = set()
+
+    def target_seq(entry: dict[str, Any], fallback: int) -> int:
+        seq = as_int(entry.get("sequence_index"), fallback)
+        while seq in taken:            # malformed plan: two entries, one slot
+            seq += 1
+        taken.add(seq)
+        return seq
+
+    created: list[str] = []
+    reused: dict[str, str] = {}
+    stale: list[str] = []
+
+    # 1. stale first (status only; the row stays)
+    for r in rows:
+        key = row_key(r)
+        if key in entries and existing.get(key) is r:
+            continue
+        stale.append(r["task_id"])
+        if r["status"] not in TERMINAL:
+            conn.execute("UPDATE tasks SET status='cancelled', updated_at=? "
+                         "WHERE task_id=?", (now, r["task_id"]))
+
+    matched = [(k, e) for k, e in entries.items() if k in existing]
+    fresh = [(k, e) for k, e in entries.items() if k not in existing]
+
+    # 2. park the matched rows so pass 3 can write any numbering it likes
+    for k, _e in matched:
+        park(existing[k]["task_id"])
+
+    # 3. update matched rows in place
+    for i, (key, entry) in enumerate(matched, start=1):
+        row = existing[key]
+        seq = target_seq(entry, i)
+        vacate(seq, row["task_id"])
+        conn.execute(
+            "UPDATE tasks SET sequence_index=?, objective=?, acceptance=?, "
+            "brief_json=?, depends_on=?, max_attempts=?, plan_key=?, "
+            "updated_at=? WHERE task_id=?",
+            (seq, str(entry.get("objective") or ""),
+             str(entry.get("acceptance") or ""),
+             json.dumps(entry.get("brief") or {}),
+             json.dumps([as_int(d, 0) for d in (entry.get("depends_on") or [])]),
+             as_int(entry.get("max_attempts"), 3), key, now, row["task_id"]))
+        reused[key] = row["task_id"]
+
+    # 4. everything else is new
+    for i, (key, entry) in enumerate(fresh, start=1):
+        seq = target_seq(entry, i)
+        vacate(seq, None)
+        created.append(create_task(
+            conn, workflow_id, seq, str(entry.get("title") or ""),
+            str(entry.get("objective") or ""), str(entry.get("acceptance") or ""),
+            entry.get("brief") or {},
+            [as_int(d, 0) for d in (entry.get("depends_on") or [])],
+            as_int(entry.get("max_attempts"), 3)))
+
+    return {"created": created, "reused": reused, "stale": stale}
+
+
 def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[sqlite3.Row]:
     return conn.execute("SELECT * FROM tasks WHERE task_id=?",
                         (task_id,)).fetchone()
