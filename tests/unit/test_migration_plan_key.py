@@ -26,6 +26,7 @@ from clams.db.repo_tasks import normalize_plan_key
 ROOT = Path(__file__).resolve().parents[2]
 MIGRATIONS_DIR = ROOT / "migrations"
 MIGRATION_009 = MIGRATIONS_DIR / "009_task_plan_key.sql"
+MIGRATION_010 = MIGRATIONS_DIR / "010_outbox_gh_close.sql"
 
 
 # --------------------------------------------------------------------- helpers
@@ -68,9 +69,11 @@ def test_migrate_adds_plan_key_column(db_path):
         _apply_migrations_through(conn, 8)
         assert schema_version(conn) == 8
         assert "plan_key" not in _columns(conn)
-        assert migrate(conn) == [MIGRATION_009.name]
+        # migrate() applies every pending migration, so 010 (outbox
+        # gh_close kind) rides along with the 009 this test targets.
+        assert migrate(conn) == [MIGRATION_009.name, MIGRATION_010.name]
         assert "plan_key" in _columns(conn)
-        assert schema_version(conn) == 9
+        assert schema_version(conn) == 10
     finally:
         conn.close()
 
@@ -137,7 +140,7 @@ def test_index_is_non_unique_and_backfill_runs(db_path):
             "VALUES('legacy-2', ?, 2, 'Legacy   Task', 'o', 'a', '{}', "
             "'pending')",
             (wf,))
-        assert migrate(conn) == [MIGRATION_009.name]
+        assert migrate(conn) == [MIGRATION_009.name, MIGRATION_010.name]
         # backfill is lower(trim(title)): SQLite cannot collapse internal runs,
         # so only padding is normalized on pre-existing rows. create_task()
         # writes the canonical normalize_plan_key() value from here on.

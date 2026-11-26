@@ -4,7 +4,9 @@ outbox with idempotency key ``gh:<kind>:<task_id>:<attempt>:<state>``.
 Sub-issue lifecycle keys are the exception to the ``<attempt>:<state>`` shape
 and are fixed, because replan/plan passes re-run them and must dedupe:
 ``gh:gh_subissue:<task_id>:created`` (provision) and
-``gh:gh_subissue:<task_id>:closed`` (close after a replan superseded the task).
+``gh:gh_subissue:<task_id>:closed`` (close after the task succeeded or a
+replan superseded it — a task is one or the other, never both, so the two
+close paths share the key without colliding).
 """
 from __future__ import annotations
 
@@ -127,9 +129,23 @@ def project_tasks_superseded(conn, workflow_id: str, repo: str,
     return n
 
 
+SUCCESS_CLOSE_COMMENT = (
+    "Task succeeded.\n\n"
+    "Task `{task_id}` (workflow `{workflow_id}`) passed the evidence gate "
+    "and its work is on the base branch, so this sub-issue is being closed "
+    "automatically. The parent workflow issue carries the overall status.\n")
+
+
 def project_task_state(conn, task_id: str, repo: str, state: str,
                        attempt: int) -> None:
-    """Mirror a task's terminal state onto its sub-issue (labels + comment)."""
+    """Mirror a task's terminal state onto its sub-issue (labels + comment).
+
+    A successful task also *closes* its sub-issue: the work is merged, and an
+    open ``status:Done`` child under a closed parent is backlog clutter (live
+    finding: clams#136's own sub-issues #139-#144). The close shares the
+    supersede key ``gh:gh_subissue:<task_id>:closed`` — reconcile only marks
+    non-terminal tasks stale, so a succeeded task is never also superseded.
+    """
     t = repo_tasks.get_task(conn, task_id)
     if t is None or not t["gh_issue_number"]:
         return
@@ -140,6 +156,14 @@ def project_task_state(conn, task_id: str, repo: str, state: str,
         repo_outbox.enqueue(
             conn, "gh_label",
             {"repo": repo, "issue": t["gh_issue_number"], "labels": [label],
+             "idempotency_key": key}, idempotency_key=key)
+    if state == "success":
+        key = f"gh:gh_subissue:{task_id}:closed"
+        repo_outbox.enqueue(
+            conn, "gh_close",
+            {"repo": repo, "issue": t["gh_issue_number"],
+             "comment": SUCCESS_CLOSE_COMMENT.format(
+                 task_id=task_id, workflow_id=t["workflow_id"]),
              "idempotency_key": key}, idempotency_key=key)
 
 

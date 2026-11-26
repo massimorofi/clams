@@ -136,6 +136,9 @@ Projection details:
 - **Sub-issues**: created per task via GraphQL `addSubIssue`, labelled
   `clams:task` + `status:In Progress`; task state changes move their labels
   (success→`status:Done`, failed→`status:Blocked`, waiting_input→`status:Review`).
+  A successful task also **closes** its sub-issue via `gh_close` (the work is
+  merged; an open `status:Done` child under a closed parent is clutter).
+  Replan-superseded tasks get the same close with a "Superseded" comment.
 - **Comments** (question asked, workflow done/blocked) embed an
   `<!-- gh:…:idempotency-key -->` marker so a relay crash between the GitHub
   call and the mark-sent never duplicates a comment.

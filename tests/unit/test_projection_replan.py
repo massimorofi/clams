@@ -282,3 +282,43 @@ def test_replan_with_nothing_stale_enqueues_nothing(db, wf):
     res = _replan(db, wf, _plan(["alpha"]))
     assert res["stale"] == []
     assert _rows(db, "gh_close") == []
+
+
+# ----------------------------------------------- close on task success
+def test_success_closes_subissue(db, wf):
+    """A succeeded task's sub-issue is closed via gh_close on the fixed
+    supersede key (live finding: clams#136's own sub-issues stayed open)."""
+    t = _task(db, wf, 1, "task-1")
+    _stamp(db, t, 201)
+    projection.project_task_state(db, t, REPO, "success", 1)
+    rows = _payloads(db, "gh_close")
+    assert [r["issue"] for r in rows] == [201]
+    assert "succeeded" in rows[0]["comment"]
+    # idempotent: re-running the projection enqueues nothing new
+    projection.project_task_state(db, t, REPO, "success", 1)
+    assert len(_rows(db, "gh_close")) == 1
+
+
+def test_failed_task_labels_but_does_not_close(db, wf):
+    t = _task(db, wf, 1, "task-1")
+    _stamp(db, t, 202)
+    projection.project_task_state(db, t, REPO, "failed", 1)
+    assert _rows(db, "gh_close") == []
+    labels = _payloads(db, "gh_label")
+    assert labels and labels[0]["issue"] == 202
+
+
+def test_success_without_subissue_is_noop(db, wf):
+    t = _task(db, wf, 1, "task-1")   # never provisioned a sub-issue
+    projection.project_task_state(db, t, REPO, "success", 1)
+    assert _rows(db, "gh_close") == []
+
+
+def test_supersede_and_success_close_share_key(db, wf):
+    """One task, one close: the success close and the supersede close use the
+    same fixed key, so whichever fires first wins and the other dedupes."""
+    t = _task(db, wf, 1, "task-1")
+    _stamp(db, t, 203)
+    projection.project_task_state(db, t, REPO, "success", 1)
+    projection.project_tasks_superseded(db, wf, REPO, [t])
+    assert len(_rows(db, "gh_close")) == 1
