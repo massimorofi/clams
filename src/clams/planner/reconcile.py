@@ -8,12 +8,16 @@ unseen and GitHub issued a duplicate sub-issue for work that already had one.
 
 This module is the single place that turns a *planned* list of plain dicts into
 DB writes: it delegates the identity-preserving merge to
-``repo_tasks.reconcile_plan`` and appends one summary event.
+``repo_tasks.reconcile_plan``, appends one summary event, and hands the
+superseded task ids to the GitHub projection so their sub-issues get closed.
 
 Deliberately stdlib-only: it imports nothing from pydantic, ``clams.github``
 or ``clams.planner.plan`` (the latter would import the planner's LLM/prompt
 machinery into every caller of a replan). Callers build the ``brief`` dict
-themselves (``plan.build_brief``) and pass plain dicts in.
+themselves (``plan.build_brief``) and pass plain dicts in. The one exception is
+the projection call below, which is resolved at *call* time (``__import__``,
+not an ``import`` statement) so this module keeps its import-time shape while a
+replan still mirrors cancellations to GitHub.
 
 Entry dict keys understood by ``reconcile_plan``:
     title, objective, acceptance, brief, depends_on, max_attempts,
@@ -50,6 +54,32 @@ def _with_sequence_indices(
             e["sequence_index"] = i
         out.append(e)
     return out
+
+
+def _project_superseded(conn: sqlite3.Connection, workflow_id: str,
+                        stale: list[str]) -> int:
+    """Close the sub-issues of the tasks this replan superseded (best effort).
+
+    ``clams.github.projection`` is resolved at *call* time (``__import__``
+    rather than an ``import`` statement) so this module keeps the import-light
+    shape asserted by ``tests/unit/test_planner_reconcile.py`` while a replan
+    still mirrors its cancellations to GitHub - an ``import clams.github`` here
+    would pull ``httpx`` into every caller of a replan.
+
+    Every failure is swallowed on purpose: a workflow with no
+    ``gh_issue_number``, no project row, or no GitHub config at all must not
+    turn an already-committed replan into a failed command. Returns the number
+    of outbox rows enqueued (0 when there is nothing to mirror).
+    """
+    if not stale:
+        return 0
+    try:
+        projection = __import__("clams.github.projection",
+                                fromlist=["project_tasks_superseded"])
+        return projection.project_tasks_superseded(conn, workflow_id, "",
+                                                   stale)
+    except Exception:  # noqa: BLE001 - mirroring must never fail a replan
+        return 0
 
 
 def apply_replanned_plan(conn: sqlite3.Connection, workflow_id: str,
@@ -98,6 +128,12 @@ def apply_replanned_plan(conn: sqlite3.Connection, workflow_id: str,
         f"replan: reused {len(reused)}, created {len(created)}, "
         f"cancelled {len(cancelled)}",
         data)
+
+    # GitHub mirror: a cancelled task keeps its row *and* its sub-issue number,
+    # so the sub-issue has to be closed explicitly or it sits open on the board
+    # claiming work the replan dropped. Guarded - projection is best-effort and
+    # a workflow without gh_issue_number / project config must not raise here.
+    _project_superseded(conn, workflow_id, cancelled)
 
     return {"created": created, "reused": reused, "cancelled": cancelled,
             "stale": cancelled, "reused_count": len(reused),
