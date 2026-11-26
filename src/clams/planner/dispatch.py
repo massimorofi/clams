@@ -10,7 +10,8 @@ import json
 import logging
 
 from .. import contracts
-from ..db import repo_events, repo_outbox, repo_tasks, repo_workflows
+from ..db import (repo_attempts, repo_events, repo_outbox, repo_tasks,
+                  repo_workflows)
 from ..db.conn import immediate
 
 log = logging.getLogger("clams.dispatch")
@@ -50,12 +51,16 @@ def dispatch_ready(conn, bus, settings) -> list[str]:
             override = get_override(conn, "executor_task")
             if override:
                 brief["prompt_template"] = override
-            # retry work reuse: tell attempt N>1 exactly why attempt N-1
-            # failed the gate (the executor seeds from its branch)
+            # retry work reuse: tell attempt N>1 why every earlier attempt
+            # failed the gate (the executor seeds from the previous branch).
+            # Cumulative history from task_attempts (#2); falls back to the
+            # last-result summary for tasks that predate the attempt table.
             if claimed["attempt"] > 1:
-                from .plan import failure_summary
-                fs = failure_summary(claimed["result_json"],
-                                     claimed["error_log"])
+                fs = repo_attempts.cumulative_retry_summary(conn, task_id)
+                if not fs:
+                    from .plan import failure_summary
+                    fs = failure_summary(claimed["result_json"],
+                                         claimed["error_log"])
                 if fs:
                     brief["prior_failure"] = fs
             msg = contracts.TaskDispatch(

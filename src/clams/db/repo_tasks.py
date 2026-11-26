@@ -18,6 +18,7 @@ import uuid
 from typing import Any, Optional
 
 from .conn import plus_s, utcnow_s, epoch_to_iso
+from . import repo_attempts
 
 TASK_STATUSES = ('pending', 'ready', 'dispatched', 'running', 'waiting_input',
                  'success', 'failed', 'blocked', 'cancelled')
@@ -383,27 +384,43 @@ def on_result(conn: sqlite3.Connection, task_id: str, attempt: int,
         "commit_sha": result.get("commit_sha") or "",
         "branch": result.get("branch") or "",
     }
-    if outcome == "success" and gate_passed:
-        return transition(conn, task_id, "success", **extra)
-    if outcome == "needs_input":
-        return transition(conn, task_id, "waiting_input", **extra)
     config_class = error_code.startswith(CONFIG_CLASS_ERRORS)
-    if error_code.startswith(INFRA_ERROR_CODES):
+    if outcome == "success" and gate_passed:
+        dst = "success"
+    elif outcome == "needs_input":
+        dst = "waiting_input"
+    elif error_code.startswith(INFRA_ERROR_CODES):
         # infra fault: free requeue, attempt preserved (give back the number
-        # claim_for_dispatch took at claim time)
+        # claim_for_dispatch took at claim time). Deliberately NOT recorded in
+        # task_attempts: the attempt number is reused, so a row here would
+        # collide with — and suppress — the real result of the retried run.
         extra["lease_token"] = None
         extra["lease_expires_at"] = None
         extra["executor_id"] = None
         extra["attempt"] = max(0, row["attempt"] - 1)
         return transition(conn, task_id, "ready", **extra)
-    # failed / gate fail: retry if attempts remain (config-class never does)
-    if not config_class and row["attempt"] < row["max_attempts"]:
+    elif not config_class and row["attempt"] < row["max_attempts"]:
+        # failed / gate fail: retry while attempts remain (config-class never)
         extra["lease_token"] = None
         extra["lease_expires_at"] = None
         extra["executor_id"] = None
-        return transition(conn, task_id, "ready", **extra)
-    extra["error_log"] = str(result.get("log_tail", ""))[:4000]
-    return transition(conn, task_id, "failed", **extra)
+        dst = "ready"
+    else:
+        extra["error_log"] = str(result.get("log_tail", ""))[:4000]
+        dst = "failed"
+    # append-only attempt history (#2): same fenced transaction as the
+    # transition above; idempotent on (task_id, attempt_no) so a replayed
+    # result event can neither duplicate nor overwrite the recorded evidence.
+    repo_attempts.record_attempt(
+        conn, task_id=task_id, workflow_id=row["workflow_id"],
+        attempt_no=attempt, lease_token=lease_token, status=dst,
+        failure_class=repo_attempts.classify_failure(outcome, gate_passed,
+                                                     error_code),
+        checks=repo_attempts.failed_checks(result), result=result,
+        error_excerpt=str(result.get("log_tail") or error_code or ""),
+        branch_name=str(result.get("branch") or ""),
+        commit_sha=str(result.get("commit_sha") or ""))
+    return transition(conn, task_id, dst, **extra)
 
 
 def transition_fenced(conn: sqlite3.Connection, task_id: str, attempt: int,
