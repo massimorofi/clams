@@ -6,6 +6,7 @@
 - [4. Labels Clams creates](#4-labels-clams-creates)
 - [5. Workflow: gestures & projection](#5-workflow-gestures--projection)
 - [6. Failure modes & verification](#6-failure-modes--verification)
+- [7. Replan and sub-issue idempotency](#7-replan-and-sub-issue-idempotency)
 
 ---
 
@@ -151,3 +152,47 @@ Projection details:
 | Sub-issues missing on old workflows | fixed in `372db6a`/`a991ac4` — rebuild the planner |
 | 403 secondary rate limit | Clams backs off automatically; reduce polling by raising `CLAMS_INTAKE_EVERY_N_CYCLES` |
 | Verify live | `docker exec clams-planner-1 sqlite3 /data/clams.db "SELECT gh_project_node_id,status_field_id,ready_option_id FROM projects;"` — all three non-NULL for a board project |
+
+
+## 7. Replan and sub-issue idempotency
+
+**Invariant: a replan reconciles by `plan_key`, never by `task_id`.** Unchanged
+tasks keep their sub-issue, removed tasks get their sub-issue closed, and only
+genuinely new tasks create one.
+
+Concretely, for a workflow whose parent issue exists (`workflows.gh_issue_number`
+is set):
+
+| Plan entry after the replan | Task row | GitHub sub-issue |
+|---|---|---|
+| title still in the plan | `UPDATE`d in place — same `task_id`, same `gh_issue_number` | untouched, no new outbox row |
+| title no longer in the plan | `cancelled` (never `DELETE`d) | exactly one `gh_close` for its issue |
+| title not seen before | inserted | exactly one `gh_subissue` (`:created`) |
+
+`plan_key` is `repo_tasks.normalize_plan_key(title)` — title stripped, internal
+whitespace runs collapsed, casefolded (`'  Fix   Replan Dedupe '` →
+`'fix replan dedupe'`). The title is the one field the planner reproduces across
+replans, which is what makes it usable as a stable identity.
+
+Why the key matters: the outbox dedupes sub-issue projections on
+`gh:gh_subissue:<task_id>:created`. A replan that deletes and re-inserts task
+rows mints a fresh `task_id` for identical work, so that key looks never-seen and
+GitHub mints a duplicate sub-issue. Reconciling by `plan_key` keeps the
+`task_id` — and therefore the idempotency key — stable, so a replan of an
+unchanged plan enqueues nothing at all.
+
+Guarantees this buys:
+
+- **N replans of the same plan produce 1 sub-issue per task.** Re-running
+  `apply_replanned_plan` with the same titles is a no-op for projection
+  (`project_tasks_created` returns 0).
+- **No orphans.** The number of `gh_subissue` `:created` rows equals the number
+  of distinct `plan_key`s ever planned, and every still-open sub-issue belongs to
+  a live task.
+- **Idempotent on retry.** Both `project_tasks_created` and
+  `project_tasks_superseded` dedupe on their outbox key, so a planner crash
+  between enqueue and send cannot double-project.
+
+Enforced by `tests/unit/test_replan_no_duplicate_issues.py` (regression test for
+issue #133, where a parent issue accumulated ~27 mostly-duplicated children).
+See `reports/replan_duplicate_issues_fix.md`.
