@@ -295,3 +295,46 @@ def test_settings_patch_rejects_unknown_and_out_of_range(db):
         "SELECT status FROM commands WHERE kind='settings_patch' "
         "ORDER BY command_id")]
     assert statuses == ["rejected", "rejected"]
+
+
+def test_retry_reopens_blocked_workflow(db):
+    """claudio#133: review_workflow returns early for 'blocked', so a retried
+    task could never drive its workflow back to done/replan."""
+    wf, t = _wf_with_task(db, status="blocked")
+    repo_tasks.transition(db, t, "failed")
+    repo_commands.insert_command(db, "retry", {}, "op", target=t)
+    _drain(db)
+    assert repo_tasks.get_task(db, t)["status"] == "ready"
+    assert repo_workflows.get_workflow(db, wf)["status"] == "running"
+
+
+def test_retry_unblocks_cascade_blocked_dependents(db):
+    """The gap: block_dependents strands 2 and 3, and nothing ever undid it,
+    so retrying task 1 revived the head of the chain only."""
+    pid = repo_projects.upsert_project(db, "o/r")
+    wf = repo_workflows.create_workflow(db, pid, "adhoc", "goal")
+    brief = {"objective": "o", "acceptance": "a", "run": ["echo x"],
+             "writable": ["*.py"], "repo": "o/r"}
+    t1 = repo_tasks.create_task(db, wf, 1, "a", "o", "a", brief)
+    t2 = repo_tasks.create_task(db, wf, 2, "b", "o", "a", brief, depends_on=[1])
+    t3 = repo_tasks.create_task(db, wf, 3, "c", "o", "a", brief, depends_on=[2])
+    for st in ("ready", "dispatched", "running", "failed"):
+        repo_tasks.transition(db, t1, st)
+    from clams.planner.review import strand_dependents
+    strand_dependents(db, wf)
+    assert repo_tasks.get_task(db, t2)["status"] == "blocked"
+    assert repo_tasks.get_task(db, t3)["status"] == "blocked"
+
+    repo_commands.insert_command(db, "retry", {}, "op", target=t1)
+    _drain(db)
+    for st in ("dispatched", "running", "success"):
+        repo_tasks.transition(db, t1, st)
+    repo_tasks.promote_ready(db)
+    assert repo_tasks.get_task(db, t2)["status"] == "ready"
+    # ordering holds: 3 still waits on 2, it must not jump the queue
+    assert repo_tasks.get_task(db, t3)["status"] == "blocked"
+
+    for st in ("dispatched", "running", "success"):
+        repo_tasks.transition(db, t2, st)
+    repo_tasks.promote_ready(db)
+    assert repo_tasks.get_task(db, t3)["status"] == "ready"

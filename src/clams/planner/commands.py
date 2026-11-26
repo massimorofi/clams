@@ -87,6 +87,14 @@ def _apply(conn, row, *, adhoc_handler=None, gh_client=None,
             "WHERE task_id=?", (task["task_id"],))
         repo_events.append_event(conn, "task", task["task_id"], "info",
                                  f"retried by {issuer}")
+        # A retry re-opens the workflow it came from. review_workflow returns
+        # early for 'blocked', so without this the workflow could never reach
+        # done/replan again even after every task succeeded.
+        wf = repo_workflows.get_workflow(conn, task["workflow_id"])
+        if wf is not None and wf["status"] == "blocked":
+            repo_workflows.set_status(conn, wf["workflow_id"], "running")
+            repo_events.append_event(conn, "workflow", wf["workflow_id"],
+                                     "info", f"reopened by retry from {issuer}")
         return {"task": task["task_id"], "status": "ready"}
 
     if kind == "answer":

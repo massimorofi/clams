@@ -10,7 +10,7 @@ import json
 import logging
 
 from .. import contracts
-from ..db import repo_events, repo_outbox, repo_tasks
+from ..db import repo_events, repo_outbox, repo_tasks, repo_workflows
 from ..db.conn import immediate
 
 log = logging.getLogger("clams.dispatch")
@@ -22,6 +22,18 @@ def dispatch_ready(conn, bus, settings) -> list[str]:
         promoted = repo_tasks.promote_ready(conn)
         for tid in promoted:
             repo_events.append_event(conn, "task", tid, "info", "ready")
+        # A promotion can mean a stranded workflow is live again: an operator
+        # retry let unblock_stranded revive cascade-blocked dependents.
+        # review_workflow returns early for 'blocked', so without this the
+        # workflow could never reach done/replan however many tasks then
+        # succeeded (claudio#133).
+        for wf_id in {repo_tasks.get_task(conn, tid)["workflow_id"]
+                      for tid in promoted}:
+            wf = repo_workflows.get_workflow(conn, wf_id)
+            if wf is not None and wf["status"] == "blocked":
+                repo_workflows.set_status(conn, wf_id, "running")
+                repo_events.append_event(conn, "workflow", wf_id, "info",
+                                         "reopened: dependents unblocked")
     dispatched: list[str] = []
     for row in repo_tasks.by_status(conn, "ready"):
         task_id = row["task_id"]

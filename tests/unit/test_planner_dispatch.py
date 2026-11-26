@@ -70,3 +70,24 @@ def test_dispatch_after_retry_reset_republishes(db):
     pubs = db.execute("SELECT COUNT(*) AS n FROM outbox "
                       "WHERE kind='bus_publish'").fetchone()["n"]
     assert pubs == 2  # original + retry republish
+
+
+def test_dispatch_reopens_workflow_when_dependents_unblock(db):
+    """claudio#133: a retry revived the head task and unblock_stranded revived
+    its dependents, but the workflow stayed 'blocked' — so review_workflow
+    skipped it forever and it could never reach done, however many tasks then
+    succeeded."""
+    s = Settings(_env_file=None)
+    bus = InMemoryBus()
+    wf, (t1, t2) = _wf_tasks(db)
+    for st in ("ready", "dispatched", "running", "failed"):
+        repo_tasks.transition(db, t1, st)
+    from clams.planner.review import strand_dependents
+    strand_dependents(db, wf)
+    repo_workflows.set_status(db, wf, "blocked")
+    assert repo_tasks.get_task(db, t2)["status"] == "blocked"
+
+    db.execute("UPDATE tasks SET status='success' WHERE task_id=?", (t1,))
+    got = dispatch_ready(db, bus, s)
+    assert t2 in got
+    assert repo_workflows.get_workflow(db, wf)["status"] == "running"

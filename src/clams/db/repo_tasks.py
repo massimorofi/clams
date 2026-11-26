@@ -108,6 +108,43 @@ def block_dependents(conn: sqlite3.Connection, workflow_id: str) -> list[str]:
             return blocked
 
 
+def unblock_stranded(conn: sqlite3.Connection, workflow_id: str) -> list[str]:
+    """blocked -> pending once every dependency has reached 'success'.
+
+    Mirror of ``block_dependents``. An operator retry (or a late success)
+    repairs the dependency graph, but nothing undid the cascade block, so a
+    retried task's dependents stayed 'blocked' forever: ``promote_ready`` only
+    looks at 'pending', and ``review_workflow`` skips blocked workflows, so no
+    later pass could rescue them. Back to 'pending' rather than straight to
+    'ready' so the single existing promotion rule (``deps_satisfied``) stays
+    authoritative about ordering. Direct UPDATE, as in block_dependents.
+    """
+    unblocked: list[str] = []
+    while True:
+        rows = conn.execute(
+            "SELECT task_id, depends_on FROM tasks "
+            "WHERE workflow_id=? AND status='blocked'",
+            (workflow_id,)).fetchall()
+        progressed = False
+        for r in rows:
+            deps = json.loads(r["depends_on"])
+            if deps:
+                marks = ",".join("?" * len(deps))
+                n = conn.execute(
+                    f"SELECT COUNT(*) n FROM tasks WHERE workflow_id=? "
+                    f"AND status='success' AND sequence_index IN ({marks})",
+                    (workflow_id, *deps)).fetchone()["n"]
+                if n != len(deps):
+                    continue
+            conn.execute(
+                "UPDATE tasks SET status='pending', updated_at=? "
+                "WHERE task_id=?", (utcnow_s(), r["task_id"]))
+            unblocked.append(r["task_id"])
+            progressed = True
+        if not progressed:
+            return unblocked
+
+
 def delete_workflow_tasks(conn: sqlite3.Connection, workflow_id: str) -> int:
     """Delete every task of a workflow (replan swap). Questions first: their
     FK to tasks has no cascade. Caller must hold the transaction."""
@@ -177,7 +214,12 @@ def deps_satisfied(conn: sqlite3.Connection, row: sqlite3.Row) -> bool:
 
 
 def promote_ready(conn: sqlite3.Connection) -> list[str]:
-    """pending -> ready where all deps are success. Returns task_ids."""
+    """blocked -> pending (deps repaired by a retry), then pending -> ready
+    where all deps are success. Returns the task_ids that became ready."""
+    for wf in conn.execute(
+            "SELECT DISTINCT workflow_id FROM tasks "
+            "WHERE status='blocked'").fetchall():
+        unblock_stranded(conn, wf["workflow_id"])
     promoted: list[str] = []
     rows = conn.execute(
         "SELECT * FROM tasks WHERE status='pending' "

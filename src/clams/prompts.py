@@ -52,8 +52,16 @@ Return ONLY a JSON object, no prose, matching:
 
 Rules: tasks are ordered (sequence_index = position, 1-based); depends_on may \
 only reference earlier tasks; every task needs >=1 run command (shell, must \
-print output and exit 0 to pass) and >=1 writable glob; acceptance must be \
-objectively checkable.
+exit 0 to pass) and >=1 writable glob; acceptance must be \
+objectively checkable. Every `run` command must PRINT a marker when it \
+succeeds — append `&& echo NAME_OK` — and must never use `-q`/`--quiet`, \
+`>/dev/null`, or a trailing `|| true`: a silent command gives the gate \
+nothing to verify, and `|| true` hides its failure entirely. `writable` must cover EVERY path the work or its \
+verification will create or modify — including result artifacts the task \
+must commit (reports, JSON outputs); if an artifact is writable-forbidden \
+the clean-tree/scope gate can never pass. Prefer `run` commands scoped to \
+the task's own test files over whole-suite commands: a suite-wide gate \
+fails on unrelated files' import errors and no agent fix can help that.
 Keep each task SMALL: one focused change an agent can finish well under one \
 hour of tool work — split large features into several tasks rather than one. \
 Run commands execute in a bare gate container that has python3, pytest, git \

@@ -157,7 +157,23 @@ class ExecutorRunner:
         if msg.type != "task.dispatch":
             self.bus.ack(self.s.stream_tasks, self.s.group_executors, d.id)
             return
-        self.run_task(msg, d)
+        try:
+            self.run_task(msg, d)
+        except Exception:  # noqa: BLE001 - a runner bug must never kill the
+            # process: an unacked message would autoclaim-replay and re-run
+            # the whole task on every restart (crash loop, claudio#133)
+            log.exception("task %s: unhandled runner error", msg.task_id)
+            try:
+                self._emit_result(msg, "failed", session_ref="", branch="",
+                                  evidence={"reason": "runner: internal "
+                                              "error (see runner logs)"},
+                                  log_tail="runner internal error",
+                                  error_code="infra:runner")
+                self.bus.ack(self.s.stream_tasks, self.s.group_executors,
+                             d.id)
+            except Exception:  # noqa: BLE001 - leave unacked for redelivery
+                log.exception("task %s: degraded result emit failed",
+                              msg.task_id)
 
     def run_task(self, msg: contracts.TaskDispatch, d: Delivered) -> None:
         brief = msg.brief
@@ -223,7 +239,11 @@ class ExecutorRunner:
             return
 
         gate = EvidenceGate(self.wt)
-        evidence = gate.run(worktree, brief.model_dump(), brief.base_ref)
+        # scope is measured from the seed ref (`base`), not the workflow base:
+        # on retry work reuse the branch already carries the previous attempt's
+        # files, and charging them to this attempt is unsatisfiable.
+        evidence = gate.run(worktree, brief.model_dump(), brief.base_ref,
+                            scope_base=base)
         outcome = "success" if evidence["passed"] else "failed"
         gate_code = "" if outcome == "success" else \
             f"gate:{str(evidence.get('reason', ''))[:40]}"
@@ -266,15 +286,90 @@ class ExecutorRunner:
         m = cls(**fields)
         self.bus.publish(self.s.stream_events, contracts.dump_message(m))
 
+    @staticmethod
+    def _shrink_evidence(evidence: dict, tail: int) -> dict:
+        ev = dict(evidence)
+        checks = []
+        for c in ev.get("checks", []):
+            c = dict(c)
+            ot = str(c.get("output_tail") or "")
+            if tail <= 0:
+                c.pop("output_tail", None)
+            elif len(ot) > tail:
+                c["output_tail"] = "..." + ot[-tail:]
+            # the scope check embeds the whole changed-file list; a task that
+            # commits dozens of artifacts made that list alone exceed the cap,
+            # so stage 2 still overflowed and fell through to the stage that
+            # discards every check — hiding the culprit (claudio#133).
+            ch = c.get("changed")
+            if isinstance(ch, list) and len(ch) > 20:
+                c["changed"] = ch[:20] + [f"(+{len(ch) - 20} more)"]
+            checks.append(c)
+        ev["checks"] = checks
+        return ev
+
     def _emit_result(self, msg: contracts.TaskDispatch, outcome: str, *,
                      session_ref: str, branch: str, evidence: dict,
                      commit_sha: str = "", changed_files: Optional[list] = None,
                      log_tail: str = "", error_code: str = "") -> None:
-        self._emit("task.result", msg, session_ref=session_ref,
-                   extra={"outcome": outcome, "evidence": evidence,
-                          "commit_sha": commit_sha, "branch": branch,
-                          "changed_files": changed_files or [],
-                          "log_tail": log_tail, "error_code": error_code})
+        # live finding (claudio#133): a whole-suite pytest gate produced
+        # evidence far over the 16 KiB contract cap; dump_message raised and
+        # the unhandled error killed the runner mid-task -> autoclaim re-run
+        # -> crash loop that burned the same attempt for hours. Trim
+        # progressively instead of ever dying.
+        base = {"outcome": outcome, "commit_sha": commit_sha, "branch": branch,
+                "error_code": error_code}
+        # Even the last-resort payload has to name the culprit: stage 3 used to
+        # keep only `reason`, so "run: empty output" arrived with every check
+        # discarded and no way to tell WHICH command failed (claudio#133).
+        reason = str((evidence or {}).get("reason") or outcome)[:300]
+        fails = []
+        for c in ((evidence or {}).get("checks") or []):
+            if c.get("ok"):
+                continue
+            f = {"check": c.get("check"), "detail": c.get("detail", ""),
+                 "cmd": str(c.get("cmd") or "")[:160]}
+            # scope failures carry their data in `violations`, not `detail`,
+            # so the last-resort payload reported "scope: failed" with nothing
+            # naming the offending files (claudio#133 T5).
+            v = c.get("violations")
+            if v:
+                f["violations"] = [str(x)[:80] for x in list(v)[:15]]
+                f["violation_count"] = len(v)
+            fails.append(f)
+            if len(fails) >= 8:
+                break
+        attempts = [
+            {**base, "evidence": evidence,
+             "changed_files": (changed_files or [])[:200],
+             "log_tail": log_tail[-4000:]},
+            {**base, "evidence": {**self._shrink_evidence(evidence, 300),
+                                  "trimmed": True},
+             "changed_files": (changed_files or [])[:50],
+             "log_tail": log_tail[-1000:]},
+            {**base, "evidence": {**self._shrink_evidence(evidence, 0),
+                                  "trimmed": True},
+             "changed_files": [f"{len(changed_files or [])} files "
+                               "(list omitted)"],
+             "log_tail": ""},
+            {**base, "evidence": {"reason": reason, "failed": fails,
+                                  "trimmed": True},
+             "changed_files": [], "log_tail": ""},
+            # guaranteed to fit: reason alone, so the ladder can never exhaust
+            {**base, "evidence": {"reason": reason, "trimmed": True},
+             "changed_files": [], "log_tail": ""},
+        ]
+        for i, extra in enumerate(attempts):
+            try:
+                self._emit("task.result", msg, session_ref=session_ref,
+                           extra=extra)
+                if i:
+                    log.info("task %s result emitted with evidence trimmed "
+                             "(stage %d)", msg.task_id, i)
+                return
+            except contracts.ContractError:
+                log.warning("task %s result over payload cap, trimming "
+                            "(stage %d)", msg.task_id, i)
 
     def _session_progress(self, session_ref: str) -> int:
         """Real progress signal: count of session messages (turns/tool calls).

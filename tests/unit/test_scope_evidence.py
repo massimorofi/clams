@@ -102,13 +102,32 @@ def test_gate_fail_command_nonzero(git_repo):
     assert not ev["passed"]
 
 
-def test_gate_fail_empty_output(git_repo):
+def test_gate_passes_silent_success(git_repo):
+    """claudio#133: exit 0 with no output is a PASS, flagged not fatal.
+
+    The old rule failed any silent command, which made `-q` / `|| true` run
+    commands unsatisfiable — T4 burned 3 attempts on a `git commit -q` that
+    succeeded, printed nothing, and was therefore scored "failed".
+    """
     wt, _ = git_repo
     path, _ = wt.add("o/r", "t4", 1, "main")
     _commit_something(path)
     ev = EvidenceGate(wt).run(path, {"run": ["true"], "writable": ["*.py"]},
                              "main")
-    assert not ev["passed"]  # exit 0 but empty output
+    assert ev["passed"], ev["reason"]
+    assert ev["checks"][0]["empty_output"] is True
+
+
+def test_gate_silent_commit_passes(git_repo):
+    """The exact T4 trap: a run command that commits artifacts with -q."""
+    wt, _ = git_repo
+    path, _ = wt.add("o/r", "t4b", 1, "main")
+    _commit_something(path)
+    cmd = ("echo 'x = 2' > gen.py && git add -A && git -c user.email=t@t "
+           "-c user.name=t commit -q -m artifacts || true")
+    ev = EvidenceGate(wt).run(path, {"run": [cmd], "writable": ["*.py"]},
+                             "main")
+    assert ev["passed"], ev["reason"]
 
 
 def test_gate_fail_forbidden_edit(git_repo):
@@ -170,3 +189,37 @@ def test_worktree_token_scrubbed(tmp_path, git_repo):
     url = subprocess.run(["git", "remote", "get-url", "origin"], cwd=d,
                          capture_output=True, text=True).stdout
     assert "ghp_secret" not in url
+
+
+def test_mid_path_doublestar_glob():
+    """`dir/**/file` must span directories. PurePosixPath.match treats "**" as
+    "*", so it matched one level only and charged a task its own writable
+    files (claudio#133 T5: 172 of 176 "violations")."""
+    p = "benchmark/results/claude_code/fix_csv/trial_1/judge.json"
+    assert scope.is_writable(p, ["benchmark/results/**/judge.json"], [])
+    assert scope.is_writable(p, ["**/judge.json"], [])
+    assert scope.is_writable("benchmark/results/judge.json",
+                             ["benchmark/results/**/judge.json"], [])
+    assert not scope.is_writable(p, ["benchmark/results/**/run.json"], [])
+    assert not scope.is_writable("other/judge.json",
+                                 ["benchmark/results/**/judge.json"], [])
+
+
+def test_gate_scope_measured_from_seed_not_workflow_base(git_repo):
+    """Retry work reuse seeds attempt N from attempt N-1's branch, so a
+    predecessor's committed files must not be charged to this task — they are
+    already on the branch it was handed and no agent edit can remove them."""
+    wt, _ = git_repo
+    path, _ = wt.add("o/r", "t6", 1, "main")
+    (path / "artifacts.bin").write_text("data\n")
+    subprocess.run(["git", "add", "."], cwd=path, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "predecessor"], cwd=path, check=True,
+                   capture_output=True)
+    seed = subprocess.run(["git", "rev-parse", "HEAD"], cwd=path,
+                          capture_output=True, text=True).stdout.strip()
+    _commit_something(path)                       # this task's own, writable
+    brief = {"run": ["echo ok"], "writable": ["*.py"]}
+    against_base = EvidenceGate(wt).run(path, brief, "main")
+    assert not against_base["passed"] and "scope" in against_base["reason"]
+    against_seed = EvidenceGate(wt).run(path, brief, "main", scope_base=seed)
+    assert against_seed["passed"], against_seed["reason"]
