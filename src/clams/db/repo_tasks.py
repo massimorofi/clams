@@ -43,6 +43,21 @@ class IllegalTransition(Exception):
     pass
 
 
+def normalize_plan_key(title: str) -> str:
+    """Canonical identity of a planned task, derived from its title.
+
+    A replan deletes and re-inserts every task row, so ``task_id`` cannot be the
+    handle that ties a new plan to what already exists (and a fresh id makes
+    the ``gh:gh_subissue:<task_id>:created`` outbox key look new, which is how
+    duplicate GitHub sub-issues get minted). The title is the one field the
+    planner reproduces, so we key on it: strip, collapse internal whitespace
+    runs, casefold. ``'  Fix   Replan Dedupe '`` -> ``'fix replan dedupe'``.
+
+    Deliberately stdlib-only (this module is a repo layer: sqlite3/json/uuid).
+    """
+    return " ".join((title or "").split()).casefold()
+
+
 def can_transition(src: str, dst: str) -> bool:
     return dst in TRANSITIONS.get(src, set())
 
@@ -169,10 +184,11 @@ def create_task(conn: sqlite3.Connection, workflow_id: str, sequence_index: int,
     conn.execute(
         "INSERT INTO tasks(task_id, workflow_id, sequence_index, depends_on, "
         "title, objective, acceptance, brief_json, status, max_attempts, "
-        "gh_issue_number) VALUES(?,?,?,?,?,?,?,?,'pending',?,?)",
+        "gh_issue_number, plan_key) VALUES(?,?,?,?,?,?,?,?,'pending',?,?,?)",
         (task_id, workflow_id, sequence_index,
          json.dumps(depends_on or []), title, objective, acceptance,
-         json.dumps(brief), max_attempts, gh_issue_number))
+         json.dumps(brief), max_attempts, gh_issue_number,
+         normalize_plan_key(title)))
     return task_id
 
 
