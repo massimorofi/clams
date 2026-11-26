@@ -213,18 +213,12 @@ def plan_workflow(conn, claudio_p, settings, workflow_id: str,
         # project_tasks_created skips tasks that already carry one, so
         # stamping the parent here silently disabled sub-issue creation.
         # Each task gets its own sub-issue number via the outbox callback.
+        # apply_replanned_plan logs its own summary event ("replan: reused N,
+        # created M, cancelled K"), so no extra timeline line is needed here.
         reconcile.apply_replanned_plan(conn, workflow_id, planned)
         repo_workflows.set_plan(conn, workflow_id,
                                 plan.model_dump(), status="running")
         # a successful plan resolves any earlier deferral/block alert on this
         # probe, so the alert reflects the *current* planning state
         repo_alerts.clear_alert(conn, "plan")
-        if n_old:
-            repo_events.append_event(
-                conn, "workflow", workflow_id, "warn",
-                f"replan: replaced {n_old} superseded tasks with "
-                f"{len(plan.tasks)}")
-        else:
-            repo_events.append_event(conn, "workflow", workflow_id, "info",
-                                     f"planned {len(plan.tasks)} tasks")
     return "running"

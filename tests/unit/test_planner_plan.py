@@ -150,7 +150,9 @@ def test_replan_replaces_tasks_without_collision(db):
     assert repo_workflows.get_workflow(db, wf)["status"] == "running"
     msgs = [r["message"] for r in db.execute(
         "SELECT message FROM events WHERE scope='workflow'").fetchall()]
-    assert any("replaced" in m for m in msgs)
+    # reconcile logs the swap summary itself (84d470e): identical titles are
+    # reused in place, nothing is deleted
+    assert any("reused 2" in m for m in msgs)
 
 
 def test_replan_prompt_includes_prior_results(db):

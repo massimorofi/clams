@@ -122,6 +122,20 @@ class WorktreeManager:
     def branch_name(self, task_id: str, attempt: int) -> str:
         return f"clams/{task_id}-a{attempt}"
 
+    def _prune_worktrees(self, clone: Path) -> None:
+        """Deregister worktrees whose directory is gone.
+
+        ``reap_old_failures`` rmtree's attempt dirs directly, which leaves a
+        ghost registration in the clone: git then reports the attempt branch
+        as still checked out, ``branch -D`` refuses it, and the next
+        ``worktree add -b`` on that branch dies with "already exists"
+        (live finding: cadfa395 T2 retries, claudio#58 replan exhaustion).
+        """
+        try:
+            _run(["git", "worktree", "prune"], cwd=clone)
+        except GitError:
+            pass
+
     def add(self, repo: str, task_id: str, attempt: int,
             base_ref: str) -> tuple[Path, str]:
         clone = self.ensure_clone(repo, base_ref)
@@ -129,7 +143,10 @@ class WorktreeManager:
         branch = self.branch_name(task_id, attempt)
         if path.exists():
             self.remove(repo, task_id, attempt)
-        # a stale branch from a previous crashed attempt? reset it.
+        # a stale branch from a previous crashed/reaped attempt? reset it.
+        # prune first: branch -D refuses a branch still registered as checked
+        # out in a worktree dir that no longer exists.
+        self._prune_worktrees(clone)
         try:
             _run(["git", "branch", "-D", branch], cwd=clone)
         except GitError:
@@ -166,15 +183,22 @@ class WorktreeManager:
         for proj in self.work_root.iterdir():
             if not proj.is_dir():
                 continue
+            removed = False
             for wt in proj.iterdir():
                 if wt.name == "repo" or not wt.is_dir():
                     continue
                 try:
                     if wt.stat().st_mtime < cutoff:
                         shutil.rmtree(wt, ignore_errors=True)
+                        removed = True
                         n += 1
                 except OSError:
                     pass
+            # deregister the dirs we just deleted, or their branches stay
+            # "checked out" in the clone and poison the next worktree add
+            clone = proj / "repo"
+            if removed and (clone / ".git").exists():
+                self._prune_worktrees(clone)
         return n
 
     # ---------------------------------------------------------------- queries

@@ -158,3 +158,32 @@ def test_dispatch_injects_prior_failure_on_attempt_two(db):
     # attempt 1 briefs never carried it (stored brief stays clean)
     assert "prior_failure" not in json.loads(
         repo_tasks.get_task(db, t)["brief_json"])
+
+
+# ------------------------------------------------- ghost worktree registrations
+
+def test_add_recovers_after_reap_ghost_registration(tmp_path):
+    """reap_old_failures rmtree's attempt dirs; the leftover registration in
+    the clone keeps the attempt branch "checked out", so without a prune the
+    next add on the same branch dies with 'branch already exists' (live
+    finding: cadfa395 T2 retries after the reaper ran)."""
+    import shutil
+    src = _src_repo(tmp_path)
+    wt = WorktreeManager(tmp_path / "work", remote_url_template=str(src))
+    p1, br = wt.add("o/r", "task1", 1, "main")
+    shutil.rmtree(p1)                       # simulate the reaper
+    p2, br2 = wt.add("o/r", "task1", 1, "main")   # must not raise GitError
+    assert br2 == br
+    assert (p2 / "a.txt").exists()
+
+
+def test_reap_prunes_ghost_registrations(tmp_path):
+    src = _src_repo(tmp_path)
+    wt = WorktreeManager(tmp_path / "work", remote_url_template=str(src))
+    p1, _ = wt.add("o/r", "task1", 1, "main")
+    os.utime(p1, (0, 0))                    # make it older than any cutoff
+    assert wt.reap_old_failures(max_age_hours=0) == 1
+    out = subprocess.run(["git", "worktree", "list", "--porcelain"],
+                         cwd=str(wt.repo_dir("o/r")), capture_output=True,
+                         text=True, env=_GIT_ENV).stdout
+    assert "task1-a1" not in out            # registration gone, not prunable

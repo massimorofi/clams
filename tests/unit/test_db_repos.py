@@ -14,7 +14,7 @@ from clams.db.conn import db_integrity_ok, plus_s, utcnow_s
 
 
 def test_migrations_apply_once(db):
-    assert schema_version(db) == 8   # 001..008
+    assert schema_version(db) == 9   # 001..009
     assert migrate(db) == []          # idempotent
     assert db_integrity_ok(db)
 
