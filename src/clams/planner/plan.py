@@ -14,6 +14,7 @@ from .. import contracts, prompts
 from ..contracts import Plan, PlanTask, PlanValidationError, validate_plan
 from ..db import (repo_alerts, repo_events, repo_tasks, repo_workflows)
 from ..db.conn import immediate, iso_to_epoch
+from . import reconcile
 
 log = logging.getLogger("clams.plan")
 
@@ -172,28 +173,22 @@ def plan_workflow(conn, claudio_p, settings, workflow_id: str,
         return "blocked"
 
     with immediate(conn):
-        # replan swap: the fresh plan supersedes the old task set. Without
-        # this the inserts collide with UNIQUE(workflow_id, sequence_index)
-        # / UNIQUE(workflow_id, title) and the workflow sticks in 'planning'.
-        n_old = repo_tasks.delete_workflow_tasks(conn, workflow_id)
-        for i, pt in enumerate(plan.tasks, start=1):
-            repo_tasks.create_task(
-                conn, workflow_id, i, pt.title, pt.objective, pt.acceptance,
-                build_brief(pt, repo, base_ref, settings),
-                depends_on=pt.depends_on,
-                max_attempts=settings.max_attempts)
-            # NOTE: tasks must NOT inherit the workflow's gh_issue_number —
-            # project_tasks_created skips tasks that already carry one, so
-            # stamping the parent here silently disabled sub-issue creation.
-            # Each task gets its own sub-issue number via the outbox callback.
+        # replan swap: the fresh plan is reconciled into the existing task set
+        # rather than replacing it. Deleting the old rows minted a new task_id
+        # per replan, which made the gh_subissue outbox key look unseen and
+        # duplicated GitHub sub-issues for work that already had one.
+        # reconcile keeps task identity and assigns the sequence_index ladder
+        # itself, so UNIQUE(workflow_id, sequence_index) / UNIQUE(workflow_id,
+        # title) still hold and the workflow cannot stick in 'planning'.
+        planned = [{**pt.model_dump(),
+                    "brief": build_brief(pt, repo, base_ref, settings),
+                    "max_attempts": settings.max_attempts}
+                   for pt in plan.tasks]
+        # NOTE: tasks must NOT inherit the workflow's gh_issue_number —
+        # project_tasks_created skips tasks that already carry one, so
+        # stamping the parent here silently disabled sub-issue creation.
+        # Each task gets its own sub-issue number via the outbox callback.
+        reconcile.apply_replanned_plan(conn, workflow_id, planned)
         repo_workflows.set_plan(conn, workflow_id,
                                 plan.model_dump(), status="running")
-        if n_old:
-            repo_events.append_event(
-                conn, "workflow", workflow_id, "warn",
-                f"replan: replaced {n_old} superseded tasks with "
-                f"{len(plan.tasks)}")
-        else:
-            repo_events.append_event(conn, "workflow", workflow_id, "info",
-                                     f"planned {len(plan.tasks)} tasks")
     return "running"
