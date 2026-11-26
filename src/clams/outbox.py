@@ -18,6 +18,24 @@ from .db import repo_alerts, repo_events, repo_outbox
 log = logging.getLogger("clams.outbox")
 
 
+def _make_gh_client():
+    """Build a GitHub client on demand (never at import time).
+
+    The import lives inside the function so that ``import clams.outbox`` stays
+    httpx-free: the gate container has no third-party deps, and the relay must
+    be importable to enqueue/dispatch bookkeeping even when GitHub is not
+    configured. Returns None when no token is set.
+    """
+    from .config import get_settings
+    from .github.client import GitHubClient
+    settings = get_settings()
+    if not settings.github_token:
+        return None
+    return GitHubClient(settings.github_token,
+                        api_base=settings.github_api_base,
+                        graphql_base=settings.github_graphql_base)
+
+
 class OutboxRelay:
     def __init__(self, bus, gh_client: Optional[Any] = None, *,
                  backoff_base_s: int = 2, max_attempts: int = 5,
@@ -111,5 +129,15 @@ class OutboxRelay:
                     self.on_subissue_created(payload["task_id"], number)
             else:
                 raise ValueError("gh_subissue needs child or task_id")
+        elif kind == "gh_close":
+            # Superseded sub-issue: optional "superseded" comment, then close.
+            # The client is built lazily (never at import time) so importing
+            # clams.outbox stays httpx-free.
+            gh = self.gh if self.gh is not None else _make_gh_client()
+            if gh is None:
+                raise RuntimeError("gh_close: no github client configured "
+                                   "(CLAMS_GITHUB_TOKEN)")
+            gh.close_issue(payload["repo"], payload["issue"],
+                           comment=payload.get("comment"))
         else:
             raise ValueError(f"unknown gh kind {kind!r}")

@@ -9,6 +9,7 @@ from typing import Any, Optional
 from ..db import (repo_commands, repo_events, repo_projects, repo_questions,
                   repo_runtime, repo_tasks, repo_workflows)
 from ..db.conn import immediate
+from . import reconcile
 
 log = logging.getLogger("clams.commands")
 
@@ -204,7 +205,8 @@ def _apply_plan(conn, payload: dict, issuer: str,
 
     Closes the loop for plans authored by the planner agent (or by hand):
     the plan must pass the exact validation LLM plans go through, then the
-    swap mirrors plan_workflow (old task set superseded atomically). NOTE:
+    swap mirrors plan_workflow: the new plan is reconciled into the existing
+    task set atomically (no deletes, task identity preserved). NOTE:
     runs inside drain_commands' BEGIN IMMEDIATE — must not open its own.
     """
     from .. import contracts
@@ -234,19 +236,25 @@ def _apply_plan(conn, payload: dict, issuer: str,
         if p.get("repo") == repo:
             base_ref = p.get("base_ref", "main")
             break
-    n_old = repo_tasks.delete_workflow_tasks(conn, wf_id)
-    for i, pt in enumerate(plan.tasks, start=1):
-        repo_tasks.create_task(
-            conn, wf_id, i, pt.title, pt.objective, pt.acceptance,
-            build_brief(pt, repo, base_ref, s),
-            depends_on=pt.depends_on, max_attempts=s.max_attempts)
+    # Reconcile, never delete: the old task set is superseded in place so a
+    # re-planned title keeps its task_id (and its GitHub sub-issue). The
+    # sequence_index ladder is assigned by reconcile, which keeps
+    # UNIQUE(workflow_id, sequence_index) intact across the swap.
+    planned = [{**pt.model_dump(),
+                "brief": build_brief(pt, repo, base_ref, s),
+                "max_attempts": s.max_attempts}
+               for pt in plan.tasks]
+    # NOTE: tasks must NOT inherit the workflow's gh_issue_number —
+    # project_tasks_created skips tasks that already carry one, so stamping
+    # the parent here silently disabled sub-issue creation. Each task gets its
+    # own sub-issue number via the outbox callback.
+    res = reconcile.apply_replanned_plan(conn, wf_id, planned, actor=issuer)
     repo_workflows.set_plan(conn, wf_id, plan.model_dump(), status="running")
-    repo_events.append_event(
-        conn, "workflow", wf_id, "warn",
-        f"apply_plan by {issuer}: replaced {n_old} tasks with "
-        f"{len(plan.tasks)}")
     log.info("apply_plan on %s by %s: %d tasks", wf_id, issuer, len(plan.tasks))
-    return {"workflow": wf_id, "tasks": len(plan.tasks), "replaced": n_old}
+    return {"workflow": wf_id, "tasks": len(plan.tasks),
+            "replaced": res["cancelled_count"],
+            "reused": res["reused_count"], "created": res["created_count"],
+            "cancelled": res["cancelled_count"]}
 
 
 def _stop_agent_run(claudio_e, session_ref: str) -> bool:
