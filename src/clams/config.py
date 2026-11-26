@@ -73,6 +73,11 @@ class Settings(BaseSettings):
     heartbeat_interval_s: int = 60
     executor_alive_interval_s: int = 30
     keep_failed_worktree_hours: int = 24
+    # on workflow done, merge that workflow's integration ref into the project
+    # base branch and push it. Env-only (not runtime-editable: the settings grid
+    # renders numbers and text only). A protected base branch rejects the push
+    # — that raises an alert and changes nothing.
+    merge_to_base_on_done: bool = True
 
     # --- planner loop -----------------------------------------------------------------
     planner_cycle_s: float = 5.0
