@@ -99,6 +99,29 @@ class TaskCancel(_Base):
     lease_token: str
 
 
+def integration_branch(workflow_id: str) -> str:
+    """The per-workflow ref the executor advances as each task succeeds.
+
+    Single spelling on purpose: the planner names it when asking for the merge
+    and the executor names it when seeding a retry, and if those ever drift the
+    merge silently becomes a no-op."""
+    return f"clams/wf/{workflow_id}"
+
+
+class WorkflowIntegrate(_Base):
+    """Planner -> executor, when a workflow reaches done: merge the workflow's
+    integration ref into the project base branch and push it.
+
+    The planner has no git access at all (no /work volume, no credentials), so
+    it can only ask the executor to do it. See executor.worktree.merge_to_base.
+    """
+    type: Literal["workflow.integrate"] = "workflow.integrate"
+    workflow_id: str
+    repo: str
+    integration_branch: str
+    base_ref: str = "main"
+
+
 # ----------------------------------------------------------------- clams:events
 class TaskStarted(_Base):
     type: Literal["task.started"] = "task.started"
@@ -153,6 +176,20 @@ class TaskResult(_Base):
     error_code: str = ""
 
 
+class WorkflowIntegrated(_Base):
+    """Executor -> planner: the outcome of a ``workflow.integrate`` request.
+
+    The executor has no DB access, so an unsuccessful merge (a conflict, or a
+    protected base branch rejecting the push) has to travel back this way to
+    become an alert instead of dying in a runner log line.
+    """
+    type: Literal["workflow.integrated"] = "workflow.integrated"
+    workflow_id: str
+    base_ref: str = ""
+    ok: bool = False
+    detail: str = ""
+
+
 class ExecutorAlive(_Base):
     type: Literal["executor.alive"] = "executor.alive"
     executor_id: str
@@ -161,21 +198,24 @@ class ExecutorAlive(_Base):
 
 
 Message = Union[
-    TaskDispatch, TaskCancel,
+    TaskDispatch, TaskCancel, WorkflowIntegrate,
     TaskStarted, TaskHeartbeat, TaskQuestion, TaskResult, ExecutorAlive,
+    WorkflowIntegrated,
 ]
 
 _MESSAGE_TYPES: dict[str, type[BaseModel]] = {
     "task.dispatch": TaskDispatch,
     "task.cancel": TaskCancel,
+    "workflow.integrate": WorkflowIntegrate,
     "task.started": TaskStarted,
     "task.heartbeat": TaskHeartbeat,
     "task.question": TaskQuestion,
     "task.result": TaskResult,
     "executor.alive": ExecutorAlive,
+    "workflow.integrated": WorkflowIntegrated,
 }
 
-TASK_STREAM_TYPES = {"task.dispatch", "task.cancel"}
+TASK_STREAM_TYPES = {"task.dispatch", "task.cancel", "workflow.integrate"}
 EVENT_STREAM_TYPES = set(_MESSAGE_TYPES) - TASK_STREAM_TYPES
 
 

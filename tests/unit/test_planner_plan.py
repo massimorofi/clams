@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 
 from clams.config import Settings
-from clams.claudio_client import ChatResponse
+from clams.claudio_client import ChatResponse, ClaudioUnavailable
 from clams.db import repo_projects, repo_tasks, repo_workflows, repo_alerts
 from clams.planner.plan import plan_workflow, extract_json
 
@@ -70,6 +70,50 @@ def test_plan_blocked_after_two_bad(db):
                            wf, "o/r")
     assert status == "blocked"
     assert repo_alerts.open_count(db) == 1
+
+
+# ------------------------------------------- transient infra must not wedge (§13)
+# Regression for workflow 5dba1d8b (claudio#136): a momentary claudio-planner
+# outage parked a zero-task, no-plan workflow in 'blocked' — a dead end the
+# planner loop never revisits — so it failed without ever having a plan.
+
+def test_plan_unreachable_stays_planning(db):
+    """An unreachable endpoint is infra, not an unplanable goal: the workflow
+    must stay retryable (planning), not jump to the blocked dead end."""
+    wf = _wf(db)
+    s = Settings(_env_file=None)
+    err = ClaudioUnavailable("claudio chat unreachable: [Errno 111] "
+                             "Connection refused")
+    status = plan_workflow(db, ScriptedP([err, err]), s, wf, "o/r")
+    assert status == "planning"
+    row = repo_workflows.get_workflow(db, wf)
+    assert row["status"] == "planning"
+    assert row["replans"] == 1            # bounded by the replan budget
+    assert row["plan_json"] is None       # still no plan, but retryable
+    assert repo_alerts.open_count(db) == 1
+
+
+def test_plan_unreachable_blocks_when_budget_exhausted(db):
+    """A sustained outage still escalates: once the replan budget is spent the
+    workflow blocks with an error alert instead of hot-looping forever."""
+    wf = _wf(db)
+    s = Settings(_env_file=None, max_replans=1)
+    err = ClaudioUnavailable("claudio chat unreachable: refused")
+    assert plan_workflow(db, ScriptedP([err, err]), s, wf, "o/r") == "planning"
+    assert plan_workflow(db, ScriptedP([err, err]), s, wf, "o/r") == "blocked"
+    assert repo_workflows.get_workflow(db, wf)["replans"] == 1
+
+
+def test_plan_success_clears_deferral_alert(db):
+    """The deferral alert is self-resolving: the cycle that finally plans
+    clears the open 'plan' probe."""
+    wf = _wf(db)
+    s = Settings(_env_file=None)
+    err = ClaudioUnavailable("claudio chat unreachable: refused")
+    assert plan_workflow(db, ScriptedP([err, err]), s, wf, "o/r") == "planning"
+    assert repo_alerts.open_count(db) == 1
+    assert plan_workflow(db, ScriptedP([GOOD]), s, wf, "o/r") == "running"
+    assert repo_alerts.open_count(db) == 0
 
 
 def test_plan_rejects_cyclic(db):

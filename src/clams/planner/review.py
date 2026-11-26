@@ -34,6 +34,23 @@ def _apply(conn, msg, settings, *, gh_enabled: bool) -> str:
                                     msg.capacity)
         return "applied"
 
+    if t == "workflow.integrated":
+        # the executor owns git, so it reports back; a failed merge means the
+        # workflow's work is stranded on the integration ref and needs a human
+        if msg.ok:
+            repo_events.append_event(
+                conn, "workflow", msg.workflow_id, "info",
+                f"merged into {msg.base_ref} ({msg.detail})")
+        else:
+            repo_alerts.raise_alert(
+                conn, "workflow", "error",
+                f"workflow {msg.workflow_id}: could not merge into "
+                f"{msg.base_ref}: {msg.detail[:200]}")
+            repo_events.append_event(
+                conn, "workflow", msg.workflow_id, "error",
+                f"merge into {msg.base_ref} failed")
+        return "applied"
+
     if t == "task.started":
         row = repo_tasks.on_started(conn, msg.task_id, msg.attempt,
                                     msg.lease_token, msg.executor_id,
@@ -170,6 +187,8 @@ def review_workflow(conn, workflow_id: str, settings,
     if outcome == "done":
         repo_workflows.set_status(conn, workflow_id, "done")
         repo_events.append_event(conn, "workflow", workflow_id, "info", "done")
+        if getattr(settings, "merge_to_base_on_done", False):
+            _enqueue_integration(conn, workflow_id, wf, settings)
         if gh_enabled:
             _project_done(conn, workflow_id, settings)
             from ..github import projection
@@ -262,3 +281,35 @@ def _wf_repo(conn, wf) -> str:
     p = conn.execute("SELECT repo FROM projects WHERE project_id=?",
                      (wf["project_id"],)).fetchone()
     return p["repo"] if p else ""
+
+
+def _enqueue_integration(conn, workflow_id: str, wf, settings) -> None:
+    """Ask the executor to merge the workflow's integration ref onto the base
+    branch.
+
+    A request, never an action: the planner has no git access at all (no /work
+    volume, no credentials), so only the executor-runner can do it. Enqueued in
+    the same transaction that set 'done', so the outbox keeps its usual
+    at-most-once delivery via the idempotency key.
+    """
+    repo = _wf_repo(conn, wf)
+    if not repo:
+        return
+    base_ref = "main"
+    for t in repo_tasks.list_tasks(conn, workflow_id):
+        try:
+            brief = json.loads(t["brief_json"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if brief.get("base_ref"):
+            base_ref = brief["base_ref"]
+            break
+    msg = contracts.WorkflowIntegrate(
+        workflow_id=workflow_id, repo=repo,
+        integration_branch=contracts.integration_branch(workflow_id),
+        base_ref=base_ref)
+    repo_outbox.enqueue(
+        conn, "bus_publish",
+        {"stream": settings.stream_tasks,
+         "msg": json.loads(contracts.dump_message(msg))},
+        idempotency_key=f"integrate:{workflow_id}")

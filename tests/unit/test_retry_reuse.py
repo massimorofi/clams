@@ -72,6 +72,49 @@ def test_retry_base_falls_back_when_no_previous_branch(tmp_path):
     assert r._retry_base(_B(), "task9", 5) == "main"
 
 
+def _commit(path, name, body="real work"):
+    (path / name).write_text(body)
+    _git("add", ".", cwd=path)
+    _git("commit", "-m", f"{name} work", cwd=path)
+
+
+def test_attempt1_seeds_from_integration_branch(tmp_path):
+    """The claudio#133 fix: a chained task's FIRST attempt must start from its
+    predecessors' merged work, not from base_ref."""
+    src = _src_repo(tmp_path)
+    wt = WorktreeManager(tmp_path / "work", remote_url_template=str(src))
+    p1, _ = wt.add("o/r", "task1", 1, "main")
+    _commit(p1, "work.py")
+    wt.integrate("o/r", "w1", p1, wt.branch_name("task1", 1))
+
+    r = ExecutorRunner.__new__(ExecutorRunner)
+    r.wt = wt
+    # a different task, first attempt: it has no previous branch of its own
+    assert r._retry_base(_B(), "task2", 1, "w1") == "clams/wf/w1"
+    p2, _ = wt.add("o/r", "task2", 1, r._retry_base(_B(), "task2", 1, "w1"))
+    assert (p2 / "work.py").exists()
+    # no workflow id, or a workflow that has not integrated anything yet
+    assert r._retry_base(_B(), "task2", 1) == "main"
+    assert r._retry_base(_B(), "task2", 1, "w-other") == "main"
+
+
+def test_retry_prefers_previous_attempt_over_integration(tmp_path):
+    """Work reuse must not regress: a retry resumes its OWN branch even when
+    the shared tip has moved past it."""
+    src = _src_repo(tmp_path)
+    wt = WorktreeManager(tmp_path / "work", remote_url_template=str(src))
+    p1, _ = wt.add("o/r", "task1", 1, "main")
+    _commit(p1, "own.py")
+    # another task advances the shared tip beyond task1's own branch
+    p2, _ = wt.add("o/r", "task2", 1, "main")
+    _commit(p2, "other.py")
+    wt.integrate("o/r", "w1", p2, wt.branch_name("task2", 1))
+
+    r = ExecutorRunner.__new__(ExecutorRunner)
+    r.wt = wt
+    assert r._retry_base(_B(), "task1", 2, "w1") == "clams/task1-a1"
+
+
 # ---------------------------------------------------------------- B: prompt
 
 def test_build_prompt_includes_prior_failure_block():

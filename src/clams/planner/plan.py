@@ -11,6 +11,7 @@ import re
 from typing import Any, Optional
 
 from .. import contracts, prompts
+from ..claudio_client import ClaudioUnavailable
 from ..contracts import Plan, PlanTask, PlanValidationError, validate_plan
 from ..db import (repo_alerts, repo_events, repo_tasks, repo_workflows)
 from ..db.conn import immediate, iso_to_epoch
@@ -141,6 +142,7 @@ def plan_workflow(conn, claudio_p, settings, workflow_id: str,
     prompt = base_prompt
     errors: list[str] = []
     plan: Optional[Plan] = None
+    transient = False
     for attempt in range(2):  # initial + one repair retry
         try:
             # no timeout: planning is agentic work too; the stall
@@ -152,6 +154,9 @@ def plan_workflow(conn, claudio_p, settings, workflow_id: str,
             validate_plan(plan, max_tasks=settings.max_plan_tasks)
             break
         except Exception as exc:  # noqa: BLE001 - any LLM failure -> repair retry
+            # an unreachable/timed-out endpoint is an infra fault, not a bad
+            # goal; it must not be treated the same as an invalid plan
+            transient = isinstance(exc, ClaudioUnavailable)
             errors.append(str(exc)[:300])
             plan = None
             # keep the full original prompt (goal + schema) — a bare error
@@ -159,6 +164,26 @@ def plan_workflow(conn, claudio_p, settings, workflow_id: str,
             prompt = base_prompt + prompts.render(conn, "plan_repair",
                                                   error=errors[-1])
     if plan is None:
+        # A workflow with no plan and no tasks must never be parked in
+        # 'blocked' by a momentary endpoint outage: 'blocked' is a dead end
+        # (the loop only revisits intake/planning), so the workflow would
+        # wedge forever without ever having had a plan. Transient faults stay
+        # retryable, bounded by the replan budget so a sustained outage still
+        # escalates instead of hot-looping every cycle. (claudio#136 shape.)
+        if transient and wf["replans"] < settings.max_replans:
+            with immediate(conn):
+                n = repo_workflows.bump_replans(conn, workflow_id)
+                repo_workflows.set_status(conn, workflow_id, "planning")
+                repo_alerts.raise_alert(
+                    conn, "plan", "warn",
+                    f"workflow {workflow_id}: planning deferred, claudio "
+                    f"planner unreachable (retry {n}/{settings.max_replans}): "
+                    f"{errors[-1] if errors else 'unknown'}")
+                repo_events.append_event(
+                    conn, "workflow", workflow_id, "warn",
+                    f"planning deferred: endpoint unreachable "
+                    f"(retry {n}/{settings.max_replans})")
+            return "planning"
         with immediate(conn):
             repo_workflows.set_status(conn, workflow_id, "blocked")
             repo_alerts.raise_alert(conn, "plan", "error",
@@ -188,6 +213,9 @@ def plan_workflow(conn, claudio_p, settings, workflow_id: str,
             # Each task gets its own sub-issue number via the outbox callback.
         repo_workflows.set_plan(conn, workflow_id,
                                 plan.model_dump(), status="running")
+        # a successful plan resolves any earlier deferral/block alert on this
+        # probe, so the alert reflects the *current* planning state
+        repo_alerts.clear_alert(conn, "plan")
         if n_old:
             repo_events.append_event(
                 conn, "workflow", workflow_id, "warn",
