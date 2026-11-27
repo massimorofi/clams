@@ -163,6 +163,7 @@ class ExecutorRunner:
         travels back to the planner as an event so it becomes an alert instead
         of a log line nobody reads.
         """
+        sha = ""
         try:
             sha = self.wt.merge_to_base(msg.repo, msg.integration_branch,
                                         msg.base_ref)
@@ -171,6 +172,20 @@ class ExecutorRunner:
             log.warning("workflow %s: merge into %s failed: %s",
                         msg.workflow_id, msg.base_ref, exc)
             ok, detail = False, str(exc)[:300]
+        if ok and getattr(self.s, "cleanup_merged_branches", False):
+            # The workflow landed on the base branch; its pushed task
+            # branches are now merged litter (their commits and shas live
+            # on the base branch and in the attempt history). Best-effort:
+            # a cleanup failure must not change the integration outcome.
+            try:
+                deleted = self.wt.cleanup_merged_branches(msg.repo, sha)
+                if deleted:
+                    log.info("workflow %s: deleted %d merged task "
+                             "branch(es): %s", msg.workflow_id, len(deleted),
+                             ", ".join(deleted))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("workflow %s: merged-branch cleanup failed: %s",
+                            msg.workflow_id, exc)
         try:
             self.bus.publish(
                 self.s.stream_events,

@@ -102,6 +102,10 @@ class Settings(BaseSettings):
     # renders numbers and text only). A protected base branch rejects the push
     # — that raises an alert and changes nothing.
     merge_to_base_on_done: bool = True
+    # after a successful merge-to-base, delete the workflow's task branches on
+    # origin whose tips are fully merged into the pushed sha. Unmerged branches
+    # (stranded work) are never touched. Env-only, like merge_to_base_on_done.
+    cleanup_merged_branches: bool = True
 
     # --- planner loop -----------------------------------------------------------------
     planner_cycle_s: float = 5.0

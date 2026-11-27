@@ -387,3 +387,46 @@ class WorktreeManager:
                     _run(["git", "worktree", "prune"], cwd=clone)
                 except GitError:
                     pass
+
+    # Matches the task attempt branches the executor pushes
+    # (clams/<task_id>-a<attempt>). Deliberately does not match the
+    # clams/wf/<workflow_id> integration refs — those are local to the
+    # clone and never pushed, but the guard makes doubly sure.
+    TASK_BRANCH_RE = re.compile(r"^clams/.+-a\d+$")
+
+    def cleanup_merged_branches(self, repo: str, merged_sha: str) -> list[str]:
+        """Delete origin task branches fully merged into ``merged_sha``.
+
+        Call after a successful ``merge_to_base``: the workflow's task
+        branches have then served their purpose — their commits live on the
+        base branch forever and the attempt history keeps branch names and
+        shas for post-mortems — so the refs on origin are pure litter
+        (the #139-#144 situation: merged branches nobody deletes).
+
+        Safety: only refs matching the task-branch pattern whose tip is an
+        ancestor of ``merged_sha`` are deleted. An unmerged branch is
+        stranded work (a failed or conflicted integration) and is left for
+        a human. A failed delete is logged and skipped, never raised:
+        cleanup is best-effort. Returns the branch names deleted.
+        """
+        clone = self.repo_dir(repo)
+        if not (clone / ".git").exists():
+            raise GitError(f"no clone for {repo}")
+        refs = _run(["git", "for-each-ref", "--format=%(refname)",
+                     "refs/remotes/origin/clams/"], cwd=clone).split()
+        deleted: list[str] = []
+        for ref in refs:
+            branch = ref[len("refs/remotes/origin/"):]
+            if not self.TASK_BRANCH_RE.match(branch):
+                continue
+            if not self._is_ancestor(clone, ref, merged_sha):
+                log.info("keeping unmerged branch %s (not an ancestor of %s)",
+                         branch, merged_sha[:10])
+                continue
+            try:
+                _run(["git", "push", "origin", "--delete", branch], cwd=clone)
+            except GitError as exc:
+                log.warning("could not delete %s on origin: %s", branch, exc)
+                continue
+            deleted.append(branch)
+        return deleted
