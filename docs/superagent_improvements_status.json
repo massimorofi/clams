@@ -1,0 +1,298 @@
+[
+  {
+    "improvement": 2,
+    "title": "#2 Phase 1: Append-only task attempt history + cumulative retry context (planner_gaps Gap 8)",
+    "issue_number": 147,
+    "issue_url": "https://github.com/massimorofi/clams/issues/147",
+    "status": "implemented",
+    "improvement_name": "Cumulative, evidence-backed executor retry context",
+    "test_files": ["tests/unit/test_attempt_history.py"],
+    "tests_passing": 7,
+    "implementing_task": {
+      "clams_task_id": "f3d288fe-c76f-4da3-8426-03e439577c14",
+      "workflow_id": "6ddd7472-b810-48c7-b8f7-2e74a49a42de",
+      "commits": ["073fd63 Add append-only task_attempts history (#2)"],
+      "summary": "Added migrations/011_task_attempts.sql (append-only task_attempts, UNIQUE(task_id, attempt_no), append-only triggers block UPDATE/DELETE) and src/clams/db/repo_attempts.py (stdlib sqlite3/json only) with record_attempt(), get_attempts(), get_attempt(), latest_attempt_no() and cumulative_retry_summary(); wired repo_tasks.on_result and planner/dispatch.py so every attempt appends one idempotent row and the retry brief's prior_failure block carries the bounded cumulative summary instead of only the latest result; task contract is unchanged across retries and executor/runner.py seeds attempt N from attempt N-1's branch."
+    },
+    "acceptance_criteria_satisfied": [
+      "migrations/011_task_attempts.sql exists and creates task_attempts with UNIQUE(task_id, attempt_no)",
+      "src/clams/db/repo_attempts.py exists and contains no 'import pydantic' / 'import fastapi'",
+      "tests/unit/test_attempt_history.py passes (7 tests): attempt-1 evidence still readable at attempt 3, duplicate replay neither duplicates nor overwrites rows, cumulative summary is bounded and includes every attempt",
+      "'cumulative_retry_summary' is referenced in src/clams/planner/dispatch.py",
+      "The '#2' GitHub issue number appears in the migration header comment"
+    ],
+    "acceptance_criteria_deferred": [],
+    "gate_command": "PYTHONPATH=src python3 -m pytest tests/unit/test_attempt_history.py -o addopts='' && echo ATTEMPT_HISTORY_OK",
+    "github_status_update": {
+      "observed_state": "closed",
+      "observed_labels": ["status:Done"],
+      "required_transition": "Move issue #147 to 'In review': reopen it (it is currently closed), replace the 'status:Done' label with the board's In-review status label, and post a comment listing the delivered acceptance criteria above plus the gate command that proves them.",
+      "board_status_option": "In review",
+      "label_to_add": "status:In review",
+      "label_exists_in_repo": false,
+      "apply_via": "gh issue edit / gh issue comment run by the operator environment when a GitHub token is available; the gate container has no network and no token, so this task only records the transition.",
+      "gh_commands": [
+        "gh label create 'status:In review' --color 1d76db --repo massimorofi/clams",
+        "gh issue reopen 147 --repo massimorofi/clams",
+        "gh issue edit 147 --repo massimorofi/clams --remove-label 'status:Done' --add-label 'status:In review'",
+        "gh issue comment 147 --repo massimorofi/clams --body-file <file containing the comment body from docs/superagent_improvements_status.md#comment-bodies>"
+      ]
+    }
+  },
+  {
+    "improvement": 7,
+    "title": "#7 Phase 2: Read-only workflow post-mortem analysis job (bounded, versioned, proposals only)",
+    "issue_number": 148,
+    "issue_url": "https://github.com/massimorofi/clams/issues/148",
+    "status": "implemented",
+    "improvement_name": "Workflow post-mortem analysis job",
+    "test_files": ["tests/unit/test_postmortem.py"],
+    "tests_passing": 31,
+    "implementing_task": {
+      "clams_task_id": "7138f0f5-fa32-41d2-a271-eca38b1aed15",
+      "workflow_id": "6ddd7472-b810-48c7-b8f7-2e74a49a42de",
+      "commits": ["445c13c feat(postmortem): read-only post-mortem job + clams postmortem subcommand"],
+      "summary": "Added src/clams/postmortem/ as a strictly read-only package: select.py (bounded workflow selection), snapshot.py (SELECT-only evidence snapshot addressable by stable refs), report.py (versioned JSON report with schema_version and evidence refs on every finding) and validate.py (report validation), plus the stdlib-only 'clams postmortem' CLI subcommand that writes the report and exits non-zero on validation failure."
+    },
+    "acceptance_criteria_satisfied": [
+      "src/clams/postmortem/{select.py,snapshot.py,report.py,validate.py} exist",
+      "tests/unit/test_postmortem.py passes (31 tests)",
+      "The CLI subcommand writes a JSON report whose schema_version field is present and whose findings all carry non-empty evidence references",
+      "grep shows no INSERT/UPDATE anywhere under src/clams/postmortem/ (0 matches), so no file under src/clams/db or src/clams/planner is modified by the postmortem package"
+    ],
+    "acceptance_criteria_deferred": [],
+    "gate_command": "PYTHONPATH=src python3 -m pytest tests/unit/test_postmortem.py -o addopts='' && echo POSTMORTEM_OK",
+    "github_status_update": {
+      "observed_state": "closed",
+      "observed_labels": ["status:Done"],
+      "required_transition": "Move issue #148 to 'In review': reopen it (it is currently closed), replace the 'status:Done' label with the board's In-review status label, and post a comment listing the delivered acceptance criteria above plus the gate command that proves them.",
+      "board_status_option": "In review",
+      "label_to_add": "status:In review",
+      "label_exists_in_repo": false,
+      "apply_via": "gh issue edit / gh issue comment run by the operator environment when a GitHub token is available; the gate container has no network and no token, so this task only records the transition.",
+      "gh_commands": [
+        "gh label create 'status:In review' --color 1d76db --repo massimorofi/clams",
+        "gh issue reopen 148 --repo massimorofi/clams",
+        "gh issue edit 148 --repo massimorofi/clams --remove-label 'status:Done' --add-label 'status:In review'",
+        "gh issue comment 148 --repo massimorofi/clams --body-file <file containing the comment body from docs/superagent_improvements_status.md#comment-bodies>"
+      ]
+    }
+  },
+  {
+    "improvement": 3,
+    "title": "#3 Phase 4: Structured worker progress messages and Planner/operator handoffs",
+    "issue_number": 149,
+    "issue_url": "https://github.com/massimorofi/clams/issues/149",
+    "status": "implemented",
+    "improvement_name": "Structured worker progress and Planner/operator handoffs",
+    "test_files": ["tests/unit/test_worker_progress.py", "tests/unit/test_handoffs.py"],
+    "tests_passing": 50,
+    "implementing_task": {
+      "clams_task_id": "b12fc1c3-792b-4360-9437-e3a2ce68d007",
+      "workflow_id": "6ddd7472-b810-48c7-b8f7-2e74a49a42de",
+      "commits": ["38f7939 Add worker progress fencing and operator handoffs"],
+      "summary": "Added migrations/012_worker_progress_handoffs.sql (worker_progress, handoffs, handoff_events plus the dispose_handoff command kind, bundled in one file) and the fenced progress/handoff model: progress messages are rejected unless lease_token, attempt_no and monotonic seq match the live lease, and handoffs are append-only decision records (Planner-visible, closable, auditable) that never mutate the immutable task brief."
+    },
+    "acceptance_criteria_satisfied": [
+      "migrations/012_worker_progress_handoffs.sql exists",
+      "tests/unit/test_worker_progress.py (20) and tests/unit/test_handoffs.py (30) pass",
+      "A progress message with a stale lease_token/attempt_no or a non-monotonic seq is rejected and leaves worker_progress unchanged",
+      "Handoff rows remain readable after closing and reopening the DB",
+      "No code path in the new modules writes to the tasks table's brief columns (a scope_change handoff stores the ask in requested_action only)"
+    ],
+    "acceptance_criteria_deferred": [],
+    "gate_command": "PYTHONPATH=src python3 -m pytest tests/unit/test_worker_progress.py tests/unit/test_handoffs.py -o addopts='' && echo HANDOFFS_OK",
+    "github_status_update": {
+      "observed_state": "closed",
+      "observed_labels": ["status:Done"],
+      "required_transition": "Move issue #149 to 'In review': reopen it (it is currently closed), replace the 'status:Done' label with the board's In-review status label, and post a comment listing the delivered acceptance criteria above plus the gate command that proves them.",
+      "board_status_option": "In review",
+      "label_to_add": "status:In review",
+      "label_exists_in_repo": false,
+      "apply_via": "gh issue edit / gh issue comment run by the operator environment when a GitHub token is available; the gate container has no network and no token, so this task only records the transition.",
+      "gh_commands": [
+        "gh label create 'status:In review' --color 1d76db --repo massimorofi/clams",
+        "gh issue reopen 149 --repo massimorofi/clams",
+        "gh issue edit 149 --repo massimorofi/clams --remove-label 'status:Done' --add-label 'status:In review'",
+        "gh issue comment 149 --repo massimorofi/clams --body-file <file containing the comment body from docs/superagent_improvements_status.md#comment-bodies>"
+      ]
+    }
+  },
+  {
+    "improvement": 1,
+    "title": "#1 Phase 5a: Authenticated GitHub PR/CI webhook intake, normalization and dedupe into the command inbox",
+    "issue_number": 150,
+    "issue_url": "https://github.com/massimorofi/clams/issues/150",
+    "status": "implemented",
+    "improvement_name": "GitHub pull-request and CI feedback loop",
+    "additional_issues": [
+      {
+        "issue_number": 151,
+        "issue_url": "https://github.com/massimorofi/clams/issues/151",
+        "title": "#1 Phase 5b: PR/CI event correlation, stale-SHA safety and policy-gated routing to handoffs/follow-ups",
+        "clams_task_id": "f5152736-737b-4961-b137-959cfaa5ffc1",
+        "commits": ["47f87cf feat(planner): route GitHub feedback through explicit pr_links mapping"]
+      }
+    ],
+    "issue_numbers": [150, 151],
+    "test_files": ["tests/unit/test_gh_webhooks.py", "tests/unit/test_gh_feedback_correlation.py"],
+    "tests_passing": 75,
+    "implementing_task": {
+      "clams_task_id": "4d418c98-eb81-4f80-abc1-001a243da6fe",
+      "workflow_id": "6ddd7472-b810-48c7-b8f7-2e74a49a42de",
+      "commits": [
+        "d937cb2 feat(github): authenticated webhook intake with durable normalized ledger",
+        "a1ab77d docs(github): record pre-existing unit-suite failures vs this change",
+        "a421ab3 fix(github): keep webhook intake inside scope by folding 014 into 013",
+        "b55d5fd fix(github): keep the webhook secret out of settings serialization",
+        "47f87cf feat(planner): route GitHub feedback through explicit pr_links mapping"
+      ],
+      "summary": "Phase 5a added src/clams/github/webhooks.py and migrations/013_github_events.sql: constant-time HMAC signature verification (hmac.compare_digest), allowlisted repos, a durable normalized bounded github_events ledger with delivery_id dedupe, and a github_event command enqueued into the existing command inbox; the webhook secret was moved to a plain @property so it can never appear in model_dump(). Phase 5b added src/clams/planner/github_feedback.py and migrations/014_github_pr_links.sql: correlation only through an explicit repo + branch/PR + head-SHA pr_links mapping (five verdicts, only 'matched' may influence a task), stale-SHA events are audit-only, infra/config check failures become operator decisions, and automatic follow-up dispatch happens only under an explicit gh_project_policy, with outcomes routed through the handoff model and projections via the idempotent outbox."
+    },
+    "acceptance_criteria_satisfied": [
+      "src/clams/github/webhooks.py and migrations/013_github_events.sql exist; tests/unit/test_gh_webhooks.py passes (59 tests)",
+      "grep shows hmac.compare_digest is used for signature verification (3 occurrences in src/clams/github/webhooks.py)",
+      "No raw webhook payload is persisted: github_events stores only normalized bounded fields",
+      "An unsupported event action or a bad signature produces no command-inbox row in the tests",
+      "src/clams/planner/github_feedback.py exists; tests/unit/test_gh_feedback_correlation.py passes (16 tests)",
+      "With no policy configured the tests assert zero follow-up tasks are created for a failed check",
+      "The stale-head-SHA test asserts no dispatch and no status change",
+      "The duplicate-delivery test asserts exactly one github_events row and at most one follow-up/outbox side effect"
+    ],
+    "acceptance_criteria_deferred": [
+      "Configurable intake policy modes (shadow / enforce) are improvement 4 and are explicitly not in this scope; intake is delivered as a single authenticated, allowlisted path with no mode selector",
+      "A 'status:In review' label does not exist in the repository yet and must be created before the label transition can be applied"
+    ],
+    "gate_command": "PYTHONPATH=src python3 -m pytest tests/unit/test_gh_webhooks.py -o addopts='' && echo GH_WEBHOOK_INTAKE_OK ; PYTHONPATH=src python3 -m pytest tests/unit/test_gh_feedback_correlation.py -o addopts='' && echo GH_FEEDBACK_ROUTE_OK",
+    "github_status_update": {
+      "observed_state": "closed (both #150 and #151)",
+      "observed_labels": ["status:Done"],
+      "required_transition": "Move BOTH issues of improvement 1 (#150 and #151) to 'In review': reopen each (they are currently closed), replace 'status:Done' with the board's In-review status label, and post a comment on each listing its delivered acceptance criteria plus its gate command. #150 covers Phase 5a intake; #151 covers Phase 5b correlation.",
+      "board_status_option": "In review",
+      "label_to_add": "status:In review",
+      "label_exists_in_repo": false,
+      "apply_via": "gh issue edit / gh issue comment run by the operator environment when a GitHub token is available; the gate container has no network and no token, so this task only records the transition.",
+      "gh_commands": [
+        "gh label create 'status:In review' --color 1d76db --repo massimorofi/clams",
+        "gh issue reopen 150 --repo massimorofi/clams",
+        "gh issue edit 150 --repo massimorofi/clams --remove-label 'status:Done' --add-label 'status:In review'",
+        "gh issue comment 150 --repo massimorofi/clams --body-file <file containing the comment body from docs/superagent_improvements_status.md#comment-bodies>",
+        "gh issue reopen 151 --repo massimorofi/clams",
+        "gh issue edit 151 --repo massimorofi/clams --remove-label 'status:Done' --add-label 'status:In review'",
+        "gh issue comment 151 --repo massimorofi/clams --body-file <file containing the comment body from docs/superagent_improvements_status.md#comment-bodies>"
+      ]
+    }
+  },
+  {
+    "improvement": 5,
+    "title": "#5 Phase 6: Governed Claudio skill lifecycle (propose, evaluate, approve, activate, rollback)",
+    "issue_number": 152,
+    "issue_url": "https://github.com/massimorofi/clams/issues/152",
+    "status": "implemented",
+    "improvement_name": "Governed Claudio skill lifecycle",
+    "test_files": ["tests/unit/test_skill_lifecycle.py"],
+    "tests_passing": 55,
+    "implementing_task": {
+      "clams_task_id": "b8fb6b4e-18e3-4693-bd91-8ff6cf2a2639",
+      "workflow_id": "6ddd7472-b810-48c7-b8f7-2e74a49a42de",
+      "commits": ["4ffd3b7 feat(skills): versioned skill lifecycle with hash-keyed approval and rollback"],
+      "summary": "Added migrations/015_skill_lifecycle.sql (skills, skill_versions, skill_evaluations, skill_approvals, skill_deployments, task_skill_versions; approvals and deployments are append-only ledgers) and src/clams/skills/{manifest.py,lifecycle.py,evaluate.py,store.py}: a deny-by-default manifest schema that rejects unknown keys, permission grants and approval-bypass; the proposed -> draft -> evaluated -> approved -> active -> retired ladder keyed to content_hash rather than a version string; versioned eval sets where a safety failure or a safety regression blocks on its own regardless of aggregate pass_rate; and a store that re-checks approval/evaluation hash equality at activation time. Added the stdlib-only 'clams skills' CLI group (propose/draft/evaluate/approve/activate/retire/rollback, every mutation requires --as, exit 3 on a refused gate) and dispatch attribution into task_skill_versions in the same transaction as the claim."
+    },
+    "acceptance_criteria_satisfied": [
+      "migrations/015_skill_lifecycle.sql and src/clams/skills/{manifest.py,lifecycle.py,evaluate.py,store.py} exist",
+      "tests/unit/test_skill_lifecycle.py passes (55 tests)",
+      "A test asserts a post-mortem-derived proposal cannot reach 'active' without an approval row whose content_hash equals the evaluated artifact hash (a post-mortem actor may only propose and draft)",
+      "Editing content after evaluation moves the version back to draft and invalidates the stored approval by hash mismatch",
+      "Rollback restores the previous approved version and is recorded (rolled_back_at stamped on the superseded row; history is never rewritten)"
+    ],
+    "acceptance_criteria_deferred": [
+      "Controlled subagent delegation with scoped capabilities is improvement 6 and is explicitly not in this scope; skill capability is modelled as an actor capability set, not as a delegation grant"
+    ],
+    "gate_command": "PYTHONPATH=src python3 -m pytest tests/unit/test_skill_lifecycle.py -o addopts='' && echo SKILL_LIFECYCLE_OK",
+    "github_status_update": {
+      "observed_state": "closed",
+      "observed_labels": ["status:Done"],
+      "required_transition": "Move issue #152 to 'In review': reopen it (it is currently closed), replace the 'status:Done' label with the board's In-review status label, and post a comment listing the delivered acceptance criteria above plus the gate command that proves them.",
+      "board_status_option": "In review",
+      "label_to_add": "status:In review",
+      "label_exists_in_repo": false,
+      "apply_via": "gh issue edit / gh issue comment run by the operator environment when a GitHub token is available; the gate container has no network and no token, so this task only records the transition.",
+      "gh_commands": [
+        "gh label create 'status:In review' --color 1d76db --repo massimorofi/clams",
+        "gh issue reopen 152 --repo massimorofi/clams",
+        "gh issue edit 152 --repo massimorofi/clams --remove-label 'status:Done' --add-label 'status:In review'",
+        "gh issue comment 152 --repo massimorofi/clams --body-file <file containing the comment body from docs/superagent_improvements_status.md#comment-bodies>"
+      ]
+    }
+  },
+  {
+    "improvement": 4,
+    "title": "Configurable intake policy modes with shadow and enforce",
+    "issue_number": null,
+    "issue_url": null,
+    "status": "not_in_scope",
+    "improvement_name": "Configurable intake policy modes (shadow and enforce)",
+    "spec_reference": "https://github.com/massimorofi/clams/issues/138",
+    "test_files": [],
+    "tests_passing": 0,
+    "implementing_task": {
+      "clams_task_id": null,
+      "workflow_id": "6ddd7472-b810-48c7-b8f7-2e74a49a42de",
+      "commits": [],
+      "summary": "Not delivered by this workflow and no GitHub issue was created for it. The parent plan (issue #138) lists intake policy modes as a separate improvement; the delivered webhook work (issue #150) implements exactly one authenticated, allowlisted intake path with no mode selector, so shadow/enforce semantics were deliberately left out of scope rather than half-implemented."
+    },
+    "acceptance_criteria_satisfied": [],
+    "acceptance_criteria_deferred": [
+      "The intake pipeline has exactly one mode selector with three allowed values (off / shadow / enforce)",
+      "Shadow mode records the would-be action without dispatching it",
+      "Enforce mode blocks out-of-scope writes and records the refusal",
+      "No GitHub issue exists for this improvement, so there is no issue to move to 'In review'"
+    ],
+    "gate_command": null,
+    "github_status_update": {
+      "observed_state": "no issue created",
+      "observed_labels": [],
+      "required_transition": "None. Do not move this improvement to 'In review': no GitHub issue was opened for it and nothing was implemented. If the operator wants it tracked, open a new issue under parent #138 with status 'Ready' (board) / 'status:Ready' (label).",
+      "board_status_option": null,
+      "label_to_add": null,
+      "label_exists_in_repo": false,
+      "apply_via": "No gh issue edit / gh issue comment action is required. The gate container has no network and no token; the operator applies any GitHub change from an authenticated environment.",
+      "gh_commands": []
+    }
+  },
+  {
+    "improvement": 6,
+    "title": "Controlled subagent delegation with scoped capabilities",
+    "issue_number": null,
+    "issue_url": null,
+    "status": "not_in_scope",
+    "improvement_name": "Controlled subagent delegation with scoped capabilities",
+    "spec_reference": "https://github.com/massimorofi/clams/issues/138",
+    "test_files": [],
+    "tests_passing": 0,
+    "implementing_task": {
+      "clams_task_id": null,
+      "workflow_id": "6ddd7472-b810-48c7-b8f7-2e74a49a42de",
+      "commits": [],
+      "summary": "Not delivered by this workflow and no GitHub issue was created for it. The parent plan (issue #138) attaches controlled_subagent_delegation.md as a separate improvement; nothing in the five delivered phases grants or scopes subagent delegation, so it stays out of scope."
+    },
+    "acceptance_criteria_satisfied": [],
+    "acceptance_criteria_deferred": [
+      "Delegation of a task to a subagent is granted explicitly and is bounded by a scoped capability set",
+      "A delegated subagent cannot widen its own scope, contract or writable paths",
+      "Delegation decisions are recorded and auditable",
+      "No GitHub issue exists for this improvement, so there is no issue to move to 'In review'"
+    ],
+    "gate_command": null,
+    "github_status_update": {
+      "observed_state": "no issue created",
+      "observed_labels": [],
+      "required_transition": "None. Do not move this improvement to 'In review': no GitHub issue was opened for it and nothing was implemented. If the operator wants it tracked, open a new issue under parent #138 with status 'Ready' (board) / 'status:Ready' (label).",
+      "board_status_option": null,
+      "label_to_add": null,
+      "label_exists_in_repo": false,
+      "apply_via": "No gh issue edit / gh issue comment action is required. The gate container has no network and no token; the operator applies any GitHub change from an authenticated environment.",
+      "gh_commands": []
+    }
+  }
+]
