@@ -82,10 +82,12 @@ the two to match exactly.
 
 ## Migration note
 
-`migrations/014_github_event_command.sql` adds `github_event` to the
-`commands.kind` CHECK constraint (the same table-rebuild pattern as
-004/007/008/012) — the DB CHECK, not `repo_commands.COMMAND_KINDS`, is the
-authoritative gate.
+`migrations/013_github_events.sql` creates the `github_events` ledger **and**
+adds `github_event` to the `commands.kind` CHECK constraint in one file (the
+same table-rebuild pattern as 004/007/008/012) — the DB CHECK, not
+`repo_commands.COMMAND_KINDS`, is the authoritative gate. Keeping both in 013
+is deliberate: the ledger and the command kind are one indivisible intake
+contract, and a separate `014` would fall outside this change's scope.
 
 ## Remaining work
 
