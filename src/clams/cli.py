@@ -1,5 +1,5 @@
 """`clams` command line: planner | executor | api | migrate | healthcheck |
-status | monitor | command."""
+status | monitor | command | postmortem."""
 from __future__ import annotations
 
 import argparse
@@ -9,7 +9,13 @@ import sys
 from typing import Optional
 
 from . import __version__
-from .config import ConfigError, Settings
+
+try:  # a minimal (stdlib-only) install has no pydantic-settings; only the
+      # read-only `postmortem` subcommand needs to work there.
+    from .config import ConfigError, Settings
+except ModuleNotFoundError:  # pragma: no cover
+    ConfigError = None
+    Settings = None
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -46,8 +52,42 @@ def main(argv: Optional[list[str]] = None) -> int:
     cmd.add_argument("kind", choices=["pause", "resume"])
     cmd.add_argument("--by", default="operator")
 
+    pm = sub.add_parser("postmortem",
+                        help="read-only post-mortem report for terminal "
+                             "workflows (JSON written under reports/)")
+    pm.add_argument("--status", action="append", dest="statuses",
+                    choices=["done", "failed", "cancelled"],
+                    help="terminal status to include (repeatable; "
+                         "default: all terminal statuses)")
+    pm.add_argument("--since", default=None,
+                    help="only workflows updated at/after this timestamp "
+                         "(YYYY-MM-DD HH:MM:SS or ISO-8601)")
+    pm.add_argument("--limit", type=int, default=25,
+                    help="max workflows in one report (default 25)")
+    pm.add_argument("--out", default=None,
+                    help="output directory (default: ./reports)")
+    pm.add_argument("--out-file", default=None,
+                    help="explicit output file path (overrides --out)")
+    pm.add_argument("--db", default=None,
+                    help="SQLite path (default: CLAMS_DB_PATH)")
+    pm.add_argument("--max-report-bytes", type=int, default=None,
+                    help="reject the report if its payload exceeds this size")
+    pm.add_argument("--print", dest="print_report", action="store_true",
+                    help="also print the report JSON to stdout")
+
     args = parser.parse_args(argv)
     _setup_logging(args.verbose)
+
+    # `postmortem` is stdlib-only and read-only: it must run even where
+    # pydantic-settings is unavailable, so it never touches Settings.
+    if args.cmd == "postmortem":
+        return _postmortem(args)
+
+    if Settings is None:
+        print("config error: pydantic-settings is not installed; only the "
+              "'postmortem' subcommand is available in this environment",
+              file=sys.stderr)
+        return 2
     settings = Settings()
 
     try:
@@ -344,6 +384,82 @@ def _command(settings, kind: str, by: str) -> int:
     conn.close()
     print(f"command {kind} queued as #{cid}")
     return 0
+
+
+def _pm_db_path(explicit: Optional[str]) -> str:
+    """Resolve the SQLite path without requiring pydantic-settings."""
+    import os
+    if explicit:
+        return explicit
+    if Settings is not None:
+        try:
+            return Settings().db_path
+        except Exception:  # noqa: BLE001 - bad config must not hide the report
+            pass
+    return os.environ.get("CLAMS_DB_PATH", "./data/clams.db")
+
+
+def _postmortem(args) -> int:
+    """Read-only post-mortem: select -> snapshot -> report -> validate -> write.
+
+    Exit codes: 0 written, 2 no database / bad arguments, 3 validation failure.
+    """
+    import sqlite3
+    from pathlib import Path
+
+    from .postmortem import (MAX_REPORT_BYTES, ReportValidationError,
+                             payload_bytes, report_filename, run_postmortem)
+
+    db_path = _pm_db_path(args.db)
+    if not Path(db_path).exists():
+        print(f"postmortem: database not found: {db_path}", file=sys.stderr)
+        return 2
+    try:
+        conn = _ro_connect(db_path)
+    except sqlite3.Error as exc:
+        print(f"postmortem: cannot open {db_path}: {exc}", file=sys.stderr)
+        return 2
+    try:
+        try:
+            report = run_postmortem(
+                conn, statuses=args.statuses, since=args.since,
+                limit=args.limit,
+                max_report_bytes=int(args.max_report_bytes
+                                     or MAX_REPORT_BYTES))
+        except ReportValidationError as exc:
+            for e in exc.errors:
+                print(f"postmortem invalid: {e}", file=sys.stderr)
+            return 3
+        except (ValueError, sqlite3.Error) as exc:
+            print(f"postmortem failed: {exc}", file=sys.stderr)
+            return 2
+    finally:
+        conn.close()
+
+    target = (Path(args.out_file) if args.out_file
+              else Path(args.out or "reports") / report_filename(report))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    text = json.dumps(report, indent=2, sort_keys=True, default=str)
+    target.write_text(text + "\n", encoding="utf-8")
+    n_find = len(report.get("findings") or [])
+    print(f"postmortem report: {target} "
+          f"({payload_bytes(report)} bytes, {len(report['workflow_ids'])} "
+          f"workflow(s), {n_find} finding(s), "
+          f"truncated={report.get('truncated')})")
+    if args.print_report:
+        print(text)
+    return 0
+
+
+def _ro_connect(db_path: str):
+    """Read-only connection; falls back to a plain open only when a read-only
+    WAL open is impossible (missing -shm). The post-mortem issues SELECTs
+    only either way."""
+    from .db import connect
+    try:
+        return connect(db_path, read_only=True)
+    except Exception:  # noqa: BLE001
+        return connect(db_path, read_only=False)
 
 
 def _planner(settings) -> int:
