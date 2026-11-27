@@ -18,10 +18,13 @@ from starlette.middleware.cors import CORSMiddleware
 from ..claudio_client import (ClaudioClient, ClaudioUnavailable,
                               SessionNotFound)
 from ..db import (repo_alerts, repo_commands, repo_events, repo_executors,
-                  repo_outbox, repo_projects, repo_questions, repo_runtime,
-                  repo_tasks, repo_workflows, connect)
+                  repo_github_events, repo_outbox, repo_projects,
+                  repo_questions, repo_runtime, repo_tasks, repo_workflows,
+                  connect)
 from ..db import repo_handoffs, repo_progress
 from ..db.conn import db_integrity_ok
+from ..github.webhooks import (DEFAULT_MAX_BODY_BYTES, WebhookError,
+                               process_webhook_body)
 from .auth import check_auth
 from .sse import event_stream
 
@@ -285,6 +288,64 @@ def create_app(settings, *, claudio_p: Optional[ClaudioClient] = None,
         d["payload"] = json.loads(d["payload"]) if d["payload"] else {}
         d["result"] = json.loads(d["result"]) if d["result"] else None
         return d
+
+    # ----------------------------------------------------------- webhooks
+    @app.post("/webhooks/github", status_code=202)
+    async def github_webhook(request: Request,
+                             writer: sqlite3.Connection = Depends(writer_dep)):
+        """GitHub webhook receiver: authenticate, bound, normalize, enqueue.
+
+        Authentication IS the HMAC-SHA256 signature: GitHub cannot present the
+        operator bearer token, so this route deliberately sits outside the
+        ``/api/v1`` bearer gate and ``X-Hub-Signature-256`` is the credential
+        (plus the repository allowlist). An unsigned delivery is never trusted.
+
+        On success the API writes exactly two rows and nothing else: the durable
+        ``github_events`` ledger row (normalized, bounded, redacted — never the
+        raw payload) and one ``github_event`` command-inbox record that the
+        planner drains. A rejected delivery — oversized body, missing or invalid
+        signature, unsupported (event, action), repository not allowlisted —
+        answers 4xx and enqueues no work. A redelivered ``delivery_id`` is a
+        no-op: one ledger row, one command, ever.
+        """
+        declared = request.headers.get("content-length", "")
+        if declared.isdigit() and int(declared) > DEFAULT_MAX_BODY_BYTES:
+            # refuse before the body is ever buffered
+            return JSONResponse(
+                {"error": "BodyTooLargeError",
+                 "detail": f"declared body of {declared} bytes exceeds the "
+                           f"{DEFAULT_MAX_BODY_BYTES}-byte limit"},
+                status_code=413)
+        raw = await request.body()
+        try:
+            record = process_webhook_body(
+                settings.github_webhook_secret, raw,
+                request.headers.get("x-hub-signature-256"),
+                request.headers.get("x-github-delivery"),
+                request.headers.get("x-github-event"),
+                max_bytes=DEFAULT_MAX_BODY_BYTES,
+                allowed_repos=settings.github_allowed_repos)
+        except WebhookError as exc:
+            # the reason only: never the body, the signature or the secret
+            return JSONResponse(exc.as_dict(), status_code=exc.status_code)
+        is_new, command_id = repo_github_events.record_delivery(writer, record)
+        if not is_new:
+            return JSONResponse(
+                {"delivery_id": record.delivery_id, "status": "duplicate",
+                 "event_action": record.event_action, "command_id": None},
+                status_code=200)
+        return {"delivery_id": record.delivery_id, "status": "new",
+                "event_action": record.event_action, "repo": record.repo,
+                "pr_number": record.pr_number, "check_id": record.check_id,
+                "command_id": command_id}
+
+    @app.get(f"{API_PREFIX}/github_events")
+    def github_events(state: Optional[str] = None, limit: int = 50,
+                      ro: sqlite3.Connection = Depends(ro_dep)):
+        """Operator visibility into webhook intake (read-only, bearer-gated)."""
+        return {"counts": repo_github_events.counts_by_state(ro),
+                "events": [dict(r) for r in
+                           repo_github_events.list_events(ro, state, limit)]}
 
     # --------------------------------------------------------------- SSE
     @app.get(f"{API_PREFIX}/events")

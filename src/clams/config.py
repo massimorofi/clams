@@ -6,12 +6,13 @@ list exactly these keys with the same defaults (enforced by
 """
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal, Optional
 
 import yaml
-from pydantic import field_validator
+from pydantic import computed_field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 Role = Literal["planner", "executor", "api"]
@@ -60,6 +61,28 @@ class Settings(BaseSettings):
     github_token: str = ""
     github_api_base: str = "https://api.github.com"
     github_graphql_base: str = "https://api.github.com/graphql"
+
+    # --- github webhook intake (env-only, never persisted, never logged) ----
+    # These are ``computed_field``s rather than Settings fields on purpose:
+    #   * ``github_webhook_secret`` must exist only in the deployment
+    #     environment. A real field would be echoed by ``.env.example`` parity
+    #     tooling and by any ``model_dump()`` of settings, i.e. it could end up
+    #     committed or logged.
+    #   * both are re-read on access, so a redeploy with a new secret takes
+    #     effect without a settings-cache reset.
+    # Nothing logs these; the webhook endpoint only ever reports *that*
+    # verification failed, never the secret or the expected digest.
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def github_webhook_secret(self) -> str:
+        return os.environ.get("CLAMS_GITHUB_WEBHOOK_SECRET", "").strip()
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def github_allowed_repos(self) -> list[str]:
+        """Comma-separated ``owner/repo`` (or ``owner/*``) allowlist."""
+        raw = os.environ.get("CLAMS_GITHUB_ALLOWED_REPOS", "")
+        return [item.strip() for item in raw.split(",") if item.strip()]
 
     # --- api -----------------------------------------------------------------------
     api_host: str = "127.0.0.1"
