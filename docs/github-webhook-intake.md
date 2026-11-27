@@ -96,3 +96,22 @@ authoritative gate.
 * Nothing yet prunes old `github_events` rows; hook it into the retention pass.
 * `GET /api/v1/github_events` is read-only visibility; a `processed_state`
   drain belongs with the planner consumer.
+
+## Test suite status
+
+`tests/unit/test_gh_webhooks.py` — 57 tests, all green, stdlib-only, no FastAPI
+import.
+
+Four tests in the wider unit suite fail **before and after** this change and are
+not fixable from the files in scope:
+
+* `test_db_repos.py::test_migrations_apply_once`, `test_cli.py::test_status_json`
+  and `test_cli.py::test_migrate_then_status` assert `schema_version == 8`
+  (`# 001..008`) while the tree already shipped migrations up to `012` before
+  this change — they were failing at `12 != 8` and now read `14 != 8`.
+* `test_bus.py::test_redis_bus_roundtrip` needs a live Redis.
+
+The correct fix is to make those three assertions derive from the migration
+directory (e.g. `max(int(f.name.split('_')[0]) for f in MIGRATIONS_DIR.glob('*.sql'))`)
+rather than hard-code a version; that belongs in a test-maintenance change, not
+here.
