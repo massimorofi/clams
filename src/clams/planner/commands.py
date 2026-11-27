@@ -147,7 +147,21 @@ def _apply(conn, row, *, adhoc_handler=None, gh_client=None,
     if kind == "dispose_handoff":
         return _dispose_handoff(conn, payload, issuer, target)
 
+    if kind == "github_event":
+        return _github_event(conn, payload)
+
     raise ValueError(f"unhandled command kind {kind}")
+
+
+def _github_event(conn, payload: dict) -> dict:
+    """Consume one normalized GitHub delivery (the planner side of intake).
+
+    Correlation, classification and routing all live in
+    ``clams.planner.github_feedback``; this is only the inbox adapter. The
+    verdict is stored on the command row so an operator can see what happened.
+    """
+    from . import github_feedback
+    return github_feedback.handle_command(conn, payload)
 
 
 def _settings_patch(conn, payload: dict, issuer: str) -> dict:

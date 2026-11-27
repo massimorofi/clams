@@ -139,3 +139,15 @@ so `.env.example` parity tooling never gains a key for it.
 * `test_secret_never_appears_in_settings_dump` - runtime proof that attribute
   access returns the secret while `model_dump()` and `model_dump_json()` do
   not contain it.
+
+## What happens next (the planner side)
+
+Stopping here is the point: the API records, it never reacts. Turning a delivery
+into a decision is the planner's job and lives in
+`src/clams/planner/github_feedback.py`, which correlates a delivery to a task
+**only** through an explicitly stored `pr_links` mapping (repo + branch/PR +
+head SHA), refuses any event whose `head_sha` is not the currently associated PR
+head, separates infrastructure/configuration check failures from code failures,
+and dispatches automatically only where a project policy opts in.
+
+See **docs/github-feedback-route.md**.

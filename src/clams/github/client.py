@@ -102,6 +102,12 @@ class GitHubClient:
     def get_issue(self, repo: str, number: int) -> dict:
         return self._request("GET", f"/repos/{repo}/issues/{number}")
 
+    def get_pull_request(self, repo: str, number: int) -> dict:
+        """One pull request. Used to (re)assert the current head SHA/branch of
+        a PR when recording a pr_links mapping - never to correlate a webhook,
+        which goes through the stored mapping only."""
+        return self._request("GET", f"/repos/{repo}/pulls/{number}")
+
     def create_issue(self, repo: str, title: str, body: str,
                      labels: list[str]) -> dict:
         return self._request("POST", f"/repos/{repo}/issues",
