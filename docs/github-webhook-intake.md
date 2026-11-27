@@ -117,3 +117,25 @@ The correct fix is to make those three assertions derive from the migration
 directory (e.g. `max(int(f.name.split('_')[0]) for f in MIGRATIONS_DIR.glob('*.sql'))`)
 rather than hard-code a version; that belongs in a test-maintenance change, not
 here.
+
+
+## Secret handling: plain property, not `computed_field`
+
+`github_webhook_secret` and `github_allowed_repos` are read from the deployment
+environment (`CLAMS_GITHUB_WEBHOOK_SECRET`, `CLAMS_GITHUB_ALLOWED_REPOS`) and
+exposed as **plain `@property`** members of `Settings`.
+
+This is deliberate and load-bearing. A pydantic `computed_field` is emitted by
+`model_dump()` / `model_dump_json()`, so any settings serialization - a debug
+log line, a planner payload, a future `/config` echo - would carry the secret
+verbatim. A plain property is reachable as `settings.github_webhook_secret`
+while being invisible to serialization, and it is absent from `model_fields`,
+so `.env.example` parity tooling never gains a key for it.
+
+`tests/unit/test_gh_webhooks.py` guards both halves:
+
+* `test_webhook_settings_are_plain_properties_not_computed_fields` - AST check
+  that neither member is decorated with `computed_field` (stdlib-only).
+* `test_secret_never_appears_in_settings_dump` - runtime proof that attribute
+  access returns the secret while `model_dump()` and `model_dump_json()` do
+  not contain it.

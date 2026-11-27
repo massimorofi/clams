@@ -425,3 +425,53 @@ def test_webhooks_module_imports_only_the_stdlib() -> None:
             imported.add(node.module.split(".")[0])
     assert imported <= {"__future__", "hashlib", "hmac", "json", "dataclasses",
                         "typing"}, f"non-stdlib import in webhooks.py: {imported}"
+
+
+# ------------------------------------------------------- secret hygiene
+def test_webhook_settings_are_plain_properties_not_computed_fields() -> None:
+    """The webhook secret must be invisible to settings serialization.
+
+    A pydantic ``computed_field`` IS emitted by ``model_dump()`` /
+    ``model_dump_json()``, so any settings dump - log line, debug payload -
+    would echo the secret. Parsed from source so this stays stdlib-only.
+    """
+    import ast
+    from pathlib import Path
+
+    cfg = Path(wh.__file__).parents[1] / "config.py"
+    tree = ast.parse(cfg.read_text(encoding="utf-8"))
+    settings_cls = next(
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.ClassDef) and n.name == "Settings")
+    watched = {"github_webhook_secret", "github_allowed_repos"}
+    found = 0
+    for node in settings_cls.body:
+        if not isinstance(node, ast.FunctionDef) or node.name not in watched:
+            continue
+        found += 1
+        decorators = {d.id if isinstance(d, ast.Name) else getattr(d, "attr", "")
+                      for d in node.decorator_list}
+        assert "computed_field" not in decorators, (
+            f"{node.name} is a computed_field, so model_dump() would leak it")
+        assert "property" in decorators, f"{node.name} must be a property"
+    assert found == 2, "both github webhook settings must exist on Settings"
+
+
+def test_secret_never_appears_in_settings_dump(monkeypatch) -> None:
+    """Runtime proof: attribute access works, serialization does not carry it."""
+    pydantic_settings = pytest.importorskip("pydantic_settings")
+    del pydantic_settings
+    from clams.config import Settings
+
+    canary = "CANARY-SECRET-MUST-NOT-BE-SERIALIZED"
+    monkeypatch.setenv("CLAMS_GITHUB_WEBHOOK_SECRET", canary)
+    monkeypatch.setenv("CLAMS_GITHUB_ALLOWED_REPOS", "acme/widgets, other/repo")
+    s = Settings()
+
+    assert s.github_webhook_secret == canary
+    assert s.github_allowed_repos == ["acme/widgets", "other/repo"]
+
+    dumped = s.model_dump()
+    assert "github_webhook_secret" not in dumped
+    assert canary not in json.dumps(dumped, default=str)
+    assert canary not in s.model_dump_json()
