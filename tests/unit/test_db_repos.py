@@ -10,11 +10,15 @@ from clams.db import connect, migrate, schema_version, immediate
 from clams.db import (repo_projects, repo_workflows, repo_tasks,
                       repo_questions, repo_commands, repo_outbox,
                       repo_events, repo_executors, repo_alerts, repo_runtime)
-from clams.db.conn import db_integrity_ok, plus_s, utcnow_s
+from clams.db.conn import MIGRATIONS_DIR, db_integrity_ok, plus_s, utcnow_s
+
+# Derived, not hard-coded: stays correct as new migrations land.
+LATEST_SCHEMA_VERSION = max(
+    int(p.name.split("_", 1)[0]) for p in MIGRATIONS_DIR.glob("*.sql"))
 
 
 def test_migrations_apply_once(db):
-    assert schema_version(db) == 10   # 001..010
+    assert schema_version(db) == LATEST_SCHEMA_VERSION   # 001..latest
     assert migrate(db) == []          # idempotent
     assert db_integrity_ok(db)
 

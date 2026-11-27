@@ -6,6 +6,11 @@ import json
 import pytest
 
 from clams.cli import main
+from clams.db.conn import MIGRATIONS_DIR
+
+# Derived, not hard-coded: stays correct as new migrations land.
+LATEST_SCHEMA_VERSION = max(
+    int(p.name.split("_", 1)[0]) for p in MIGRATIONS_DIR.glob("*.sql"))
 
 
 @pytest.fixture()
@@ -24,7 +29,7 @@ def test_migrate_then_status(env, capsys):
     assert main(["status"]) == 0
     out = capsys.readouterr().out
     assert "== clams status ==" in out
-    assert "Schema      v10" in out
+    assert f"Schema      v{LATEST_SCHEMA_VERSION}" in out
     assert "Planner" in out and "no heartbeat" in out
     assert "Alerts      none open" in out
 
@@ -34,7 +39,7 @@ def test_status_json(env, capsys):
     capsys.readouterr()
     assert main(["status", "--json"]) == 0
     out = json.loads(capsys.readouterr().out)
-    assert out["schema_version"] == 10
+    assert out["schema_version"] == LATEST_SCHEMA_VERSION
 
 
 def test_command_pause(env, capsys):
