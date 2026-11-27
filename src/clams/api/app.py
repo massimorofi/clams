@@ -20,6 +20,7 @@ from ..claudio_client import (ClaudioClient, ClaudioUnavailable,
 from ..db import (repo_alerts, repo_commands, repo_events, repo_executors,
                   repo_outbox, repo_projects, repo_questions, repo_runtime,
                   repo_tasks, repo_workflows, connect)
+from ..db import repo_handoffs, repo_progress
 from ..db.conn import db_integrity_ok
 from .auth import check_auth
 from .sse import event_stream
@@ -32,6 +33,16 @@ class CommandBody(BaseModel):
     target: Optional[str] = None
     payload: dict = Field(default_factory=dict)
     issued_by: str = "api"
+
+
+class HandoffDispositionBody(BaseModel):
+    """Operator disposition of a handoff: queued as a command, never applied
+    to domain state by the API."""
+
+    status: str
+    disposition: str = ""
+    note: str = ""
+    issued_by: str = "operator"
 
 
 def create_app(settings, *, claudio_p: Optional[ClaudioClient] = None,
@@ -164,6 +175,71 @@ def create_app(settings, *, claudio_p: Optional[ClaudioClient] = None,
     @app.get(f"{API_PREFIX}/projects")
     def projects(ro: sqlite3.Connection = Depends(ro_dep)):
         return [dict(r) for r in repo_projects.list_projects(ro)]
+
+    # ------------------------------------------------- worker narration (ro)
+    @app.get(f"{API_PREFIX}/handoffs")
+    def handoffs(status: Optional[str] = None,
+                 workflow_id: Optional[str] = None,
+                 task_id: Optional[str] = None,
+                 kind: Optional[str] = None,
+                 limit: int = 100,
+                 ro: sqlite3.Connection = Depends(ro_dep)):
+        """Operator visibility: handoff history, newest first (read-only)."""
+        rows = repo_handoffs.list_handoffs(
+            ro, status=status, workflow_id=workflow_id, task_id=task_id,
+            kind=kind, limit=max(1, min(limit, 500)))
+        return {"counts": repo_handoffs.counts_by_status(ro),
+                "handoffs": [h.as_dict() for h in rows]}
+
+    @app.get(f"{API_PREFIX}/handoffs/{{handoff_id}}")
+    def handoff_detail(handoff_id: int, progress_limit: int = 50,
+                       ro: sqlite3.Connection = Depends(ro_dep)):
+        """One handoff + the worker progress around it + its audit trail."""
+        h = repo_handoffs.get_handoff(ro, handoff_id)
+        if h is None:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        progress = repo_progress.progress_rows_to_dicts(
+            repo_progress.list_progress(ro, h.task_id, h.attempt_no,
+                                        limit=max(1, min(progress_limit, 500))))
+        trail = [dict(r) for r in ro.execute(
+            "SELECT event_id, scope, ref, level, message, data, ts FROM events "
+            "WHERE data LIKE ? ORDER BY event_id",
+            (f'%"handoff_id": {handoff_id}%',)).fetchall()]
+        return {**h.as_dict(), "progress": progress, "audit": trail}
+
+    @app.get(f"{API_PREFIX}/tasks/{{task_id}}/progress")
+    def task_progress(task_id: str, attempt_no: Optional[int] = None,
+                      after_id: int = 0, limit: int = 200,
+                      ro: sqlite3.Connection = Depends(ro_dep)):
+        """Fenced worker progress for a task (read-only, ascending)."""
+        if repo_tasks.get_task(ro, task_id) is None:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        rows = repo_progress.list_progress(
+            ro, task_id, attempt_no, after_id=after_id,
+            limit=max(1, min(limit, 500)))
+        return {"task_id": task_id,
+                "attempt_no": attempt_no,
+                "last_seq": (repo_progress.last_seq(ro, task_id, attempt_no)
+                             if attempt_no is not None else None),
+                "progress": repo_progress.progress_rows_to_dicts(rows)}
+
+    @app.post(f"{API_PREFIX}/handoffs/{{handoff_id}}/dispose", status_code=202)
+    def dispose_handoff(handoff_id: int, body: HandoffDispositionBody,
+                        writer: sqlite3.Connection = Depends(writer_dep)):
+        """Queue an operator disposition through the command inbox.
+
+        The API does not write handoff state: it inserts a ``dispose_handoff``
+        command and the planner applies the transition when it drains the
+        inbox, so the Planner stays the only domain-state writer.
+        """
+        try:
+            cid = repo_handoffs.enqueue_disposition(
+                writer, handoff_id, body.status,
+                issued_by=body.issued_by or "operator",
+                disposition=body.disposition, note=body.note)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=422)
+        return {"command_id": cid, "status": "new", "handoff_id": handoff_id}
 
     # ---------------------------------------------------------- config
     @app.get(f"{API_PREFIX}/config")

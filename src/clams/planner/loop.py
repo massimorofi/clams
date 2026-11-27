@@ -235,6 +235,21 @@ class PlannerLoop:
                 self.bus.push_dlq(s.stream_dlq, d.payload, "max deliveries")
                 self.bus.ack(s.stream_events, s.group_planner, d.id)
                 continue
+            # worker narration (progress / handoff) is persisted by the
+            # planner before the core message contracts are consulted: it is
+            # evidence, not domain state, and must never burn an attempt.
+            if commands_mod.worker_narration_type(d.payload):
+                try:
+                    with immediate(self.conn):
+                        commands_mod.ingest_worker_payload(
+                            self.conn, d.payload, msg_id=d.id)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("worker narration dropped: %s", exc)
+                    self.bus.ack(s.stream_events, s.group_planner, d.id)
+                    continue
+                self.bus.ack(s.stream_events, s.group_planner, d.id)
+                n += 1
+                continue
             try:
                 apply_event(self.conn, msg, d.id, s,
                             gh_enabled=self.gh_client is not None)
