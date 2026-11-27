@@ -38,7 +38,8 @@ def prompt_vars(brief: contracts.Brief) -> dict:
         f"\nThe human answered your earlier question: {brief.answer}\n"
         if brief.answer else "")
     prior_failure_block = (
-        "PREVIOUS ATTEMPT FAILED THE EVIDENCE GATE:\n"
+        "PREVIOUS ATTEMPT FAILED THE EVIDENCE GATE "
+        "(cumulative history, oldest first):\n"
         f"{brief.prior_failure}\n"
         "The previous attempt's committed work is already on this branch — "
         "inspect it first and fix exactly these failures instead of redoing "

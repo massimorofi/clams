@@ -136,8 +136,8 @@ PROMPTS: dict[str, PromptSpec] = {
                     "`forbidden_line` renders the whole 'Forbidden paths' "
                     "line (with trailing newline) or is empty; `answer_block` "
                     "renders the human-answer block or is empty; "
-                    "`prior_failure_block` renders the previous-attempt gate-"
-                    "failure block on retries or is empty.",
+                    "`prior_failure_block` renders the cumulative prior-"
+                    "attempt gate-failure history on retries or is empty.",
         placeholders=("objective", "acceptance", "prior_failure_block",
                       "writable", "forbidden_line", "run", "max_turns",
                       "answer_block"),
