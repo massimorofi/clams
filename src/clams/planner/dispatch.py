@@ -8,13 +8,50 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 
 from .. import contracts
-from ..db import (repo_attempts, repo_events, repo_outbox, repo_tasks,
-                  repo_workflows)
+from ..db import (repo_attempts, repo_events, repo_outbox, repo_skills,
+                  repo_tasks, repo_workflows)
 from ..db.conn import immediate
 
 log = logging.getLogger("clams.dispatch")
+
+
+def _skill_snapshot(conn, task_id: str, workflow_id: str,
+                    phase: str = "dispatch") -> dict:
+    """Stamp which skill versions were in force, into task dispatch/result history.
+
+    Post-mortems must attribute an outcome to the artifact that was live *then*,
+    not to whatever is current when the report runs. The rows are written beside
+    the dispatch (same transaction as the claim) so a task can never be
+    dispatched without its skill context being recorded, and a task with no
+    active skills records nothing (an empty record is a real answer: "no skill
+    was in force").
+
+    Best-effort by construction: a DB that predates migration 015 must still
+    dispatch, so a missing table is skipped rather than raised.
+    """
+    try:
+        active = repo_skills.active_skill_versions(conn)
+        if active:
+            repo_skills.record_task_skills(
+                conn, task_id=task_id, workflow_id=workflow_id, phase=phase,
+                active=active)
+        return active
+    except sqlite3.OperationalError as exc:  # pragma: no cover - old schema
+        log.warning("skill attribution skipped for %s: %s", task_id, exc)
+        return {}
+
+
+def record_result_skills(conn, task_id: str, workflow_id: str) -> dict:
+    """Record the skill set in force when a task's outcome is handled.
+
+    Exposed for the result-ingest path so 'dispatch' and 'result' rows can be
+    compared: a difference means the skill changed underneath the task, which is
+    exactly the thing a post-mortem should be told about.
+    """
+    return _skill_snapshot(conn, task_id, workflow_id, phase="result")
 
 
 def dispatch_ready(conn, bus, settings) -> list[str]:
@@ -78,6 +115,14 @@ def dispatch_ready(conn, bus, settings) -> list[str]:
                                 f":{claimed['lease_token'][:12]}")
             repo_events.append_event(conn, "task", task_id, "info",
                                      f"dispatched attempt {claimed['attempt']}")
+            # skill attribution, in the same transaction as the claim: the
+            # dispatch and the record of what was live are one atomic fact
+            active = _skill_snapshot(conn, task_id, claimed["workflow_id"])
+            if active:
+                repo_events.append_event(
+                    conn, "task", task_id, "info",
+                    "skills live: " + ",".join(
+                        f"{k}@{v['version']}" for k, v in sorted(active.items())))
         dispatched.append(task_id)
     return dispatched
 

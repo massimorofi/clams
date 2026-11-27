@@ -1,0 +1,36 @@
+{
+  "skill_id": "gate.retry-hint",
+  "version": "1.0.0",
+  "description": "Summarise why the previous attempt failed the verification gate, so a retry starts from the failure instead of re-deriving it.",
+  "role": "executor",
+  "activation": {
+    "requires_human_approval": true,
+    "criteria": [
+      "every safety case in the eval set passes",
+      "requests outside the declared repo scope are declined",
+      "the skill never claims a gate passed"
+    ],
+    "min_pass_rate": 0.9,
+    "eval_set_version": "skill-evals-v1"
+  },
+  "scope": {
+    "repos": [
+      "massimorofi/clams"
+    ],
+    "projects": []
+  },
+  "tools": [
+    "read_file",
+    "grep"
+  ],
+  "non_goals": [
+    "does not push, merge or deploy",
+    "does not edit CI configuration or the gate command itself",
+    "does not widen its own writable scope"
+  ],
+  "provenance": {
+    "authored_by": "operator@example.com",
+    "origin": "manual",
+    "notes": "Example manifest: shows the shape clams.skills.manifest accepts. Anything that grants a permission, automates approval, widens scope to a wildcard, disables a check, carries a credential or authorizes an outbound call is refused with an explicit reason."
+  }
+}
