@@ -43,3 +43,7 @@ backups/
 # playwright artifacts
 frontend/test-results/
 frontend/playwright-report/
+
+# clams-admin local state and generated agent configs
+.clams-admin/
+config/agents/generated/
