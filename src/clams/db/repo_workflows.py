@@ -7,6 +7,7 @@ import uuid
 from typing import Any, Optional
 
 from .conn import utcnow_s
+from .repo_events import append_event
 
 WF_STATUSES = ('intake', 'planning', 'running', 'review', 'done',
                'failed', 'blocked', 'paused', 'cancelled')
@@ -76,6 +77,40 @@ def bump_replans(conn: sqlite3.Connection, workflow_id: str) -> int:
         "UPDATE workflows SET replans=replans+1, updated_at=? WHERE workflow_id=? "
         "RETURNING replans", (utcnow_s(), workflow_id)) as cur:
         return cur.fetchone()["replans"]
+
+
+def reset_replan_budget(conn: sqlite3.Connection, workflow_id: str, *,
+                        reason: str = 'operator_replan') -> int:
+    """Zero the replan counter and return the count it was reset from.
+
+    An operator-issued replan is a deliberate override, so the workflow must
+    start again with a *full* budget. Without this the counter keeps whatever
+    the automated path had already spent: a workflow that reached 'blocked'
+    through ``review.review_workflow``'s exhaustion branch is sitting at
+    ``max_replans``, so the first poisoned outcome after the override re-enters
+    that same branch and blocks immediately with 'replans exhausted' instead of
+    actually replanning.
+
+    Only ``replans`` (and ``updated_at``) is written. ``max_replans`` is a
+    planner setting (``clams.config.Settings``), never a column on workflows,
+    so the cap itself can neither be read nor mutated here. Automated /
+    planner-issued replans keep incrementing via ``bump_replans``; this helper
+    is for the operator override only.
+
+    Appends one event recording the previous count and the reason.
+    Raises ValueError on an unknown workflow.
+    """
+    row = conn.execute("SELECT replans FROM workflows WHERE workflow_id=?",
+                       (workflow_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"unknown workflow {workflow_id}")
+    prev = int(row["replans"] or 0)
+    conn.execute("UPDATE workflows SET replans=0, updated_at=? "
+                 "WHERE workflow_id=?", (utcnow_s(), workflow_id))
+    append_event(conn, "workflow", workflow_id, "info",
+                 f"replan budget reset (was {prev}): {reason}",
+                 {"previous_replans": prev, "replans": 0, "reason": reason})
+    return prev
 
 
 def list_by_status(conn: sqlite3.Connection, *statuses: str) -> list[sqlite3.Row]:

@@ -66,12 +66,24 @@ def _apply(conn, row, *, adhoc_handler=None, gh_client=None,
         wf = repo_workflows.get_workflow(conn, target or "")
         if wf is None:
             raise ValueError(f"unknown workflow {target}")
+        # 'blocked' stays replannable on purpose: that is exactly the state a
+        # workflow reaches when the automated budget ran out
+        # (review.review_workflow -> 'blocked: replans exhausted'), and an
+        # operator replan is how a human hands it a fresh budget.
         if wf["status"] not in ("failed", "blocked", "review", "running"):
             raise ValueError(f"workflow {target} not replannable from {wf['status']}")
+        # Operator override: start from a full budget. Without the reset the
+        # counter is still at max_replans, so the first poisoned outcome after
+        # this replan re-triggers the replan path and blocks immediately with
+        # 'replans exhausted'. Automated/planner-issued replans keep
+        # incrementing the counter in review.review_workflow (bump_replans).
+        prev_replans = repo_workflows.reset_replan_budget(
+            conn, wf["workflow_id"], reason=f"operator_replan by {issuer}")
         repo_workflows.set_status(conn, wf["workflow_id"], "planning")
         repo_events.append_event(conn, "workflow", wf["workflow_id"], "info",
                                  f"replan requested by {issuer}")
-        return {"workflow": wf["workflow_id"], "status": "planning"}
+        return {"workflow": wf["workflow_id"], "status": "planning",
+                "replan_budget_reset": prev_replans}
 
     if kind == "retry":
         task = repo_tasks.get_task(conn, target or "")
