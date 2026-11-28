@@ -1,25 +1,27 @@
 name: clams
 
+x-clams-env: &clams-env
+  # In-container wiring; overrides .env (which keeps host-dev defaults
+  # and secrets). Volumes: clams-db -> /data, worktrees -> /work.
+  CLAMS_DATA_DIR: /data
+  CLAMS_DB_PATH: /data/clams.db
+  CLAMS_WORK_ROOT: /work
+  CLAMS_CLAUDIO_WORKSPACE_ROOT: /work
+  CLAMS_REDIS_URL: redis://redis:6379/0
+  # Must bind all interfaces inside the container, or docker's port
+  # forwarding can't reach it; the host mapping keeps it loopback-only.
+  CLAMS_API_HOST: 0.0.0.0
+  CLAMS_CLAUDIO_PLANNER_URL: http://claudio-planner:8100
+  CLAMS_CLAUDIO_EXECUTOR_URL: http://claudio-executor:8100
+  # git credential helper for task-branch pushes (executor-runner mounts
+  # config/clams-gitconfig); harmless where no git runs.
+  GIT_CONFIG_GLOBAL: /etc/clams-gitconfig
+
 x-clams: &clams
   image: clams:local
   build: .
   env_file: .env
-  environment:
-    # In-container wiring; overrides .env (which keeps host-dev defaults
-    # and secrets). Volumes: clams-db -> /data, worktrees -> /work.
-    CLAMS_DATA_DIR: /data
-    CLAMS_DB_PATH: /data/clams.db
-    CLAMS_WORK_ROOT: /work
-    CLAMS_CLAUDIO_WORKSPACE_ROOT: /work
-    CLAMS_REDIS_URL: redis://redis:6379/0
-    # Must bind all interfaces inside the container, or docker's port
-    # forwarding can't reach it; the host mapping keeps it loopback-only.
-    CLAMS_API_HOST: 0.0.0.0
-    CLAMS_CLAUDIO_PLANNER_URL: http://claudio-planner:8100
-    CLAMS_CLAUDIO_EXECUTOR_URL: http://claudio-executor:8100
-    # git credential helper for task-branch pushes (executor-runner mounts
-    # config/clams-gitconfig); harmless where no git runs.
-    GIT_CONFIG_GLOBAL: /etc/clams-gitconfig
+  environment: *clams-env
   restart: unless-stopped
   networks: [clams]
 
@@ -115,6 +117,29 @@ services:
   executor-runner:
     <<: *clams
     command: ["executor"]
+    volumes:
+      - worktrees:/work
+      # git credential helper for pushing task branches (GIT_CONFIG_GLOBAL)
+      - ./config/clams-gitconfig:/etc/clams-gitconfig:ro
+    depends_on:
+      redis: {condition: service_healthy}
+      claudio-executor: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "clams", "healthcheck", "executor"]
+      interval: 20s
+      retries: 3
+
+  # Second executor slot. executor_capacity is a Redis prefetch count, not
+  # concurrency — a runner executes one task at a time — so parallelism comes
+  # from a second runner container with its own CLAMS_EXECUTOR_ID (distinct
+  # row in the executors table, separately probed by the watchdog). The
+  # halogen LLM server has 4 slots; add more runners here to use the rest.
+  executor-runner-2:
+    <<: *clams
+    command: ["executor"]
+    environment:
+      <<: *clams-env
+      CLAMS_EXECUTOR_ID: executor-2
     volumes:
       - worktrees:/work
       # git credential helper for pushing task branches (GIT_CONFIG_GLOBAL)
