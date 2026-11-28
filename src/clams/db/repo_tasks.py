@@ -43,6 +43,67 @@ class IllegalTransition(Exception):
     pass
 
 
+#: Terminal statuses that record *undelivered* work. A replan supersedes the
+#: attempt, so an absent row in one of these states must still go to
+#: 'cancelled' (see ``reconcile_plan``): leaving it 'failed'/'blocked' keeps
+#: ``workflow_outcome`` permanently 'failed'/'blocked' no matter how well the
+#: new plan performs. 'success' is deliberately NOT here - it records delivered
+#: work and must survive a replan untouched.
+SUPERSEDE_TERMINAL = ("failed", "blocked")
+
+
+def normalize_plan_key(title: str) -> str:
+    """Canonical identity of a planned task, derived from its title.
+
+    A replan must not re-mint ``task_id``s (a fresh id makes the
+    ``gh:gh_subissue:<task_id>:created`` outbox key look new, which is how
+    duplicate GitHub sub-issues get minted). The title is the one field the
+    planner reproduces, so we key on it: strip, collapse internal whitespace
+    runs, casefold. ``'  Fix   Replan Dedupe '`` -> ``'fix replan dedupe'``.
+
+    Deliberately stdlib-only (this module is a repo layer: sqlite3/json/uuid).
+    """
+    return " ".join((title or "").split()).casefold()
+
+
+def _field(row: Any, name: str, default: Any = None) -> Any:
+    """Read ``name`` from a sqlite3.Row or a plain dict, tolerating a missing
+    column (``plan_key`` only exists from migration 009 onwards)."""
+    try:
+        keys = row.keys()
+    except AttributeError:
+        pass
+    else:
+        return row[name] if name in keys else default
+    try:
+        return row[name]
+    except (KeyError, IndexError):
+        return default
+
+
+def row_key(row: Any) -> str:
+    """Plan identity of an existing task row: its stored ``plan_key``, falling
+    back to ``normalize_plan_key(title)`` for rows predating migration 009
+    (NULL plan_key) or for schemas without the column at all."""
+    plan_key = _field(row, "plan_key")
+    if plan_key:
+        return str(plan_key)
+    return normalize_plan_key(str(_field(row, "title", "") or ""))
+
+
+def _has_plan_key_column(conn: sqlite3.Connection) -> bool:
+    """True when ``tasks.plan_key`` exists (migration 009+).
+
+    The repo layer must stay runnable against a schema that predates the
+    column, so every statement that mentions it is built conditionally.
+    """
+    try:
+        rows = conn.execute("PRAGMA table_info(tasks)").fetchall()
+    except sqlite3.Error:
+        return False
+    return any(r[1] == "plan_key" for r in rows)
+
+
 def can_transition(src: str, dst: str) -> bool:
     return dst in TRANSITIONS.get(src, set())
 
@@ -166,14 +227,182 @@ def create_task(conn: sqlite3.Connection, workflow_id: str, sequence_index: int,
                 gh_issue_number: Optional[int] = None) -> str:
     import uuid as _uuid
     task_id = str(_uuid.uuid4())
+    cols = ["task_id", "workflow_id", "sequence_index", "depends_on", "title",
+            "objective", "acceptance", "brief_json", "status", "max_attempts",
+            "gh_issue_number"]
+    vals: list[Any] = [task_id, workflow_id, sequence_index,
+                       json.dumps(depends_on or []), title, objective,
+                       acceptance, json.dumps(brief), "pending", max_attempts,
+                       gh_issue_number]
+    if _has_plan_key_column(conn):
+        cols.append("plan_key")
+        vals.append(normalize_plan_key(title))
     conn.execute(
-        "INSERT INTO tasks(task_id, workflow_id, sequence_index, depends_on, "
-        "title, objective, acceptance, brief_json, status, max_attempts, "
-        "gh_issue_number) VALUES(?,?,?,?,?,?,?,?,'pending',?,?)",
-        (task_id, workflow_id, sequence_index,
-         json.dumps(depends_on or []), title, objective, acceptance,
-         json.dumps(brief), max_attempts, gh_issue_number))
+        f"INSERT INTO tasks({', '.join(cols)}) "
+        f"VALUES({', '.join('?' * len(cols))})", vals)
     return task_id
+
+
+def reconcile_plan(conn: sqlite3.Connection, workflow_id: str,
+                   planned: list[dict[str, Any]]) -> dict[str, Any]:
+    """Apply a (re)plan to ``workflow_id`` in place, preserving task identity.
+
+    Why not delete-and-reinsert: ``delete_workflow_tasks`` mints brand-new
+    ``task_id``s on every replan, so the outbox key
+    ``gh:gh_subissue:<task_id>:created`` looks unseen and GitHub mints a
+    duplicate sub-issue for work that already has one. Identity here is
+    ``row_key()`` (``plan_key``, else ``normalize_plan_key(title)``): a plan
+    entry that matches an existing row UPDATES that row and keeps its
+    ``task_id`` (and therefore its ``gh_issue_number``) forever.
+
+    Rules:
+      * matched entry -> UPDATE in place of sequence_index, objective,
+        acceptance, brief_json, depends_on, max_attempts, plan_key,
+        updated_at. ``task_id``, ``gh_issue_number`` and ``status`` are never
+        written by a match.
+      * duplicate plan_keys inside ONE incoming plan collapse; first wins.
+      * existing rows whose plan_key is absent from the new plan are reported
+        as ``stale`` and set to 'cancelled' -- including rows that are already
+        terminal ``failed`` or ``blocked``, because a superseded failure would
+        otherwise hold ``workflow_outcome`` at 'failed'/'blocked' forever;
+        those flips are also reported under ``superseded_terminal``. The one
+        exception is ``success``: a delivered row keeps its status (it records
+        shipped work and must never block 'done'). Already-'cancelled' rows are
+        reported as stale but not rewritten. Nothing is ever DELETEd here (that
+        is what keeps GitHub sub-issues mapped).
+      * unmatched entries are inserted via ``create_task``.
+
+    ``sequence_index`` is UNIQUE per workflow, so renumbering runs in two
+    passes: matched rows are first parked on private scratch indices (a
+    re-ordered plan can never transiently collide with itself), then written
+    back in ascending order. A leftover cancelled row sitting on a needed slot
+    is parked too - its row stays, only its ordering slot moves.
+
+    Stdlib only (sqlite3/json), like the rest of this module. The caller owns
+    the transaction (wrap in ``conn.immediate``), as elsewhere here.
+
+    Note a re-added title matches its cancelled row and is therefore NOT
+    resurrected: status is left alone, so reviving planned work stays an
+    explicit decision for the caller (planner side, out of scope here).
+
+    Returns {'created': [task_id...], 'reused': {plan_key: task_id},
+             'stale': [task_id...], 'superseded_terminal': [task_id...]}.
+    """
+    rows = list_tasks(conn, workflow_id)
+    has_plan_key = _has_plan_key_column(conn)
+
+    # winner per plan_key: list_tasks is ORDER BY sequence_index, so the
+    # lowest sequence_index wins, matching the dedupe rule in 009.
+    existing: dict[str, sqlite3.Row] = {}
+    for r in rows:
+        existing.setdefault(row_key(r), r)
+
+    entries: dict[str, dict[str, Any]] = {}
+    for entry in (planned or []):
+        key = normalize_plan_key(str(entry.get("title") or ""))
+        if key not in entries:          # duplicate plan_key: first occurrence wins
+            entries[key] = entry
+
+    def as_int(value: Any, default: int) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    now = utcnow_s()
+    scratch = min([0] + [r["sequence_index"] for r in rows]) - 1
+
+    def park(task_id: str) -> None:
+        """Move a row off the sequence_index ladder onto a private slot."""
+        nonlocal scratch
+        scratch -= 1
+        conn.execute("UPDATE tasks SET sequence_index=?, updated_at=? "
+                     "WHERE task_id=?", (scratch, now, task_id))
+
+    def vacate(seq: int, keep: Optional[str]) -> None:
+        """Free ``seq``: whoever else in this workflow holds it gets parked."""
+        sql = ("SELECT task_id FROM tasks WHERE workflow_id=? AND sequence_index=?"
+               + (" AND task_id<>?" if keep else ""))
+        vals: list[Any] = [workflow_id, seq] + ([keep] if keep else [])
+        holder = conn.execute(sql, vals).fetchone()
+        if holder is not None:
+            park(holder["task_id"])
+
+    taken: set[int] = set()
+
+    def target_seq(entry: dict[str, Any], fallback: int) -> int:
+        seq = as_int(entry.get("sequence_index"), fallback)
+        while seq in taken:            # malformed plan: two entries, one slot
+            seq += 1
+        taken.add(seq)
+        return seq
+
+    created: list[str] = []
+    reused: dict[str, str] = {}
+    stale: list[str] = []
+    superseded_terminal: list[str] = []
+
+    # 1. stale first (status only; the row stays)
+    for r in rows:
+        key = row_key(r)
+        if key in entries and existing.get(key) is r:
+            continue
+        stale.append(r["task_id"])
+        status = r["status"]
+        if status == "success":
+            continue                   # delivered work is never rewritten
+        if status in SUPERSEDE_TERMINAL:
+            # superseded failure/block: flip it, and tell the caller it was
+            # a terminal row we had to override
+            conn.execute("UPDATE tasks SET status='cancelled', updated_at=? "
+                         "WHERE task_id=?", (now, r["task_id"]))
+            superseded_terminal.append(r["task_id"])
+        elif status not in TERMINAL:
+            conn.execute("UPDATE tasks SET status='cancelled', updated_at=? "
+                         "WHERE task_id=?", (now, r["task_id"]))
+
+    matched = [(k, e) for k, e in entries.items() if k in existing]
+    fresh = [(k, e) for k, e in entries.items() if k not in existing]
+
+    # 2. park the matched rows so pass 3 can write any numbering it likes
+    for k, _e in matched:
+        park(existing[k]["task_id"])
+
+    # 3. update matched rows in place
+    for i, (key, entry) in enumerate(matched, start=1):
+        row = existing[key]
+        seq = target_seq(entry, i)
+        vacate(seq, row["task_id"])
+        sets = ["sequence_index=?", "objective=?", "acceptance=?",
+                "brief_json=?", "depends_on=?", "max_attempts=?"]
+        vals: list[Any] = [seq, str(entry.get("objective") or ""),
+                           str(entry.get("acceptance") or ""),
+                           json.dumps(entry.get("brief") or {}),
+                           json.dumps([as_int(d, 0)
+                                       for d in (entry.get("depends_on") or [])]),
+                           as_int(entry.get("max_attempts"), 3)]
+        if has_plan_key:
+            sets.append("plan_key=?")
+            vals.append(key)
+        sets.append("updated_at=?")
+        vals += [now, row["task_id"]]
+        conn.execute(
+            f"UPDATE tasks SET {', '.join(sets)} WHERE task_id=?", vals)
+        reused[key] = row["task_id"]
+
+    # 4. everything else is new
+    for i, (key, entry) in enumerate(fresh, start=1):
+        seq = target_seq(entry, i)
+        vacate(seq, None)
+        created.append(create_task(
+            conn, workflow_id, seq, str(entry.get("title") or ""),
+            str(entry.get("objective") or ""), str(entry.get("acceptance") or ""),
+            entry.get("brief") or {},
+            [as_int(d, 0) for d in (entry.get("depends_on") or [])],
+            as_int(entry.get("max_attempts"), 3)))
+
+    return {"created": created, "reused": reused, "stale": stale,
+            "superseded_terminal": superseded_terminal}
 
 
 def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[sqlite3.Row]:
