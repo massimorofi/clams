@@ -143,7 +143,7 @@ For a local endpoint an empty/`local` key is fine.
 
 Checklist:
 
-- [ ] `docker compose -p clams ps` → 6 services, all healthy
+- [ ] `docker compose -p clams ps` → 8 services running; services with configured healthchecks report healthy
 - [ ] `curl -s localhost:1075/readyz` → `{"status":"ready","db":true}`
 - [ ] UI at `http://localhost:1075` renders the Overview after the token is set
 - [ ] `clams status` shows `Planner alive` (heartbeat < 60 s)

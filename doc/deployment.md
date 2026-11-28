@@ -1,5 +1,11 @@
 # Deployment & state machines
 
+> **Current deployment topology:** see [System architecture](system_architecture.md)
+> for the current Compose service inventory, networks, mounts, and
+> communication paths. Some topology details in this page describe an earlier
+> deployment revision; use the architecture guide and `docker-compose.yml` as
+> authoritative for the current stack.
+
 - [1. Topology](#1-topology)
 - [2. Services, volumes, healthchecks](#2-services-volumes-healthchecks)
 - [3. Scaling](#3-scaling)
@@ -13,59 +19,19 @@
 
 ## 1. Topology
 
-Six containers on one docker network (`clams`), four named volumes. The
-**planner is the only process that writes domain tables**; the API writes only
-the `commands` inbox; executors are stateless and DB-less.
+The deployment has eight Compose services across two Docker networks. The
+**planner is the only process that writes workflow/task domain state**; the
+API reads that state and queues commands (including validated webhook
+deliveries); executor-runners are stateless and DB-less. See
+[System architecture](system_architecture.md) for the current topology diagram
+and service/volume inventory.
 
-```mermaid
-flowchart TB
-    subgraph HOST["Docker host"]
-        subgraph NET["docker network: clams"]
-            REDIS[("redis:6379<br/>redis:7-alpine<br/>AOF everysec")]
-            CP["claudio-planner:8100<br/>claudio/agent:latest<br/>approval_mode on_request"]
-            CE["claudio-executor:8100<br/>claudio/agent:latest<br/>approval_mode off"]
-            PL["planner<br/>clams:local · clams planner"]
-            EX["executor-runner<br/>clams:local · clams executor"]
-            API["api<br/>clams:local · clams api"]
-        end
-        DB[("volume clams-db<br/>/data/clams.db WAL")]
-        WT[("volume worktrees<br/>/work/&lt;project&gt;/…")]
-        SS[("volume claudio-sessions<br/>/sessions")]
-        RD[("volume redis-data<br/>/data")]
-        CFG[("bind config/claudio-*.yaml<br/>over image config.yaml")]
-        BR["Browser"]
-    end
-    GH["GitHub API<br/>(REST + GraphQL)"]
-    LLM["LLM endpoint<br/>(OpenAI-compatible)"]
+The current topology diagram is in [System architecture](system_architecture.md).
 
-    DB --- PL
-    DB -. "ro" .- API
-    WT --- EX
-    WT --- CE
-    SS --- CP
-    SS --- CE
-    SS -.- API
-    RD --- REDIS
-    CFG --- CP
-    CFG --- CE
-    PL <--> REDIS
-    EX <--> REDIS
-    PL <--> CP
-    EX <--> CE
-    PL <--> GH
-    API --- BR
-    CP --- LLM
-    CE --- LLM
-
-    BR ---|"http://127.0.0.1:1075"| API
-    DBG1["debug Claudio-P<br/>127.0.0.1:1072"] --- CP
-    DBG2["debug Claudio-E<br/>127.0.0.1:1073"] --- CE
-```
-
-Streams: `clams:tasks` (planner → executors, group `executors`),
-`clams:events` (executors → planner, group `planner`), plus an auxiliary
-`clams:dlq` dead-letter stream. Losing Redis loses no work: on planner restart
-`rebuild_dispatch()` re-enqueues everything from the DB.
+Streams: `clams:tasks` (planner → executor-runners, group `executors`),
+`clams:events` (executor-runners → planner, group `planner`), plus an auxiliary
+`clams:dlq` dead-letter stream. Losing Redis loses no canonical task state:
+dispatch can be reconstructed from SQLite on planner restart.
 
 ## 2. Services, volumes, healthchecks
 
@@ -73,13 +39,15 @@ Streams: `clams:tasks` (planner → executors, group `executors`),
 |---|---|---|---|
 | `redis` | redis:7-alpine | `redis-cli ping` | — |
 | `claudio-planner` | `${CLAUDIO_IMAGE}` | `GET :8100/healthz` | — |
-| `claudio-executor` | `${CLAUDIO_IMAGE}` | `GET :8100/healthz` | — |
+| `claudio-executor` | `${CLAUDIO_EXECUTOR_IMAGE}` | `GET :8100/healthz` | — |
+| `claudio-ui` | `${CLAUDIO_WEB_IMAGE}` | — | claudio-planner healthy |
 | `planner` | clams:local (built) | `clams healthcheck planner` (heartbeat < 60 s) | redis + claudio-planner healthy |
 | `executor-runner` | clams:local | `clams healthcheck executor` (redis ping + claudio-E health) | redis + claudio-executor healthy |
+| `executor-runner-2` | clams:local | `clams healthcheck executor` (redis ping + claudio-E health) | redis + claudio-executor healthy |
 | `api` | clams:local | — (compose `depends_on` planner healthy) | planner healthy |
 
-Volumes: `clams-db` (SQLite, planner-owned; API mounts rw for the commands
-insert only), `worktrees` (shared between executor-runner and claudio-executor
+Volumes: `clams-db` (SQLite, planner-owned; API mounts rw for command and
+webhook intake), `worktrees` (shared between executor-runners and claudio-executor
 — this is how the agent sees the worktrees), `claudio-sessions` (agent session
 state), `redis-data` (AOF), `claudio-planner-data` / `claudio-executor-data`
 (session transcripts + agent state — without these a rebuild wipes every
@@ -90,11 +58,12 @@ wins over `CLAUDIO__*` env vars; directory, not file, so UI config edits can
 
 ## 3. Scaling
 
-One Claudio-E serves one task at a time (session isolation), so scale in
-**pairs**: add `claudio-executor-N` + `executor-runner-N` to the compose file
-(each runner gets its own `worktrees` mount and points at its Claudio-E via
-`CLAMS_CLAUDIO_EXECUTOR_URL`). The planner is a singleton by design (single
-writer). The API is stateless; run more replicas behind a proxy if needed.
+Each executor-runner handles one task at a time; the current deployment has
+two runner containers with distinct executor IDs sharing the same Claudio-E
+backend and worktree volume. Add runner consumers with unique IDs to increase
+runner concurrency, and ensure the shared agent/model endpoint can serve the
+additional requests. The planner is a singleton by design (single writer).
+The API is stateless; run more replicas behind a proxy if needed.
 
 ## 4. Task state machine
 
@@ -146,7 +115,7 @@ stateDiagram-v2
 ```
 
 The **evidence gate** (executor-side, deterministic — never model text): every
-`run:` command exits 0 with non-empty output; ≥1 commit on the branch; changed
+`run:` command exits 0 (empty output is allowed); ≥1 commit on the branch; changed
 files ⊆ writable globs and ∉ forbidden (a catch-all `*` in forbidden yields to
 explicit writable globs); `git status --porcelain` clean. Any missing or
 unparseable check ⇒ FAIL.
@@ -189,7 +158,7 @@ watchdog pause is auto-cleared (after 3 consecutive healthy probes).
 | Bound | Setting | Default |
 |---|---|---|
 | Dispatch lease | informational only — an unclaimed task waits in Redis, it is **not** expired | `CLAMS_LEASE_DISPATCH_S` |
-| Running lease (heartbeat grace) | extended by each heartbeat to now+`CLAMS_LEASE_RUNNING_EXTEND_S`; silence ⇒ executor declared dead ⇒ requeue/fail | 180 s |
+| Running lease (heartbeat grace) | extended by liveness evidence to now+`CLAMS_LEASE_RUNNING_EXTEND_S`; silence ⇒ executor declared dead ⇒ requeue/fail | 600 s |
 | ~~Wall cap~~ | **removed everywhere** — no duration kill in Clams or Claudio | — |
 | Stall alert (no kill) | no turn progress for `CLAMS_STALL_ALERT_MINUTES` → alert + badge | 15 min |
 | Task attempts | `CLAMS_MAX_ATTEMPTS` | 3 |

@@ -1,10 +1,12 @@
 # Clams v2 — Planner–Executor orchestrator for Claudio
 
 Clams turns GitHub Issues / Projects V2 boards into a durable work queue and
-drives two **unmodified** Claudio agent containers — a **Planner** (decomposition
-+ review judgement) and an **Executor** (headless task runner in isolated git
-worktrees) — with a web UI for supervision. One SQLite DB, exactly two Redis
-streams.
+drives two Claudio agent backends — a **Planner** (plan generation) and an
+**Executor** (headless task work in isolated git worktrees). Clams' Python
+planner validates plans and makes workflow review decisions from task state and
+evidence; its Python executor-runner coordinates agent execution. A web UI
+provides supervision. One SQLite DB, two Redis work/event streams, and an
+auxiliary dead-letter stream.
 
 The authoritative design spec lives in
 [massimorofi/clams#130](https://github.com/massimorofi/clams/issues/130)
@@ -17,6 +19,7 @@ The authoritative design spec lives in
 |---|---|
 | [Quickstart](doc/quickstart.md) | Install, `.env` configuration, ports & addresses, **token setup incl. the UI**, first run |
 | [clamsctl reference](doc/clamsctl.md) | Every operator command and its parameters |
+| [System architecture](doc/system_architecture.md) | Current Compose topology, container roles, executor layers, communication paths, and persistent volumes |
 | [Deployment & state machines](doc/deployment.md) | Docker topology, services, volumes, healthchecks, scaling, **workflow & task state machines**, leases, watchdog, operations |
 | [GitHub setup](doc/github.md) | Token/credential scopes, Projects V2 kanban board setup, intake gestures, projection rules |
 
@@ -40,8 +43,7 @@ flowchart LR
     P -->|XADD tasks| R
     R -->|XREADGROUP| E
     E -->|XADD events| R
-    A -->|read-only SQL| DB
-    A -->|INSERT commands| DB
+    A -->|read-only SQL + command/webhook intake| DB
     B --> A
     P <-->|HTTP /api/v1/chat| CP
     E <-->|HTTP /api/v1/chat| CE
@@ -49,16 +51,16 @@ flowchart LR
 
 Five invariants (enforced and tested):
 
-1. **Single writer** — only the planner mutates domain tables; the API inserts
-   into `commands` only.
+1. **Single writer** — only the planner mutates workflow/task domain state; the
+   API reads state and queues commands (including validated webhook deliveries).
 2. **DB is truth, queues are transport** — losing Redis loses no work.
 3. **Every side-effect via outbox** — no GitHub call or XADD inside a business
    transaction.
 4. **Evidence beats claims** — task success = deterministic gate pass
-   (`run:` commands exit 0 with output, ≥1 commit, scope respected, clean
-   tree), never model text.
-5. **Everything bounded** — attempts, turns, wall time, replans, plan size,
-   outbox retries, LLM calls per cycle.
+   (`run:` commands exit 0, ≥1 commit, scope respected, clean tree), never
+   model text.
+5. **Work is bounded** — attempts, agent turns, replans, plan size, outbox
+   retries, and LLM calls per cycle have configured bounds.
 
 ## Quick start (short version)
 
