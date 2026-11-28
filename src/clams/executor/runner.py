@@ -94,7 +94,15 @@ class ExecutorRunner:
                                          self.s.group_executors,
                                          self.executor_id):
             self._handle(d)
-        idle_ms = 2 * self.s.heartbeat_interval_s * 1000
+        # A LIVE task's dispatch message stays unacked in the PEL for its whole
+        # duration, so PEL idle time alone never proves the owner dead — a
+        # short threshold lets a booting runner steal another runner's
+        # in-flight task and run it twice (the on_started owner fence now
+        # rejects the DB takeover, but the duplicate session still burns LLM).
+        # Only claim stragglers once their running lease could not still be
+        # renewed by the watchdog: lease TTL + one probe of slack.
+        idle_ms = (self.s.lease_running_extend_s
+                   + self.s.watchdog_probe_interval_s) * 1000
         for d in self.bus.autoclaim(self.s.stream_tasks, self.s.group_executors,
                                     self.executor_id, idle_ms):
             self._handle(d)

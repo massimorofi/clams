@@ -418,12 +418,23 @@ def on_started(conn: sqlite3.Connection, task_id: str, attempt: int,
                session_ref: str, extend_s: int = 180) -> Optional[sqlite3.Row]:
     """dispatched -> running, fenced on (task_id, attempt, lease_token).
 
-    Also re-adopts an already-running task with the SAME attempt+token: an
-    autoclaimed runner restarts the chat with a fresh session_ref, and the
-    watchdog's session evidence must follow it (live case: runner recreated
-    mid-task, DB kept pointing at the dead session)."""
+    Also re-adopts an already-running task with the SAME attempt+token, but
+    only when the previous owner cannot still be alive: either the SAME
+    executor (a restarted runner replays its own PEL and its old session
+    died with it — live case: runner recreated mid-task, DB kept pointing at
+    the dead session) or an EXPIRED lease (a dead runner stops getting
+    watchdog renewals, so a fresh lease proves a live one). A different
+    executor may never take over a running task whose lease is still fresh:
+    a dispatch message stays unacked for the whole task duration, so a
+    second runner's startup XAUTOCLAIM would otherwise steal live work and
+    run it twice (live finding, 2026-11-28: executor-2 boot stole a task
+    executor-1 had been running for 37 minutes)."""
     row = get_task(conn, task_id)
     if row is None:
+        return None
+    if (row["status"] == "running" and row["executor_id"]
+            and row["executor_id"] != executor_id
+            and (row["lease_expires_at"] or "") > utcnow_s()):
         return None
     with conn.execute(
         "UPDATE tasks SET status='running', executor_id=?, session_ref=?, "
@@ -535,6 +546,15 @@ def on_result(conn: sqlite3.Connection, task_id: str, attempt: int,
     if row is None or row["attempt"] != attempt or row["lease_token"] != lease_token:
         return None
     if row["status"] not in ("running", "dispatched"):
+        return None
+    # Owner fence: a duplicate runner (a stolen in-flight dispatch message)
+    # carries the same attempt+token, so those alone cannot tell it apart —
+    # but only the current owner's session_ref is on the row (stored by
+    # on_started). An empty result session_ref is an infra fault raised
+    # before any session existed: never fence those.
+    if (row["status"] == "running" and result.get("session_ref")
+            and row["session_ref"]
+            and result["session_ref"] != row["session_ref"]):
         return None
     extra: dict[str, Any] = {
         "result_json": json.dumps(result),

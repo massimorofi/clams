@@ -174,6 +174,56 @@ def test_on_started_fencing(db):
     assert started["session_ref"] == "s1"
 
 
+def test_on_started_rejects_steal_from_live_runner(db):
+    """A second runner's startup XAUTOCLAIM must not take a running task whose
+    lease is fresh: the dispatch message stays unacked for the whole task
+    duration, so idle time alone never proves the owner dead (live finding:
+    executor-2 boot stole a task executor-1 had run for 37 minutes)."""
+    wf = _mk_wf(db)
+    t = repo_tasks.create_task(db, wf, 1, "a", "o", "a", _brief())
+    repo_tasks.promote_ready(db)
+    tok = repo_tasks.claim_for_dispatch(db, t, 120)["lease_token"]
+    assert repo_tasks.on_started(db, t, 1, tok, "e1", "s1", extend_s=600)
+    assert repo_tasks.on_started(db, t, 1, tok, "e2", "s2", extend_s=600) is None
+    cur = repo_tasks.get_task(db, t)
+    assert cur["executor_id"] == "e1" and cur["session_ref"] == "s1"
+
+
+def test_on_started_re_adoption_allowed_cases(db):
+    wf = _mk_wf(db)
+    t = repo_tasks.create_task(db, wf, 1, "a", "o", "a", _brief())
+    repo_tasks.promote_ready(db)
+    tok = repo_tasks.claim_for_dispatch(db, t, 120)["lease_token"]
+    repo_tasks.on_started(db, t, 1, tok, "e1", "s1", extend_s=600)
+    # same runner restarted mid-task: replays its own PEL, re-adopts with a
+    # fresh session_ref so the watchdog's session evidence follows it
+    again = repo_tasks.on_started(db, t, 1, tok, "e1", "s1b", extend_s=600)
+    assert again is not None and again["session_ref"] == "s1b"
+    # a different executor may take over only once the lease has lapsed
+    assert repo_tasks.on_started(db, t, 1, tok, "e2", "s2", extend_s=600) is None
+    db.execute("UPDATE tasks SET lease_expires_at=? WHERE task_id=?",
+               ("2000-01-01 00:00:00", t))
+    took = repo_tasks.on_started(db, t, 1, tok, "e2", "s2", extend_s=600)
+    assert took is not None and took["executor_id"] == "e2"
+
+
+def test_on_result_fences_duplicate_runner(db):
+    """The runner that stole the in-flight message carries the SAME
+    attempt+token; only the session_ref stored at on_started identifies the
+    owner. An empty result session_ref (infra fault raised before any session
+    existed) is never fenced by this rule."""
+    wf = _mk_wf(db)
+    t = repo_tasks.create_task(db, wf, 1, "a", "o", "a", _brief())
+    repo_tasks.promote_ready(db)
+    tok = repo_tasks.claim_for_dispatch(db, t, 120)["lease_token"]
+    repo_tasks.on_started(db, t, 1, tok, "e1", "s1")
+    assert repo_tasks.on_result(db, t, 1, tok, "success", True,
+                                {"session_ref": "s2"}) is None
+    r = repo_tasks.on_result(db, t, 1, tok, "success", True,
+                             {"session_ref": "s1", "commit_sha": "abc"})
+    assert r["status"] == "success" and r["commit_sha"] == "abc"
+
+
 def test_on_result_paths(db):
     wf = _mk_wf(db)
     t = repo_tasks.create_task(db, wf, 1, "a", "o", "a", _brief())
