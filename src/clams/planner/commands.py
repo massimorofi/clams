@@ -145,6 +145,9 @@ def _apply(conn, row, *, adhoc_handler=None, gh_client=None,
     if kind == "apply_plan":
         return _apply_plan(conn, payload, issuer, target)
 
+    if kind == "recover":
+        return _recover(conn, target, issuer, gh_client=gh_client)
+
     if kind == "dispose_handoff":
         return _dispose_handoff(conn, payload, issuer, target)
 
@@ -152,6 +155,161 @@ def _apply(conn, row, *, adhoc_handler=None, gh_client=None,
         return _github_event(conn, payload)
 
     raise ValueError(f"unhandled command kind {kind}")
+
+
+def _recover(conn, target: Optional[str], issuer: str,
+             *, gh_client=None) -> dict[str, Any]:
+    """Recovery sweep on a workflow that stalled (``recover`` command).
+
+    A blocked/failed workflow can leave two kinds of open sub-issue behind:
+
+    ``orphan``        still open on GitHub, no task owns it any more (a replan
+                      dropped the task, or the projection half-completed).
+                      Closed with a "superseded by recovery" comment.
+    ``stale success`` still open although its task reached ``success`` — created
+                      before auto-close-on-success existed. Closed with the
+                      standard "Task succeeded" comment.
+
+    Both go out as ``gh_close`` outbox rows, so the relay stays the only path to
+    GitHub (invariant 3) and a re-run dedups on the idempotency key.
+
+    After the sweep the plan tail is rebuilt from the surviving task rows and
+    pushed through the identity-preserving reconciler (nothing is ever deleted,
+    and it runs even when there is nothing left to re-plan, so "identity
+    preserved" is proven on every recover), and the workflow is moved to
+    ``planning`` so the planner loop picks the replan up: that hand-back is the
+    retry-from-the-last-successful-step.
+
+    Re-running ``recover`` on a workflow that is already ``planning``/``running``
+    with empty sweeps is a no-op: one ``recovery: nothing to recover`` event and
+    zero writes (no outbox row, no task row, no status change).
+
+    Deliberately *not* done here: deleting task rows, and anything that touches
+    a git branch.
+    """
+    from . import recovery
+
+    wf = repo_workflows.get_workflow(conn, target or "")
+    if wf is None:
+        raise ValueError(f"unknown workflow {target}")
+
+    wf_id = wf["workflow_id"]
+    status = wf["status"]
+    # read-only classification first: it decides both the sweeps and whether a
+    # re-run on an already-recovered workflow is a no-op.
+    plan = recovery.plan_recovery(conn, wf_id, gh_client)
+
+    if status not in ("blocked", "failed"):
+        # Idempotent re-run. A workflow already handed back to the planner
+        # ('planning'/'running') whose sweeps come back empty has nothing left
+        # for recovery to do: it gets one noop line on the timeline and zero
+        # writes, instead of a rejected command.
+        if status in ("planning", "running") and plan["noop"]:
+            repo_events.append_event(
+                conn, "workflow", wf_id, "info",
+                f"recovery: nothing to recover by {issuer}",
+                {"noop": True, "orphan_count": 0, "stale_success_count": 0,
+                 "outbox_rows": 0, "status": status})
+            log.info("recovery on %s by %s: nothing to recover", wf_id, issuer)
+            return {"workflow": wf_id, "noop": True, "orphan_count": 0,
+                    "stale_success_count": 0, "outbox_rows": 0,
+                    "status": status}
+        raise ValueError(f"workflow {target} is {status}, not blocked/failed")
+
+    repo_name = recovery.workflow_repo(conn, wf_id)
+
+    orphans_closed: list[int] = []
+    stale_closed: list[int] = []
+    outbox_rows = 0
+
+    if plan["noop"]:
+        # Idempotent path: both sweeps are empty, so recovery must queue
+        # *nothing*. A re-run on an already-swept workflow therefore adds zero
+        # outbox rows and says so on the timeline instead of staying silent.
+        repo_events.append_event(
+            conn, "workflow", wf_id, "info",
+            f"nothing to recover by {issuer}",
+            {"orphans_closed": [], "stale_success_closed": [],
+             "orphan_count": 0, "stale_success_count": 0, "outbox_rows": 0})
+    else:
+        for sub in plan["orphans"]:
+            number = sub.get("number")
+            if not number:
+                continue
+            if recovery.enqueue_close(
+                    conn, repo=repo_name, number=number,
+                    comment=recovery.SUPERSEDED_COMMENT, reason="superseded",
+                    idempotency_key=f"gh:gh_close:{wf_id}:{number}:orphan"):
+                outbox_rows += 1
+            orphans_closed.append(int(number))
+
+        for sub in plan["stale_success"]:
+            number = sub.get("number")
+            if not number:
+                continue
+            if recovery.enqueue_close(
+                    conn, repo=repo_name, number=number,
+                    comment=recovery.SUCCESS_CLOSE_COMMENT,
+                    reason="stale_success",
+                    idempotency_key=f"gh:gh_close:{wf_id}:{number}:stale_success"):
+                outbox_rows += 1
+            stale_closed.append(int(number))
+
+    # plan-tail rebuild: recovery has no LLM plan, so it reconciles the plan
+    # back from the task rows that still represent work. Matching is by
+    # plan_key, so task_id / gh_issue_number / status survive and no row is
+    # deleted; the ladder is re-numbered 1..N and dangling deps are dropped.
+    tail = recovery.plan_tail(conn, wf_id)
+    # Always push the tail through the reconciler, even when it is empty: that
+    # is what proves identity preservation on every recover, not only the ones
+    # that happened to have work left to re-plan.
+    recon = reconcile.apply_replanned_plan(conn, wf_id, tail, actor=issuer)
+
+    # hand the workflow back to the planner: 'planning' is what the loop picks up
+    repo_workflows.set_status(conn, wf_id, "planning")
+    repo_events.append_event(conn, "workflow", wf_id, "info",
+                             f"replan requested by {issuer}")
+
+    data = {
+        "orphans_closed": orphans_closed,
+        "stale_success_closed": stale_closed,
+        "orphan_count": plan["orphan_count"],
+        "stale_success_count": plan["stale_success_count"],
+        "preserved_success": list(plan.get("preserved_success") or []),
+        "outbox_rows": outbox_rows,
+        "noop": bool(plan["noop"]),
+        "tasks_created": recon["created_count"],
+        "tasks_reused": recon["reused_count"],
+        "tasks_cancelled": recon["cancelled_count"],
+        # the WorkflowIntegrated-style summary line
+        "tasks_preserved": len(recovery.success_task_ids(conn, wf_id)),
+        "replanned": len(tail),
+        "status": "planning",
+    }
+    repo_events.append_event(
+        conn, "workflow", wf_id, "info",
+        f"workflow recovered: {wf_id} by {issuer} \u2014 closed "
+        f"{len(orphans_closed)} orphan(s), {len(stale_closed)} stale-success "
+        f"sub-issue(s), replanned {len(tail)} task(s)", data)
+    log.info("recovery on %s by %s: %d orphan(s), %d stale-success "
+             "sub-issue(s), %d task(s) replanned", wf_id, issuer,
+             len(orphans_closed), len(stale_closed), len(tail))
+
+    return {
+        "workflow": wf_id,
+        "status": "planning",
+        "orphans_closed": orphans_closed,
+        "stale_success_closed": stale_closed,
+        "orphan_count": plan["orphan_count"],
+        "stale_success_count": plan["stale_success_count"],
+        "tasks_created": recon["created_count"],
+        "tasks_reused": recon["reused_count"],
+        "tasks_cancelled": recon["cancelled_count"],
+        "tasks_preserved": data["tasks_preserved"],
+        "replanned": data["replanned"],
+        "outbox_rows": outbox_rows,
+        "noop": bool(plan["noop"]),
+    }
 
 
 def _github_event(conn, payload: dict) -> dict:

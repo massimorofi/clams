@@ -19,6 +19,7 @@ The authoritative design spec lives in
 | [clamsctl reference](doc/clamsctl.md) | Every operator command and its parameters |
 | [Deployment & state machines](doc/deployment.md) | Docker topology, services, volumes, healthchecks, scaling, **workflow & task state machines**, leases, watchdog, operations |
 | [GitHub setup](doc/github.md) | Token/credential scopes, Projects V2 kanban board setup, intake gestures, projection rules |
+| [Workflow recovery runbook](doc/workflow-recovery.md) | Recovering a blocked/failed workflow with one `recover` command: orphan + stale-success sweeps, replan from the last successful step, idempotency & audit trail |
 
 ## Architecture at a glance
 
@@ -101,5 +102,5 @@ src/clams/
   api/       app · sse · auth
 frontend/    Vite + React + TS + Tailwind + TanStack Query · e2e/ Playwright
 tests/       unit · contract · integration · chaos
-doc/         quickstart · clamsctl · deployment · github
+doc/         quickstart · clamsctl · deployment · github · workflow-recovery
 ```
