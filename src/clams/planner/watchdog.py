@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import time
 from typing import Optional
@@ -27,7 +28,8 @@ from typing import Optional
 import httpx
 
 from ..db import (repo_alerts, repo_events, repo_executors, repo_outbox,
-                  repo_runtime, repo_stall_evidence, repo_tasks)
+                  repo_runtime, repo_stall_evidence, repo_tasks,
+                  repo_workflows)
 from ..db.conn import (db_integrity_ok, get_runtime_state, immediate,
                        iso_to_epoch, set_runtime_state)
 
@@ -46,6 +48,10 @@ CRITICAL = {"redis", "claudio_planner", "claudio_executor", "dlq"}
 #: alert prefixes whose subject is a task; hygiene clears them when the task
 #: is gone or no longer running.
 TASK_ALERT_PREFIXES = ("stall:", "turns:", "attempts:", "infra:", "orphan:")
+
+#: both "plan" probe alerts embed "workflow <uuid>" at the front; hygiene uses
+#: it to tell whether the alert's subject is still in a planning-failure state.
+PLAN_ALERT_WF = re.compile(r"workflow ([0-9a-fA-F-]{36})")
 
 #: consecutive health failures before an infra requeue (one blip is noise)
 DOWN_STREAK_TO_REQUEUE = 2
@@ -169,7 +175,9 @@ class Watchdog:
     # --------------------------------------------------------- alert hygiene
     def _alert_hygiene(self, conn) -> int:
         """Clear open alerts whose subject is gone (stale stall/turns/attempts
-        for a finished or deleted task; workflow alert once unblocked)."""
+        for a finished or deleted task; workflow alert once unblocked; plan
+        alert once its workflow has left the planning-failure states without a
+        later successful plan — e.g. it was cancelled or operator-reset)."""
         cleared = 0
         for a in repo_alerts.list_open(conn):
             probe = a["probe"]
@@ -184,6 +192,13 @@ class Watchdog:
                 ).fetchone()["n"]
                 if n == 0:
                     cleared += repo_alerts.clear_alert(conn, probe)
+            elif probe == "plan":
+                m = PLAN_ALERT_WF.search(a["message"] or "")
+                if m:
+                    wf = repo_workflows.get_workflow(conn, m.group(1))
+                    if wf is None or wf["status"] not in ("planning",
+                                                          "blocked"):
+                        cleared += repo_alerts.clear_alert(conn, probe)
         return cleared
 
     # ------------------------------------------------------ liveness monitor

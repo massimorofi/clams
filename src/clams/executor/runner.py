@@ -38,7 +38,8 @@ def prompt_vars(brief: contracts.Brief) -> dict:
         f"\nThe human answered your earlier question: {brief.answer}\n"
         if brief.answer else "")
     prior_failure_block = (
-        "PREVIOUS ATTEMPT FAILED THE EVIDENCE GATE:\n"
+        "PREVIOUS ATTEMPT FAILED THE EVIDENCE GATE "
+        "(cumulative history, oldest first):\n"
         f"{brief.prior_failure}\n"
         "The previous attempt's committed work is already on this branch — "
         "inspect it first and fix exactly these failures instead of redoing "
@@ -127,16 +128,58 @@ class ExecutorRunner:
             self._handle(d)
 
     # ---------------------------------------------------------------- handlers
-    def _retry_base(self, brief, task_id: str, attempt: int) -> str:
-        """Base ref for a new worktree: attempt N>1 seeds from attempt N-1's
-        branch when it exists (work reuse), else falls back to base_ref."""
+    def _retry_base(self, brief, task_id: str, attempt: int,
+                    workflow_id: str = "") -> str:
+        """Base ref for a new worktree.
+
+        Precedence: attempt N>1 seeds from attempt N-1's branch (work reuse);
+        otherwise the workflow's integration ref, which carries every
+        predecessor task's gate-passed work; otherwise the workflow base ref.
+
+        The integration tier is what stops a chained task from wasting its
+        first attempt: seeded from base_ref it finds none of its dependencies'
+        files, recreates them, and is then failed by the scope gate for the
+        recreation (claudio#133 T5, T6).
+        """
         if attempt > 1:
             prev = self.wt.branch_name(task_id, attempt - 1)
             if self.wt.ref_exists(brief.repo, prev):
                 log.info("task %s attempt %d: seeding from %s",
                          task_id, attempt, prev)
                 return prev
+        if workflow_id:
+            integ = self.wt.integration_branch(workflow_id)
+            if self.wt.ref_exists(brief.repo, integ):
+                log.info("task %s attempt %d: seeding from %s",
+                         task_id, attempt, integ)
+                return integ
         return brief.base_ref
+
+    def _integrate_workflow(self, msg: contracts.WorkflowIntegrate) -> None:
+        """Land a finished workflow's merged work on the base branch.
+
+        Best-effort by construction: the message is acked either way, so a
+        conflict or a protected branch cannot replay forever, and the outcome
+        travels back to the planner as an event so it becomes an alert instead
+        of a log line nobody reads.
+        """
+        try:
+            sha = self.wt.merge_to_base(msg.repo, msg.integration_branch,
+                                        msg.base_ref)
+            ok, detail = True, sha[:10]
+        except Exception as exc:  # noqa: BLE001
+            log.warning("workflow %s: merge into %s failed: %s",
+                        msg.workflow_id, msg.base_ref, exc)
+            ok, detail = False, str(exc)[:300]
+        try:
+            self.bus.publish(
+                self.s.stream_events,
+                contracts.dump_message(contracts.WorkflowIntegrated(
+                    workflow_id=msg.workflow_id, base_ref=msg.base_ref,
+                    ok=ok, detail=detail)))
+        except Exception:  # noqa: BLE001
+            log.exception("workflow %s: could not report integration outcome",
+                          msg.workflow_id)
 
     def _handle(self, d: Delivered) -> None:
         try:
@@ -152,6 +195,10 @@ class ExecutorRunner:
             self.bus.ack(self.s.stream_tasks, self.s.group_executors, d.id)
             return
         if msg.type == "task.cancel":
+            self.bus.ack(self.s.stream_tasks, self.s.group_executors, d.id)
+            return
+        if msg.type == "workflow.integrate":
+            self._integrate_workflow(msg)
             self.bus.ack(self.s.stream_tasks, self.s.group_executors, d.id)
             return
         if msg.type != "task.dispatch":
@@ -184,7 +231,8 @@ class ExecutorRunner:
             # correct work is kept and the agent fixes only what failed
             # (live finding, claudio#58 T2: a 90-min committed attempt was
             # redone from scratch because the retry started from base_ref)
-            base = self._retry_base(brief, msg.task_id, msg.attempt)
+            base = self._retry_base(brief, msg.task_id, msg.attempt,
+                                    msg.workflow_id)
             worktree, branch = self.wt.add(brief.repo, msg.task_id,
                                            msg.attempt, base)
         except Exception as exc:  # noqa: BLE001
@@ -258,6 +306,18 @@ class ExecutorRunner:
                 self.wt.push(worktree, branch)
             except Exception as exc:  # noqa: BLE001
                 evidence["push_error"] = str(exc)
+            # Chain the work onward: the next task's first attempt seeds from
+            # this ref instead of base_ref, so it neither regenerates this
+            # task's files nor is charged for them by the scope gate. Non-fatal
+            # by design, like push_error — a task that passed the gate stays
+            # passed, and a later dependent just seeds from the older tip.
+            # Must run before wt.remove below: a non-ff integration merges
+            # inside this worktree.
+            try:
+                self.wt.integrate(brief.repo, msg.workflow_id, worktree,
+                                  branch)
+            except Exception as exc:  # noqa: BLE001
+                evidence["integration_error"] = str(exc)
         self._emit_result(msg, outcome, session_ref=session_ref, branch=branch,
                           commit_sha=commit_sha, evidence=evidence,
                           changed_files=evidence.get("changed_files", []),

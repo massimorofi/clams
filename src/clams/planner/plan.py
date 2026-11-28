@@ -11,9 +11,11 @@ import re
 from typing import Any, Optional
 
 from .. import contracts, prompts
+from ..claudio_client import ClaudioUnavailable
 from ..contracts import Plan, PlanTask, PlanValidationError, validate_plan
 from ..db import (repo_alerts, repo_events, repo_tasks, repo_workflows)
 from ..db.conn import immediate, iso_to_epoch
+from . import reconcile
 
 log = logging.getLogger("clams.plan")
 
@@ -141,6 +143,7 @@ def plan_workflow(conn, claudio_p, settings, workflow_id: str,
     prompt = base_prompt
     errors: list[str] = []
     plan: Optional[Plan] = None
+    transient = False
     for attempt in range(2):  # initial + one repair retry
         try:
             # no timeout: planning is agentic work too; the stall
@@ -152,6 +155,9 @@ def plan_workflow(conn, claudio_p, settings, workflow_id: str,
             validate_plan(plan, max_tasks=settings.max_plan_tasks)
             break
         except Exception as exc:  # noqa: BLE001 - any LLM failure -> repair retry
+            # an unreachable/timed-out endpoint is an infra fault, not a bad
+            # goal; it must not be treated the same as an invalid plan
+            transient = isinstance(exc, ClaudioUnavailable)
             errors.append(str(exc)[:300])
             plan = None
             # keep the full original prompt (goal + schema) — a bare error
@@ -159,6 +165,26 @@ def plan_workflow(conn, claudio_p, settings, workflow_id: str,
             prompt = base_prompt + prompts.render(conn, "plan_repair",
                                                   error=errors[-1])
     if plan is None:
+        # A workflow with no plan and no tasks must never be parked in
+        # 'blocked' by a momentary endpoint outage: 'blocked' is a dead end
+        # (the loop only revisits intake/planning), so the workflow would
+        # wedge forever without ever having had a plan. Transient faults stay
+        # retryable, bounded by the replan budget so a sustained outage still
+        # escalates instead of hot-looping every cycle. (claudio#136 shape.)
+        if transient and wf["replans"] < settings.max_replans:
+            with immediate(conn):
+                n = repo_workflows.bump_replans(conn, workflow_id)
+                repo_workflows.set_status(conn, workflow_id, "planning")
+                repo_alerts.raise_alert(
+                    conn, "plan", "warn",
+                    f"workflow {workflow_id}: planning deferred, claudio "
+                    f"planner unreachable (retry {n}/{settings.max_replans}): "
+                    f"{errors[-1] if errors else 'unknown'}")
+                repo_events.append_event(
+                    conn, "workflow", workflow_id, "warn",
+                    f"planning deferred: endpoint unreachable "
+                    f"(retry {n}/{settings.max_replans})")
+            return "planning"
         with immediate(conn):
             repo_workflows.set_status(conn, workflow_id, "blocked")
             repo_alerts.raise_alert(conn, "plan", "error",
@@ -172,28 +198,27 @@ def plan_workflow(conn, claudio_p, settings, workflow_id: str,
         return "blocked"
 
     with immediate(conn):
-        # replan swap: the fresh plan supersedes the old task set. Without
-        # this the inserts collide with UNIQUE(workflow_id, sequence_index)
-        # / UNIQUE(workflow_id, title) and the workflow sticks in 'planning'.
-        n_old = repo_tasks.delete_workflow_tasks(conn, workflow_id)
-        for i, pt in enumerate(plan.tasks, start=1):
-            repo_tasks.create_task(
-                conn, workflow_id, i, pt.title, pt.objective, pt.acceptance,
-                build_brief(pt, repo, base_ref, settings),
-                depends_on=pt.depends_on,
-                max_attempts=settings.max_attempts)
-            # NOTE: tasks must NOT inherit the workflow's gh_issue_number —
-            # project_tasks_created skips tasks that already carry one, so
-            # stamping the parent here silently disabled sub-issue creation.
-            # Each task gets its own sub-issue number via the outbox callback.
+        # replan swap: the fresh plan is reconciled into the existing task set
+        # rather than replacing it. Deleting the old rows minted a new task_id
+        # per replan, which made the gh_subissue outbox key look unseen and
+        # duplicated GitHub sub-issues for work that already had one.
+        # reconcile keeps task identity and assigns the sequence_index ladder
+        # itself, so UNIQUE(workflow_id, sequence_index) / UNIQUE(workflow_id,
+        # title) still hold and the workflow cannot stick in 'planning'.
+        planned = [{**pt.model_dump(),
+                    "brief": build_brief(pt, repo, base_ref, settings),
+                    "max_attempts": settings.max_attempts}
+                   for pt in plan.tasks]
+        # NOTE: tasks must NOT inherit the workflow's gh_issue_number —
+        # project_tasks_created skips tasks that already carry one, so
+        # stamping the parent here silently disabled sub-issue creation.
+        # Each task gets its own sub-issue number via the outbox callback.
+        # apply_replanned_plan logs its own summary event ("replan: reused N,
+        # created M, cancelled K"), so no extra timeline line is needed here.
+        reconcile.apply_replanned_plan(conn, workflow_id, planned)
         repo_workflows.set_plan(conn, workflow_id,
                                 plan.model_dump(), status="running")
-        if n_old:
-            repo_events.append_event(
-                conn, "workflow", workflow_id, "warn",
-                f"replan: replaced {n_old} superseded tasks with "
-                f"{len(plan.tasks)}")
-        else:
-            repo_events.append_event(conn, "workflow", workflow_id, "info",
-                                     f"planned {len(plan.tasks)} tasks")
+        # a successful plan resolves any earlier deferral/block alert on this
+        # probe, so the alert reflects the *current* planning state
+        repo_alerts.clear_alert(conn, "plan")
     return "running"

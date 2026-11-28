@@ -18,6 +18,7 @@ import uuid
 from typing import Any, Optional
 
 from .conn import plus_s, utcnow_s, epoch_to_iso
+from . import repo_attempts
 
 TASK_STATUSES = ('pending', 'ready', 'dispatched', 'running', 'waiting_input',
                  'success', 'failed', 'blocked', 'cancelled')
@@ -41,6 +42,21 @@ TRANSITIONS: dict[str, set[str]] = {
 
 class IllegalTransition(Exception):
     pass
+
+
+def normalize_plan_key(title: str) -> str:
+    """Canonical identity of a planned task, derived from its title.
+
+    A replan deletes and re-inserts every task row, so ``task_id`` cannot be the
+    handle that ties a new plan to what already exists (and a fresh id makes
+    the ``gh:gh_subissue:<task_id>:created`` outbox key look new, which is how
+    duplicate GitHub sub-issues get minted). The title is the one field the
+    planner reproduces, so we key on it: strip, collapse internal whitespace
+    runs, casefold. ``'  Fix   Replan Dedupe '`` -> ``'fix replan dedupe'``.
+
+    Deliberately stdlib-only (this module is a repo layer: sqlite3/json/uuid).
+    """
+    return " ".join((title or "").split()).casefold()
 
 
 def can_transition(src: str, dst: str) -> bool:
@@ -169,11 +185,154 @@ def create_task(conn: sqlite3.Connection, workflow_id: str, sequence_index: int,
     conn.execute(
         "INSERT INTO tasks(task_id, workflow_id, sequence_index, depends_on, "
         "title, objective, acceptance, brief_json, status, max_attempts, "
-        "gh_issue_number) VALUES(?,?,?,?,?,?,?,?,'pending',?,?)",
+        "gh_issue_number, plan_key) VALUES(?,?,?,?,?,?,?,?,'pending',?,?,?)",
         (task_id, workflow_id, sequence_index,
          json.dumps(depends_on or []), title, objective, acceptance,
-         json.dumps(brief), max_attempts, gh_issue_number))
+         json.dumps(brief), max_attempts, gh_issue_number,
+         normalize_plan_key(title)))
     return task_id
+
+
+def reconcile_plan(conn: sqlite3.Connection, workflow_id: str,
+                   planned: list[dict[str, Any]]) -> dict[str, Any]:
+    """Apply a (re)plan to ``workflow_id`` in place, preserving task identity.
+
+    Why not delete-and-reinsert: ``delete_workflow_tasks`` mints brand-new
+    ``task_id``s on every replan, so the outbox key
+    ``gh:gh_subissue:<task_id>:created`` looks unseen and GitHub mints a
+    duplicate sub-issue for work that already has one. Identity here is
+    ``normalize_plan_key(title)``: a plan entry that matches an existing row
+    UPDATES that row and keeps its ``task_id`` (and therefore its
+    ``gh_issue_number``) forever.
+
+    Rules:
+      * matched entry -> UPDATE in place of sequence_index, objective,
+        acceptance, brief_json, depends_on, max_attempts, plan_key,
+        updated_at. ``task_id``, ``gh_issue_number`` and ``status`` are never
+        written by a match.
+      * duplicate plan_keys inside ONE incoming plan collapse; first wins.
+      * existing rows whose plan_key is absent from the new plan are reported
+        as ``stale`` and set to 'cancelled' unless already terminal. Nothing is
+        ever DELETEd here (that is what keeps GitHub sub-issues mapped).
+      * unmatched entries are inserted via ``create_task``.
+
+    ``sequence_index`` is UNIQUE per workflow, so renumbering runs in two
+    passes: matched rows are first parked on private scratch indices (a
+    re-ordered plan can never transiently collide with itself), then written
+    back in ascending order. A leftover cancelled row sitting on a needed slot
+    is parked too — its row stays, only its ordering slot moves.
+
+    Stdlib only (sqlite3/json), like the rest of this module. The caller owns
+    the transaction (wrap in ``conn.immediate``), as elsewhere here.
+
+    Note a re-added title matches its cancelled row and is therefore NOT
+    resurrected: status is left alone, so reviving planned work stays an
+    explicit decision for the caller (planner side, out of scope here).
+
+    Returns {'created': [task_id...], 'reused': {plan_key: task_id},
+             'stale': [task_id...]}.
+    """
+    rows = list_tasks(conn, workflow_id)
+
+    def row_key(row: sqlite3.Row) -> str:
+        # rows predating migration 009 may have a NULL plan_key
+        return row["plan_key"] or normalize_plan_key(row["title"])
+
+    # winner per plan_key: list_tasks is ORDER BY sequence_index, so the
+    # lowest sequence_index wins, matching the dedupe rule in 009.
+    existing: dict[str, sqlite3.Row] = {}
+    for r in rows:
+        existing.setdefault(row_key(r), r)
+
+    entries: dict[str, dict[str, Any]] = {}
+    for entry in (planned or []):
+        key = normalize_plan_key(str(entry.get("title") or ""))
+        if key not in entries:          # duplicate plan_key: first occurrence wins
+            entries[key] = entry
+
+    def as_int(value: Any, default: int) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    now = utcnow_s()
+    scratch = min([0] + [r["sequence_index"] for r in rows]) - 1
+
+    def park(task_id: str) -> None:
+        """Move a row off the sequence_index ladder onto a private slot."""
+        nonlocal scratch
+        scratch -= 1
+        conn.execute("UPDATE tasks SET sequence_index=?, updated_at=? "
+                     "WHERE task_id=?", (scratch, now, task_id))
+
+    def vacate(seq: int, keep: Optional[str]) -> None:
+        """Free ``seq``: whoever else in this workflow holds it gets parked."""
+        sql = ("SELECT task_id FROM tasks WHERE workflow_id=? AND sequence_index=?"
+               + (" AND task_id<>?" if keep else ""))
+        vals: list[Any] = [workflow_id, seq] + ([keep] if keep else [])
+        holder = conn.execute(sql, vals).fetchone()
+        if holder is not None:
+            park(holder["task_id"])
+
+    taken: set[int] = set()
+
+    def target_seq(entry: dict[str, Any], fallback: int) -> int:
+        seq = as_int(entry.get("sequence_index"), fallback)
+        while seq in taken:            # malformed plan: two entries, one slot
+            seq += 1
+        taken.add(seq)
+        return seq
+
+    created: list[str] = []
+    reused: dict[str, str] = {}
+    stale: list[str] = []
+
+    # 1. stale first (status only; the row stays)
+    for r in rows:
+        key = row_key(r)
+        if key in entries and existing.get(key) is r:
+            continue
+        stale.append(r["task_id"])
+        if r["status"] not in TERMINAL:
+            conn.execute("UPDATE tasks SET status='cancelled', updated_at=? "
+                         "WHERE task_id=?", (now, r["task_id"]))
+
+    matched = [(k, e) for k, e in entries.items() if k in existing]
+    fresh = [(k, e) for k, e in entries.items() if k not in existing]
+
+    # 2. park the matched rows so pass 3 can write any numbering it likes
+    for k, _e in matched:
+        park(existing[k]["task_id"])
+
+    # 3. update matched rows in place
+    for i, (key, entry) in enumerate(matched, start=1):
+        row = existing[key]
+        seq = target_seq(entry, i)
+        vacate(seq, row["task_id"])
+        conn.execute(
+            "UPDATE tasks SET sequence_index=?, objective=?, acceptance=?, "
+            "brief_json=?, depends_on=?, max_attempts=?, plan_key=?, "
+            "updated_at=? WHERE task_id=?",
+            (seq, str(entry.get("objective") or ""),
+             str(entry.get("acceptance") or ""),
+             json.dumps(entry.get("brief") or {}),
+             json.dumps([as_int(d, 0) for d in (entry.get("depends_on") or [])]),
+             as_int(entry.get("max_attempts"), 3), key, now, row["task_id"]))
+        reused[key] = row["task_id"]
+
+    # 4. everything else is new
+    for i, (key, entry) in enumerate(fresh, start=1):
+        seq = target_seq(entry, i)
+        vacate(seq, None)
+        created.append(create_task(
+            conn, workflow_id, seq, str(entry.get("title") or ""),
+            str(entry.get("objective") or ""), str(entry.get("acceptance") or ""),
+            entry.get("brief") or {},
+            [as_int(d, 0) for d in (entry.get("depends_on") or [])],
+            as_int(entry.get("max_attempts"), 3)))
+
+    return {"created": created, "reused": reused, "stale": stale}
 
 
 def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[sqlite3.Row]:
@@ -383,27 +542,43 @@ def on_result(conn: sqlite3.Connection, task_id: str, attempt: int,
         "commit_sha": result.get("commit_sha") or "",
         "branch": result.get("branch") or "",
     }
-    if outcome == "success" and gate_passed:
-        return transition(conn, task_id, "success", **extra)
-    if outcome == "needs_input":
-        return transition(conn, task_id, "waiting_input", **extra)
     config_class = error_code.startswith(CONFIG_CLASS_ERRORS)
-    if error_code.startswith(INFRA_ERROR_CODES):
+    if outcome == "success" and gate_passed:
+        dst = "success"
+    elif outcome == "needs_input":
+        dst = "waiting_input"
+    elif error_code.startswith(INFRA_ERROR_CODES):
         # infra fault: free requeue, attempt preserved (give back the number
-        # claim_for_dispatch took at claim time)
+        # claim_for_dispatch took at claim time). Deliberately NOT recorded in
+        # task_attempts: the attempt number is reused, so a row here would
+        # collide with — and suppress — the real result of the retried run.
         extra["lease_token"] = None
         extra["lease_expires_at"] = None
         extra["executor_id"] = None
         extra["attempt"] = max(0, row["attempt"] - 1)
         return transition(conn, task_id, "ready", **extra)
-    # failed / gate fail: retry if attempts remain (config-class never does)
-    if not config_class and row["attempt"] < row["max_attempts"]:
+    elif not config_class and row["attempt"] < row["max_attempts"]:
+        # failed / gate fail: retry while attempts remain (config-class never)
         extra["lease_token"] = None
         extra["lease_expires_at"] = None
         extra["executor_id"] = None
-        return transition(conn, task_id, "ready", **extra)
-    extra["error_log"] = str(result.get("log_tail", ""))[:4000]
-    return transition(conn, task_id, "failed", **extra)
+        dst = "ready"
+    else:
+        extra["error_log"] = str(result.get("log_tail", ""))[:4000]
+        dst = "failed"
+    # append-only attempt history (#2): same fenced transaction as the
+    # transition above; idempotent on (task_id, attempt_no) so a replayed
+    # result event can neither duplicate nor overwrite the recorded evidence.
+    repo_attempts.record_attempt(
+        conn, task_id=task_id, workflow_id=row["workflow_id"],
+        attempt_no=attempt, lease_token=lease_token, status=dst,
+        failure_class=repo_attempts.classify_failure(outcome, gate_passed,
+                                                     error_code),
+        checks=repo_attempts.failed_checks(result), result=result,
+        error_excerpt=str(result.get("log_tail") or error_code or ""),
+        branch_name=str(result.get("branch") or ""),
+        commit_sha=str(result.get("commit_sha") or ""))
+    return transition(conn, task_id, dst, **extra)
 
 
 def transition_fenced(conn: sqlite3.Connection, task_id: str, attempt: int,

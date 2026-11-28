@@ -27,6 +27,7 @@ from ..db import (repo_events, repo_runtime, repo_tasks, repo_workflows)
 from ..db.conn import connect, immediate, migrate
 from . import commands as commands_mod
 from . import dispatch as dispatch_mod
+from . import github_feedback
 from . import plan as plan_mod
 from . import reaper as reaper_mod
 from .review import apply_event, review_workflow, strand_dependents
@@ -68,6 +69,18 @@ class PlannerLoop:
         # 1. commands (interrupt priority, applied even when paused)
         stats["commands"] = commands_mod.drain_commands(
             self.conn, gh_client=self.gh_client, claudio_e=self.ce)
+
+        # 1b. GitHub feedback: consume any ledger row the command inbox did
+        # not deliver (lost command, planner restart). Idempotent per
+        # delivery_id, and it only ever correlates through stored pr_links.
+        # Deliberately outside the pause gate, because the github_event command
+        # path above is too: the same delivery must route the same way whichever
+        # way it arrives.
+        try:
+            stats["gh_feedback"] = github_feedback.sweep_unprocessed(
+                self.conn, settings=self.s)
+        except Exception as exc:  # noqa: BLE001 - intake must not wedge the loop
+            log.warning("github feedback sweep failed: %s", exc)
 
         # 2-5. planning work only when not paused
         if not paused:
@@ -234,6 +247,21 @@ class PlannerLoop:
             if d.deliveries > s.dlq_max_deliveries:
                 self.bus.push_dlq(s.stream_dlq, d.payload, "max deliveries")
                 self.bus.ack(s.stream_events, s.group_planner, d.id)
+                continue
+            # worker narration (progress / handoff) is persisted by the
+            # planner before the core message contracts are consulted: it is
+            # evidence, not domain state, and must never burn an attempt.
+            if commands_mod.worker_narration_type(d.payload):
+                try:
+                    with immediate(self.conn):
+                        commands_mod.ingest_worker_payload(
+                            self.conn, d.payload, msg_id=d.id)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("worker narration dropped: %s", exc)
+                    self.bus.ack(s.stream_events, s.group_planner, d.id)
+                    continue
+                self.bus.ack(s.stream_events, s.group_planner, d.id)
+                n += 1
                 continue
             try:
                 apply_event(self.conn, msg, d.id, s,

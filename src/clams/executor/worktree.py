@@ -122,6 +122,20 @@ class WorktreeManager:
     def branch_name(self, task_id: str, attempt: int) -> str:
         return f"clams/{task_id}-a{attempt}"
 
+    def _prune_worktrees(self, clone: Path) -> None:
+        """Deregister worktrees whose directory is gone.
+
+        ``reap_old_failures`` rmtree's attempt dirs directly, which leaves a
+        ghost registration in the clone: git then reports the attempt branch
+        as still checked out, ``branch -D`` refuses it, and the next
+        ``worktree add -b`` on that branch dies with "already exists"
+        (live finding: cadfa395 T2 retries, claudio#58 replan exhaustion).
+        """
+        try:
+            _run(["git", "worktree", "prune"], cwd=clone)
+        except GitError:
+            pass
+
     def add(self, repo: str, task_id: str, attempt: int,
             base_ref: str) -> tuple[Path, str]:
         clone = self.ensure_clone(repo, base_ref)
@@ -129,7 +143,10 @@ class WorktreeManager:
         branch = self.branch_name(task_id, attempt)
         if path.exists():
             self.remove(repo, task_id, attempt)
-        # a stale branch from a previous crashed attempt? reset it.
+        # a stale branch from a previous crashed/reaped attempt? reset it.
+        # prune first: branch -D refuses a branch still registered as checked
+        # out in a worktree dir that no longer exists.
+        self._prune_worktrees(clone)
         try:
             _run(["git", "branch", "-D", branch], cwd=clone)
         except GitError:
@@ -166,15 +183,22 @@ class WorktreeManager:
         for proj in self.work_root.iterdir():
             if not proj.is_dir():
                 continue
+            removed = False
             for wt in proj.iterdir():
                 if wt.name == "repo" or not wt.is_dir():
                     continue
                 try:
                     if wt.stat().st_mtime < cutoff:
                         shutil.rmtree(wt, ignore_errors=True)
+                        removed = True
                         n += 1
                 except OSError:
                     pass
+            # deregister the dirs we just deleted, or their branches stay
+            # "checked out" in the clone and poison the next worktree add
+            clone = proj / "repo"
+            if removed and (clone / ".git").exists():
+                self._prune_worktrees(clone)
         return n
 
     # ---------------------------------------------------------------- queries
@@ -216,3 +240,150 @@ class WorktreeManager:
 
     def push(self, path: Path, branch: str) -> None:
         _run(["git", "push", "-u", "origin", branch], cwd=path)
+
+    # ------------------------------------------------ workflow integration ref
+    # The container gitconfig supplies a credential helper but no committer
+    # identity, so any merge we make has to carry one explicitly.
+    INTEGRATION_IDENTITY = ("clams-integrator", "clams@invalid")
+
+    def integration_branch(self, workflow_id: str) -> str:
+        # the planner uses the same helper (contracts.integration_branch) when
+        # it asks for the merge, so the two sides cannot drift
+        from ..contracts import integration_branch
+        return integration_branch(workflow_id)
+
+    def _ref_sha(self, clone: Path, ref: str) -> Optional[str]:
+        try:
+            sha = _run(["git", "rev-parse", "--verify", "--quiet", ref],
+                       cwd=clone).strip()
+        except GitError:
+            return None
+        return sha or None
+
+    def _is_ancestor(self, clone: Path, a: str, b: str) -> bool:
+        """True when `a` is reachable from `b`. Exit 1 is a legitimate answer
+        here, not an error, so this cannot go through ``_run``."""
+        proc = subprocess.run(["git", "merge-base", "--is-ancestor", a, b],
+                              cwd=str(clone), capture_output=True, text=True,
+                              env=trust_env())
+        return proc.returncode == 0
+
+    def integrate(self, repo: str, workflow_id: str, worktree: Path,
+                  task_branch: str) -> str:
+        """Advance the workflow's integration ref to include `task_branch`, so
+        the next task's *first* attempt seeds from it instead of from the
+        workflow base ref.
+
+        Pure ref plumbing in the common case: with a single executor slot a
+        task branch is a descendant of the tip, so this is one compare-and-swap
+        ``update-ref`` and no working tree is touched. Only a genuine
+        non-fast-forward (a retry branch predating a tip advance, or a future
+        capacity>1) needs a real merge, and that runs in the still-alive task
+        worktree rather than a dedicated integration worktree — a per-workflow
+        checkout would have no lifecycle owner, since ``reap_old_failures``
+        only removes task dirs and the runner never learns "workflow done".
+
+        The ref is local to the clone and never pushed: lose the volume and
+        seeding falls back to base_ref, which is exactly the old behaviour.
+
+        Raises on conflict or a lost race; callers must treat that as
+        non-fatal (a task that passed the gate stays passed). To start a
+        workflow's integration over, delete ``refs/heads/clams/wf/<workflow_id>``.
+        """
+        clone = self.repo_dir(repo)
+        if not (clone / ".git").exists():
+            raise GitError(f"no clone for {repo}")
+        integ = self.integration_branch(workflow_id)
+        task_sha = self._ref_sha(clone, f"refs/heads/{task_branch}")
+        if task_sha is None:
+            raise GitError(f"task branch {task_branch} not found in clone")
+        tip = self._ref_sha(clone, f"refs/heads/{integ}")
+        if tip is None:
+            # CAS against the empty old value means "create only if absent", so
+            # two racers cannot both win; the loser gets a non-zero exit.
+            _run(["git", "update-ref", f"refs/heads/{integ}", task_sha, ""],
+                 cwd=clone)
+            return task_sha
+        if tip == task_sha:
+            return tip
+        if self._is_ancestor(clone, tip, task_sha):
+            _run(["git", "update-ref", f"refs/heads/{integ}", task_sha, tip],
+                 cwd=clone)
+            return task_sha
+        # non-ff: merge the tip into the task branch (its tree is clean — the
+        # gate just checked it) and advance the ref onto the merge commit.
+        name, email = self.INTEGRATION_IDENTITY
+        try:
+            _run(["git", "-c", f"user.name={name}", "-c", f"user.email={email}",
+                  "merge", "--no-edit", integ], cwd=worktree)
+        except GitError:
+            try:
+                _run(["git", "merge", "--abort"], cwd=worktree)
+            except GitError:
+                pass
+            raise
+        merged = self.head_commit(worktree)
+        _run(["git", "update-ref", f"refs/heads/{integ}", merged, tip],
+             cwd=clone)
+        return merged
+
+    def merge_to_base(self, repo: str, integration_ref: str,
+                      base_ref: str) -> str:
+        """Merge `integration_ref` into `base_ref` and push it. Returns the sha
+        that was pushed.
+
+        Unlike ``integrate`` this needs a real checkout, so it uses a temporary
+        worktree created and removed inside the call — it has an owner, so the
+        lifecycle objection to a *standing* integration worktree does not apply.
+
+        Two things that bite: the clone's own checkout already holds `base_ref`,
+        so the temp worktree must be `--detach`ed (git refuses to check out a
+        branch twice); and it must start from `origin/<base_ref>`, not the local
+        branch, because a checked-out local branch is never fast-forwarded by
+        ``fetch`` and would silently merge into a stale tip.
+
+        Raises GitError on a conflict or a rejected push (a protected base
+        branch, for instance). Nothing changes in that case: the merge is
+        aborted and nothing is pushed.
+        """
+        clone = self.ensure_clone(repo, base_ref)
+        self.fetch(repo)
+        # merge into the current remote tip, not a possibly-stale local branch
+        start = base_ref
+        if self._ref_sha(clone, f"refs/remotes/origin/{base_ref}"):
+            start = f"origin/{base_ref}"
+        path = self.work_root / _slug(repo) / "integrate-base"
+        if path.exists():
+            shutil.rmtree(path, ignore_errors=True)
+            try:
+                _run(["git", "worktree", "prune"], cwd=clone)
+            except GitError:
+                pass
+        try:
+            _run(["git", "worktree", "add", "--detach", str(path), start],
+                 cwd=clone)
+            name, email = self.INTEGRATION_IDENTITY
+            try:
+                _run(["git", "-c", f"user.name={name}",
+                      "-c", f"user.email={email}",
+                      "merge", "--no-edit", integration_ref], cwd=path)
+            except GitError:
+                try:
+                    _run(["git", "merge", "--abort"], cwd=path)
+                except GitError:
+                    pass
+                raise
+            sha = self.head_commit(path)
+            _run(["git", "push", "origin", f"HEAD:refs/heads/{base_ref}"],
+                 cwd=path)
+            return sha
+        finally:
+            try:
+                _run(["git", "worktree", "remove", "--force", str(path)],
+                     cwd=clone)
+            except GitError:
+                shutil.rmtree(path, ignore_errors=True)
+                try:
+                    _run(["git", "worktree", "prune"], cwd=clone)
+                except GitError:
+                    pass

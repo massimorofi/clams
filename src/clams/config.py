@@ -6,6 +6,7 @@ list exactly these keys with the same defaults (enforced by
 """
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal, Optional
@@ -61,6 +62,29 @@ class Settings(BaseSettings):
     github_api_base: str = "https://api.github.com"
     github_graphql_base: str = "https://api.github.com/graphql"
 
+    # --- github webhook intake (env-only, never persisted, never logged) ----
+    # Plain ``@property`` (NOT ``computed_field``) on purpose: a
+    # ``computed_field`` is serialized into ``model_dump()`` /
+    # ``model_dump_json()``, so any settings dump - log line, debug endpoint,
+    # planner payload - would echo the secret. A plain property is reachable as
+    # ``settings.github_webhook_secret`` but invisible to serialization.
+    #   * ``github_webhook_secret`` exists only in the deployment environment,
+    #     so it is also absent from ``.env.example`` parity tooling and can
+    #     never be committed.
+    #   * both are re-read on access, so a redeploy with a new secret takes
+    #     effect without a settings-cache reset.
+    # Nothing logs these; the webhook endpoint only ever reports *that*
+    # verification failed, never the secret or the expected digest.
+    @property
+    def github_webhook_secret(self) -> str:
+        return os.environ.get("CLAMS_GITHUB_WEBHOOK_SECRET", "").strip()
+
+    @property
+    def github_allowed_repos(self) -> list[str]:
+        """Comma-separated ``owner/repo`` (or ``owner/*``) allowlist."""
+        raw = os.environ.get("CLAMS_GITHUB_ALLOWED_REPOS", "")
+        return [item.strip() for item in raw.split(",") if item.strip()]
+
     # --- api -----------------------------------------------------------------------
     api_host: str = "127.0.0.1"
     api_port: int = 8200
@@ -73,6 +97,11 @@ class Settings(BaseSettings):
     heartbeat_interval_s: int = 60
     executor_alive_interval_s: int = 30
     keep_failed_worktree_hours: int = 24
+    # on workflow done, merge that workflow's integration ref into the project
+    # base branch and push it. Env-only (not runtime-editable: the settings grid
+    # renders numbers and text only). A protected base branch rejects the push
+    # — that raises an alert and changes nothing.
+    merge_to_base_on_done: bool = True
 
     # --- planner loop -----------------------------------------------------------------
     planner_cycle_s: float = 5.0

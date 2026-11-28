@@ -8,7 +8,10 @@ from typing import Any, Optional
 
 from ..db import (repo_commands, repo_events, repo_projects, repo_questions,
                   repo_runtime, repo_tasks, repo_workflows)
+from ..db import repo_handoffs, repo_progress
+from ..handoffs import Handoff, WorkerProgress
 from ..db.conn import immediate
+from . import reconcile
 
 log = logging.getLogger("clams.commands")
 
@@ -145,6 +148,12 @@ def _apply(conn, row, *, adhoc_handler=None, gh_client=None,
     if kind == "recover":
         return _recover(conn, target, issuer, gh_client=gh_client)
 
+    if kind == "dispose_handoff":
+        return _dispose_handoff(conn, payload, issuer, target)
+
+    if kind == "github_event":
+        return _github_event(conn, payload)
+
     raise ValueError(f"unhandled command kind {kind}")
 
 
@@ -225,6 +234,17 @@ def _recover(conn, target: Optional[str], issuer: str,
     }
 
 
+def _github_event(conn, payload: dict) -> dict:
+    """Consume one normalized GitHub delivery (the planner side of intake).
+
+    Correlation, classification and routing all live in
+    ``clams.planner.github_feedback``; this is only the inbox adapter. The
+    verdict is stored on the command row so an operator can see what happened.
+    """
+    from . import github_feedback
+    return github_feedback.handle_command(conn, payload)
+
+
 def _settings_patch(conn, payload: dict, issuer: str) -> dict:
     """Runtime tuning of planner-side execution-flow settings.
 
@@ -284,7 +304,8 @@ def _apply_plan(conn, payload: dict, issuer: str,
 
     Closes the loop for plans authored by the planner agent (or by hand):
     the plan must pass the exact validation LLM plans go through, then the
-    swap mirrors plan_workflow (old task set superseded atomically). NOTE:
+    swap mirrors plan_workflow: the new plan is reconciled into the existing
+    task set atomically (no deletes, task identity preserved). NOTE:
     runs inside drain_commands' BEGIN IMMEDIATE — must not open its own.
     """
     from .. import contracts
@@ -314,19 +335,25 @@ def _apply_plan(conn, payload: dict, issuer: str,
         if p.get("repo") == repo:
             base_ref = p.get("base_ref", "main")
             break
-    n_old = repo_tasks.delete_workflow_tasks(conn, wf_id)
-    for i, pt in enumerate(plan.tasks, start=1):
-        repo_tasks.create_task(
-            conn, wf_id, i, pt.title, pt.objective, pt.acceptance,
-            build_brief(pt, repo, base_ref, s),
-            depends_on=pt.depends_on, max_attempts=s.max_attempts)
+    # Reconcile, never delete: the old task set is superseded in place so a
+    # re-planned title keeps its task_id (and its GitHub sub-issue). The
+    # sequence_index ladder is assigned by reconcile, which keeps
+    # UNIQUE(workflow_id, sequence_index) intact across the swap.
+    planned = [{**pt.model_dump(),
+                "brief": build_brief(pt, repo, base_ref, s),
+                "max_attempts": s.max_attempts}
+               for pt in plan.tasks]
+    # NOTE: tasks must NOT inherit the workflow's gh_issue_number —
+    # project_tasks_created skips tasks that already carry one, so stamping
+    # the parent here silently disabled sub-issue creation. Each task gets its
+    # own sub-issue number via the outbox callback.
+    res = reconcile.apply_replanned_plan(conn, wf_id, planned, actor=issuer)
     repo_workflows.set_plan(conn, wf_id, plan.model_dump(), status="running")
-    repo_events.append_event(
-        conn, "workflow", wf_id, "warn",
-        f"apply_plan by {issuer}: replaced {n_old} tasks with "
-        f"{len(plan.tasks)}")
     log.info("apply_plan on %s by %s: %d tasks", wf_id, issuer, len(plan.tasks))
-    return {"workflow": wf_id, "tasks": len(plan.tasks), "replaced": n_old}
+    return {"workflow": wf_id, "tasks": len(plan.tasks),
+            "replaced": res["cancelled_count"],
+            "reused": res["reused_count"], "created": res["created_count"],
+            "cancelled": res["cancelled_count"]}
 
 
 def _stop_agent_run(claudio_e, session_ref: str) -> bool:
@@ -451,3 +478,171 @@ def _config_patch(conn, payload: dict, issuer: str,
                              f"config_patch by {issuer}: "
                              f"applied={applied} removed={removed}")
     return {"projects": applied, "removed": removed}
+
+
+# ------------------------------------------------------------- handoffs
+def _dispose_handoff(conn, payload: dict, issuer: str,
+                     target: Optional[str]) -> dict:
+    """Operator disposition of a worker handoff (open -> acknowledged -> ...).
+
+    The API never touches the handoffs table: it enqueues this command and the
+    planner (the only domain-state writer) applies the transition. Idempotent:
+    re-running the same disposition is a no-op, so a replayed command cannot
+    corrupt the history. A handoff that asked for a scope change is *answered*
+    here; the task brief is never edited by this path.
+    """
+    hid = payload.get("handoff_id")
+    if hid is None and target is not None:
+        try:
+            hid = int(target)
+        except (TypeError, ValueError):
+            raise ValueError("dispose_handoff needs payload.handoff_id")
+    if hid is None:
+        raise ValueError("dispose_handoff needs payload.handoff_id")
+    try:
+        hid = int(hid)
+    except (TypeError, ValueError):
+        raise ValueError(f"bad handoff id {hid!r}")
+    to_status = payload.get("status") or payload.get("to_status") or ""
+    if not to_status:
+        raise ValueError("dispose_handoff needs payload.status "
+                         "(acknowledged|resolved|rejected)")
+    res = repo_handoffs.dispose(
+        conn, hid, to_status,
+        disposition=payload.get("disposition") or "",
+        disposed_by=issuer or "operator",
+        note=payload.get("note") or "")
+    if not res.get("ok"):
+        reason = res.get("reason", "failed")
+        raise ValueError(f"cannot dispose handoff {hid}: {reason}")
+    return {"handoff": hid, "status": res["status"],
+            "changed": res.get("changed", False),
+            "disposition": res.get("disposition", "")}
+
+
+# ------------------------------------------------- worker narration ingest
+#: bus event types that carry worker progress / handoff requests
+WORKER_NARRATION_TYPES = ("task.progress", "task.handoff")
+
+
+def _decode_payload(raw) -> Optional[dict]:
+    """Best-effort decode of a bus payload into a dict (None if not one)."""
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            raw = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            return None
+    return raw if isinstance(raw, dict) else None
+
+
+def worker_narration_type(raw) -> Optional[str]:
+    """The narration type if this payload is worker progress/handoff, else None.
+
+    Checked on the *raw* payload (before the pydantic message contracts, which
+    only know the core event types) so the loop can route these messages
+    without a contract change.
+    """
+    data = _decode_payload(raw)
+    if not data:
+        return None
+    etype = data.get("type") or data.get("event")
+    return etype if etype in WORKER_NARRATION_TYPES else None
+
+
+def ingest_worker_payload(conn, raw, *, msg_id: Optional[str] = None) -> dict:
+    """Persist one worker progress/handoff message and surface it.
+
+    Called by the planner loop when it reads clams:events. Returns a result
+    dict ``{"kind", "accepted"/"id", ...}``. Raises ValueError on a malformed
+    payload so the caller can leave the message unacked / DLQ it.
+
+    Idempotent on redelivery: progress is fenced on (task, attempt, lease, seq)
+    and a duplicate seq is rejected without writing; handoffs dedupe on their
+    natural key.
+    """
+    data = _decode_payload(raw)
+    if data is None:
+        raise ValueError("worker narration payload is not a JSON object")
+    if msg_id and repo_events.was_processed(conn, msg_id):
+        return {"kind": data.get("type"), "duplicate": True}
+    etype = data.get("type") or data.get("event")
+    body = data.get("payload") if isinstance(data.get("payload"), dict) else data
+    if etype == "task.progress":
+        res = _ingest_progress(conn, body, data)
+    elif etype == "task.handoff":
+        res = _ingest_handoff(conn, body, data)
+    else:
+        raise ValueError(f"not a worker narration message: {etype!r}")
+    if msg_id:
+        repo_events.mark_processed(conn, msg_id)
+    return res
+
+
+def _task_workflow_id(conn, task_id: str) -> str:
+    row = conn.execute("SELECT workflow_id FROM tasks WHERE task_id=?",
+                       (task_id,)).fetchone()
+    return row["workflow_id"] if row else ""
+
+
+def _ingest_progress(conn, body: dict, envelope: dict) -> dict:
+    """Fenced append of one worker progress line."""
+    rec = WorkerProgress.from_payload({
+        "task_id": body.get("task_id") or envelope.get("task_id"),
+        "attempt_no": body.get("attempt_no", envelope.get("attempt", 0)),
+        "seq": body.get("seq", envelope.get("seq", 0)),
+        "kind": body.get("kind") or "log",
+        "text": body.get("text", envelope.get("text", "")),
+        "lease_token": body.get("lease_token") or envelope.get("lease_token") or "",
+    })
+    res = repo_progress.append_progress_record(conn, rec)
+    if res["accepted"]:
+        log.debug("progress %s/%s seq=%s %s", rec.task_id, rec.attempt_no,
+                  rec.seq, rec.kind)
+    else:
+        # surfaced (never silent): a stale executor is worth seeing in the
+        # timeline, but it changes no state
+        repo_events.append_event(
+            conn, "task", rec.task_id, "warn",
+            f"rejected stale progress ({res['reason']}, attempt "
+            f"{rec.attempt_no}, seq {rec.seq})",
+            {"reason": res["reason"], "attempt_no": rec.attempt_no,
+             "seq": rec.seq})
+        log.info("rejected progress for %s: %s", rec.task_id, res["reason"])
+    return {"kind": "task.progress", **res}
+
+
+def _ingest_handoff(conn, body: dict, envelope: dict) -> dict:
+    """Record a handoff request. Never edits the task brief."""
+    payload = {
+        "task_id": body.get("task_id") or envelope.get("task_id"),
+        "workflow_id": (body.get("workflow_id") or envelope.get("workflow_id")
+                        or ""),
+        "attempt_no": body.get("attempt_no", envelope.get("attempt", 0)),
+        "kind": body.get("kind") or "other",
+        "reason": body.get("reason", ""),
+        "requested_action": body.get("requested_action", ""),
+    }
+    if not payload["workflow_id"]:
+        payload["workflow_id"] = _task_workflow_id(conn, payload["task_id"])
+    if not payload["workflow_id"]:
+        raise ValueError(f"handoff for unknown task {payload['task_id']!r}")
+    handoff = Handoff.from_payload(payload)
+    res = repo_handoffs.record_handoff(conn, handoff)
+    if handoff.asks_scope_change:
+        # Explicitly NOT an edit: the brief stays exactly as planned. The
+        # operator answers by disposing the handoff (and, if they agree,
+        # replanning / apply_plan through the normal path).
+        repo_events.append_event(
+            conn, "task", handoff.task_id, "warn",
+            f"scope change requested (handoff #{res['id']}); brief left "
+            "immutable - answer via dispose_handoff or replan",
+            {"handoff_id": res["id"],
+             "requested_action": handoff.requested_action})
+    log.info("handoff #%s recorded for %s (%s)", res["id"], handoff.task_id,
+             handoff.kind)
+    return {"kind": "task.handoff", **res}

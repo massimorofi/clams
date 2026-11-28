@@ -12,7 +12,7 @@ from clams.bus import InMemoryBus
 from clams.config import Settings
 from clams.claudio_client import ChatResponse, ClaudioError
 from clams.executor.runner import ExecutorRunner, build_prompt, detect_needs_input
-from clams.executor.worktree import WorktreeManager
+from clams.executor.worktree import GitError, WorktreeManager
 
 
 @pytest.fixture()
@@ -109,6 +109,86 @@ def test_success_flow(tmp_path, remote):
     assert not wt.worktree_path("o/r", "t1", 1).exists()
     # dispatch acked
     assert bus.pending_count(s.stream_tasks, s.group_executors) == 0
+
+
+def _commit(ws: Path, msg: str):
+    subprocess.run(["git", "add", "."], cwd=ws, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", msg], cwd=ws, check=True,
+                   capture_output=True)
+
+
+def _run_one(runner, bus, s):
+    got = bus.read(s.stream_tasks, s.group_executors, "e1", count=1)
+    runner._handle(got[0])
+    return [e for e in _drain_events(bus, s) if e.type == "task.result"][0]
+
+
+def test_second_task_seeds_from_integration_branch(tmp_path, remote):
+    """claudio#133, the wasted attempt: a chained task's first attempt seeded
+    from main, found none of its dependencies' files, recreated them, and was
+    then failed by the scope gate for the recreation. It must instead start
+    from the workflow's integration ref — and not be charged for what was
+    already there."""
+    s = _settings(tmp_path)
+    bus = InMemoryBus()
+    bus.ensure_group(s.stream_tasks, s.group_executors)
+    wt = WorktreeManager(s.work_root, remote_url_template=str(remote))
+
+    def build_module(ws: Path):
+        (ws / "new.py").write_text("VALUE = 1\n")
+        _commit(ws, "t1 work")
+
+    _dispatch(bus, s, task_id="t1", token="L1")
+    res1 = _run_one(ExecutorRunner(s, bus, FakeClaudio(build_module), wt),
+                    bus, s)
+    assert res1.outcome == "success"
+    assert wt.ref_exists("o/r", "clams/wf/w1")
+
+    seen: list[bool] = []
+
+    def write_notes(ws: Path):
+        seen.append((ws / "new.py").exists())   # proof the seed carried t1
+        (ws / "notes.txt").write_text("notes\n")
+        _commit(ws, "t2 work")
+
+    b2 = contracts.Brief(objective="document the module",
+                         acceptance="notes.txt exists",
+                         run=["test -f new.py && echo ok"],
+                         writable=["*.txt"], repo="o/r", base_ref="main")
+    _dispatch(bus, s, brief=b2, task_id="t2", token="L2")
+    res2 = _run_one(ExecutorRunner(s, bus, FakeClaudio(write_notes), wt),
+                    bus, s)
+
+    assert seen == [True]
+    assert res2.outcome == "success", res2.evidence
+    assert res2.changed_files == ["notes.txt"]  # t1's new.py not charged
+    assert "integration_error" not in res2.evidence
+    # the tip advanced to t2's commit
+    assert wt.ref_exists("o/r", "clams/wf/w1")
+
+
+def test_integration_failure_does_not_fail_task(tmp_path, remote, monkeypatch):
+    """Integration is an optimisation, never a verdict: a task that passed the
+    gate stays passed if the ref cannot be advanced."""
+    s = _settings(tmp_path)
+    bus = InMemoryBus()
+    bus.ensure_group(s.stream_tasks, s.group_executors)
+    wt = WorktreeManager(s.work_root, remote_url_template=str(remote))
+
+    def boom(*a, **k):
+        raise GitError("simulated integration failure")
+
+    monkeypatch.setattr(wt, "integrate", boom)
+
+    def agent(ws: Path):
+        (ws / "new.py").write_text("VALUE = 1\n")
+        _commit(ws, "work")
+
+    _dispatch(bus, s)
+    res = _run_one(ExecutorRunner(s, bus, FakeClaudio(agent), wt), bus, s)
+    assert res.outcome == "success"
+    assert "simulated integration failure" in res.evidence["integration_error"]
+    assert not wt.ref_exists("o/r", "clams/wf/w1")
 
 
 def test_gate_fail_keeps_worktree(tmp_path, remote):

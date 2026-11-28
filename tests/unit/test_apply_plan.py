@@ -36,9 +36,13 @@ def test_apply_plan_swaps_tasks_and_runs(db):
     row = repo_workflows.get_workflow(db, wf)
     assert row["status"] == "running"
     tasks = repo_tasks.list_tasks(db, wf)
-    assert [t["title"] for t in tasks] == ["step one", "step two"]
-    assert "old task" not in [t["title"] for t in tasks]
-    brief = json.loads(tasks[0]["brief_json"])
+    by_title = {t["title"]: t for t in tasks}
+    # reconcile never deletes (84d470e): the dropped title stays as a
+    # cancelled row so its GitHub sub-issue mapping survives
+    assert set(by_title) == {"old task", "step one", "step two"}
+    assert by_title["old task"]["status"] == "cancelled"
+    assert by_title["step one"]["status"] == "pending"
+    brief = json.loads(by_title["step one"]["brief_json"])
     assert brief["repo"] == "o/r" and brief["run"] == ["echo one"]
     assert json.loads(row["plan_json"])["tasks"][1]["depends_on"] == [1]
 

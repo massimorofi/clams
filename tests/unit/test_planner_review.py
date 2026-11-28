@@ -253,3 +253,60 @@ def test_stall_alerts_without_killing(db_path):
     assert repo_tasks.get_task(db, t)["status"] == "running"   # NOT killed
     # idempotent: same severity does not re-alert
     assert wd.check_liveness(db) == 0
+
+
+# ------------------------------------------------- merge to base on done (§13)
+
+def _succeed(db, s, wf, t, a, tok, mid="m9"):
+    _started(db, s, t, a, tok, msg_id=mid)
+    m = contracts.TaskResult(task_id=t, attempt=a, lease_token=tok,
+                             outcome="success", evidence={"passed": True},
+                             commit_sha="abc", branch="clams/x",
+                             session_ref="sess-1")
+    assert apply_event(db, m, mid + "r", s) == "applied"
+    assert repo_workflows.get_workflow(db, wf)["status"] == "done"
+
+
+def test_done_asks_executor_to_merge_to_base(db):
+    """The planner has no git access, so 'done' can only *request* the merge."""
+    s = Settings(_env_file=None)
+    wf, [(t, a, tok)] = _dispatched(db, s)
+    _succeed(db, s, wf, t, a, tok)
+
+    rows = repo_outbox.claim_due(db)
+    assert len(rows) == 1
+    payload = json.loads(rows[0]["payload"])
+    assert payload["stream"] == s.stream_tasks
+    msg = payload["msg"]
+    assert msg["type"] == "workflow.integrate"
+    assert msg["workflow_id"] == wf
+    assert msg["repo"] == "o/r"
+    assert msg["integration_branch"] == contracts.integration_branch(wf)
+    assert msg["base_ref"] == "main"
+
+
+def test_done_enqueues_nothing_when_merge_disabled(db):
+    s = Settings(_env_file=None, merge_to_base_on_done=False)
+    wf, [(t, a, tok)] = _dispatched(db, s)
+    _succeed(db, s, wf, t, a, tok)
+    assert repo_outbox.claim_due(db) == []
+
+
+def test_workflow_integrated_reports_back(db):
+    """The executor owns git, so a failed merge must come back as an alert —
+    otherwise the workflow's work is stranded on the ref in silence."""
+    from clams.db import repo_alerts
+    s = Settings(_env_file=None)
+    wf, [(t, a, tok)] = _dispatched(db, s)
+    _started(db, s, t, a, tok)
+
+    ok = contracts.WorkflowIntegrated(workflow_id=wf, base_ref="main",
+                                      ok=True, detail="deadbeef01")
+    assert apply_event(db, ok, "mi1", s) == "applied"
+    assert repo_alerts.open_count(db) == 0
+
+    bad = contracts.WorkflowIntegrated(workflow_id=wf, base_ref="main",
+                                       ok=False, detail="merge conflict")
+    assert apply_event(db, bad, "mi2", s) == "applied"
+    assert repo_alerts.open_count(db) == 1
+    assert "merge conflict" in repo_alerts.list_open(db)[0]["message"]

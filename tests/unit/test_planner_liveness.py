@@ -256,3 +256,23 @@ def test_new_attempt_resets_window(db):
     repo_tasks.on_started(db, t, row["attempt"], row["lease_token"], "e1",
                           "sess-2")
     assert wd.check_liveness(db) == 0           # fresh baseline, no stale warn
+
+
+def test_alert_hygiene_clears_stale_plan_alert(db):
+    """The 'plan' probe is global and normally cleared by the next successful
+    plan; if its workflow left planning/blocked another way (operator reset,
+    cancel), hygiene must clear it once the subject is out of those states."""
+    s = _settings()
+    pid = repo_projects.upsert_project(db, "o/r")
+    wf = repo_workflows.create_workflow(db, pid, "adhoc", "g")
+    repo_workflows.set_status(db, wf, "blocked")
+    repo_alerts.raise_alert(
+        db, "plan", "error",
+        f"workflow {wf} unplanable: claudio chat unreachable: "
+        "[Errno 111] Connection refused")
+    wd = _wd(FakeCE(), s)
+    wd.probe(db)
+    assert "plan" in [a["probe"] for a in repo_alerts.list_open(db)]
+    repo_workflows.set_status(db, wf, "done")   # replanned & finished
+    wd.probe(db)
+    assert "plan" not in [a["probe"] for a in repo_alerts.list_open(db)]

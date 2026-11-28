@@ -72,6 +72,49 @@ def test_retry_base_falls_back_when_no_previous_branch(tmp_path):
     assert r._retry_base(_B(), "task9", 5) == "main"
 
 
+def _commit(path, name, body="real work"):
+    (path / name).write_text(body)
+    _git("add", ".", cwd=path)
+    _git("commit", "-m", f"{name} work", cwd=path)
+
+
+def test_attempt1_seeds_from_integration_branch(tmp_path):
+    """The claudio#133 fix: a chained task's FIRST attempt must start from its
+    predecessors' merged work, not from base_ref."""
+    src = _src_repo(tmp_path)
+    wt = WorktreeManager(tmp_path / "work", remote_url_template=str(src))
+    p1, _ = wt.add("o/r", "task1", 1, "main")
+    _commit(p1, "work.py")
+    wt.integrate("o/r", "w1", p1, wt.branch_name("task1", 1))
+
+    r = ExecutorRunner.__new__(ExecutorRunner)
+    r.wt = wt
+    # a different task, first attempt: it has no previous branch of its own
+    assert r._retry_base(_B(), "task2", 1, "w1") == "clams/wf/w1"
+    p2, _ = wt.add("o/r", "task2", 1, r._retry_base(_B(), "task2", 1, "w1"))
+    assert (p2 / "work.py").exists()
+    # no workflow id, or a workflow that has not integrated anything yet
+    assert r._retry_base(_B(), "task2", 1) == "main"
+    assert r._retry_base(_B(), "task2", 1, "w-other") == "main"
+
+
+def test_retry_prefers_previous_attempt_over_integration(tmp_path):
+    """Work reuse must not regress: a retry resumes its OWN branch even when
+    the shared tip has moved past it."""
+    src = _src_repo(tmp_path)
+    wt = WorktreeManager(tmp_path / "work", remote_url_template=str(src))
+    p1, _ = wt.add("o/r", "task1", 1, "main")
+    _commit(p1, "own.py")
+    # another task advances the shared tip beyond task1's own branch
+    p2, _ = wt.add("o/r", "task2", 1, "main")
+    _commit(p2, "other.py")
+    wt.integrate("o/r", "w1", p2, wt.branch_name("task2", 1))
+
+    r = ExecutorRunner.__new__(ExecutorRunner)
+    r.wt = wt
+    assert r._retry_base(_B(), "task1", 2, "w1") == "clams/task1-a1"
+
+
 # ---------------------------------------------------------------- B: prompt
 
 def test_build_prompt_includes_prior_failure_block():
@@ -115,3 +158,32 @@ def test_dispatch_injects_prior_failure_on_attempt_two(db):
     # attempt 1 briefs never carried it (stored brief stays clean)
     assert "prior_failure" not in json.loads(
         repo_tasks.get_task(db, t)["brief_json"])
+
+
+# ------------------------------------------------- ghost worktree registrations
+
+def test_add_recovers_after_reap_ghost_registration(tmp_path):
+    """reap_old_failures rmtree's attempt dirs; the leftover registration in
+    the clone keeps the attempt branch "checked out", so without a prune the
+    next add on the same branch dies with 'branch already exists' (live
+    finding: cadfa395 T2 retries after the reaper ran)."""
+    import shutil
+    src = _src_repo(tmp_path)
+    wt = WorktreeManager(tmp_path / "work", remote_url_template=str(src))
+    p1, br = wt.add("o/r", "task1", 1, "main")
+    shutil.rmtree(p1)                       # simulate the reaper
+    p2, br2 = wt.add("o/r", "task1", 1, "main")   # must not raise GitError
+    assert br2 == br
+    assert (p2 / "a.txt").exists()
+
+
+def test_reap_prunes_ghost_registrations(tmp_path):
+    src = _src_repo(tmp_path)
+    wt = WorktreeManager(tmp_path / "work", remote_url_template=str(src))
+    p1, _ = wt.add("o/r", "task1", 1, "main")
+    os.utime(p1, (0, 0))                    # make it older than any cutoff
+    assert wt.reap_old_failures(max_age_hours=0) == 1
+    out = subprocess.run(["git", "worktree", "list", "--porcelain"],
+                         cwd=str(wt.repo_dir("o/r")), capture_output=True,
+                         text=True, env=_GIT_ENV).stdout
+    assert "task1-a1" not in out            # registration gone, not prunable

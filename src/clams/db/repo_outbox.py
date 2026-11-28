@@ -8,7 +8,7 @@ from typing import Any, Optional
 from .conn import plus_s, utcnow_s
 
 OUTBOX_KINDS = ('bus_publish', 'gh_comment', 'gh_label', 'gh_board_move',
-                'gh_subissue')
+                'gh_subissue', 'gh_close')
 
 
 def enqueue(conn: sqlite3.Connection, kind: str, payload: dict[str, Any],

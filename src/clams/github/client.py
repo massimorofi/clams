@@ -102,6 +102,12 @@ class GitHubClient:
     def get_issue(self, repo: str, number: int) -> dict:
         return self._request("GET", f"/repos/{repo}/issues/{number}")
 
+    def get_pull_request(self, repo: str, number: int) -> dict:
+        """One pull request. Used to (re)assert the current head SHA/branch of
+        a PR when recording a pr_links mapping - never to correlate a webhook,
+        which goes through the stored mapping only."""
+        return self._request("GET", f"/repos/{repo}/pulls/{number}")
+
     def create_issue(self, repo: str, title: str, body: str,
                      labels: list[str]) -> dict:
         return self._request("POST", f"/repos/{repo}/issues",
@@ -125,6 +131,25 @@ class GitHubClient:
         return self._request(
             "PATCH", f"/repos/{repo}/issues/{number}",
             json_body={"labels": labels})
+
+    def close_issue(self, repo: str, number: int,
+                    *, comment: Optional[str] = None) -> dict:
+        """Close an issue (superseded sub-issues must be closable).
+
+        Posts ``comment`` first when given (through :meth:`add_comment`), then
+        PATCHes the issue to ``state=closed``. An issue that is already closed
+        is a success, not an error: the state is read back from the response
+        and nothing is raised, so a retried outbox row cannot dead-letter on a
+        second close.
+        """
+        if comment:
+            self.add_comment(repo, number, comment)
+        resp = self._request("PATCH", f"/repos/{repo}/issues/{number}",
+                             json_body={"state": "closed"})
+        state = (resp or {}).get("state")
+        log.info("closed %s#%s (state=%s)", repo, number, state)
+        return {"repo": repo, "number": number, "state": state,
+                "closed": state in ("closed", None)}
 
     def ensure_label(self, repo: str, name: str, color: str = "0e8a16",
                      description: str = "") -> None:
@@ -276,3 +301,7 @@ class GitHubClient:
                 return c.head(self.api_base).status_code < 500
         except Exception:
             return False
+
+
+#: Alias: tickets and docs sometimes spell the class ``GithubClient``.
+GithubClient = GitHubClient

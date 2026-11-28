@@ -14,7 +14,7 @@ from clams.db.conn import db_integrity_ok, plus_s, utcnow_s
 
 
 def test_migrations_apply_once(db):
-    assert schema_version(db) == 8   # 001..008
+    assert schema_version(db) == 10   # 001..010
     assert migrate(db) == []          # idempotent
     assert db_integrity_ok(db)
 
@@ -576,3 +576,11 @@ def test_read_only_connection(db_path):
     with pytest.raises(sqlite3.OperationalError):
         ro.execute("INSERT INTO runtime_state(key,value) VALUES('x','y')")
     ro.close()
+
+
+def test_gh_close_allowed_by_shipped_schema(db):
+    """Migration 010 widened the outbox kind CHECK; without it enqueue
+    swallowed the IntegrityError and gh_close silently enqueued nothing."""
+    from clams.db import repo_outbox
+    assert repo_outbox.enqueue(db, "gh_close", {"issue": 1},
+                               "gh:gh_subissue:t1:closed") is not None
