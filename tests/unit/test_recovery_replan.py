@@ -21,8 +21,8 @@ import json
 
 import pytest
 
-from clams.db import (connect, migrate, repo_projects, repo_tasks,
-                      repo_workflows)
+from clams.db import (connect, migrate, repo_commands, repo_projects,
+                      repo_tasks, repo_workflows)
 from clams.planner import commands
 
 BRIEF = {"objective": "o", "acceptance": "a", "run": ["echo x"],
@@ -164,10 +164,39 @@ def test_recover_from_failed_workflow_also_reopens(db):
     assert "replan requested by me" in _messages(db, wf)
 
 
-def test_recover_rejects_a_running_workflow(db):
+def test_recover_rejects_a_running_workflow_with_work_to_sweep(db):
+    """Still live work to clean -> 'running' is not a recovery target."""
     wf = _workflow(db, status="running")
-    with pytest.raises(ValueError):
-        commands._recover(db, wf, "operator")
+    _task(db, wf, 1, "done, issue still open", status="success",
+          gh_issue_number=201)
+    gh = FakeGH(labelled=[_issue(201, "done, issue still open")],
+                subissues=[_issue(201, "done, issue still open")])
+
+    with pytest.raises(ValueError, match="not blocked/failed"):
+        commands._recover(db, wf, "operator", gh_client=gh)
+
+    assert _close_rows(db) == []
+
+
+def test_recover_on_a_clean_running_workflow_is_a_noop(db):
+    """Requirement 3: planning/running + noop -> one event, zero writes."""
+    wf = _workflow(db, status="running")
+    _task(db, wf, 1, "alpha", status="success", gh_issue_number=201)
+    gh = FakeGH(labelled=[_issue(201, "done", state="closed")],
+                subissues=[])
+    before = _snapshot(db)
+
+    res = commands._recover(db, wf, "operator", gh_client=gh)
+
+    assert res["noop"] is True
+    assert res["orphan_count"] == 0
+    assert res["stale_success_count"] == 0
+    assert res["status"] == "running"
+    assert _close_rows(db) == []
+    assert _snapshot(db) == before, "the noop path must not touch any row"
+    messages = _messages(db, wf)
+    assert messages.count("recovery: nothing to recover by operator") == 1
+    assert not [m for m in messages if m.startswith("workflow recovered:")]
 
 
 # ------------------------------------------------------ plan-tail rebuild
@@ -344,3 +373,124 @@ def test_final_audit_event_records_the_sweep(db):
     assert data["orphans_closed"] == []
     assert data["outbox_rows"] == 1
     assert data["noop"] is False
+
+
+
+# ------------------------------------------------------- whole-table snapshots
+def _snapshot(db) -> list[tuple]:
+    """Every task row, all columns, ordered by task_id (stable for compare)."""
+    return [tuple(r) for r in db.execute(
+        "SELECT * FROM tasks ORDER BY task_id").fetchall()]
+
+
+def _outbox_snapshot(db) -> list[tuple]:
+    return [tuple(r) for r in db.execute(
+        "SELECT * FROM outbox ORDER BY outbox_id").fetchall()]
+
+
+def _event_count(db) -> int:
+    return db.execute("SELECT COUNT(*) n FROM events").fetchone()["n"]
+
+
+def _success_plus_failed_tail(db, status="blocked"):
+    """The scenario the recover command exists for.
+
+    One finished step (success, sub-issue #201 already closed by the auto-close
+    that shipped later) and a two-step tail that never got there: #202 failed,
+    #203 was stranded blocked behind it. GitHub reports all three sub-issues
+    closed, so there is nothing for the sweeps to clean: recovery's whole job
+    here is the replan.
+    """
+    wf = _workflow(db, status)
+    t_ok = _task(db, wf, 1, "step one", status="success", gh_issue_number=201)
+    t_bad = _task(db, wf, 2, "step two", status="failed", depends_on=[1],
+                  gh_issue_number=202)
+    t_stranded = _task(db, wf, 3, "step three", status="blocked",
+                       depends_on=[2], gh_issue_number=203)
+    gh = FakeGH(labelled=[_issue(201, "step one", state="closed"),
+                          _issue(202, "step two", state="closed"),
+                          _issue(203, "step three", state="closed")],
+                subissues=[])
+    return wf, (t_ok, t_bad, t_stranded), gh
+
+
+# ------------------------------------------- the end-to-end recover (via drain)
+def test_recover_command_preserves_success_and_replans_the_tail(db):
+    """One ``recover`` on a blocked workflow: clean up AND retry from the
+    last successful step, with the finished work left exactly as it was."""
+    wf, (t_ok, t_bad, t_stranded), gh = _success_plus_failed_tail(db)
+    cid = repo_commands.insert_command(db, "recover", {}, "operator",
+                                       target=wf)
+
+    assert commands.drain_commands(db, gh_client=gh) == 1
+    assert repo_commands.get(db, cid)["status"] == "applied"
+
+    rows = {r["task_id"]: r for r in _rows(db, wf)}
+    assert set(rows) == {t_ok, t_bad, t_stranded}, "no task row was minted"
+
+    # the success task is untouched: same identity, same issue, still success
+    ok = rows[t_ok]
+    assert ok["task_id"] == t_ok
+    assert ok["gh_issue_number"] == 201
+    assert ok["status"] == "success"
+    # ... and recovery did not queue a close for its (already closed) sub-issue
+    assert [json.loads(r["payload"])["issue"] for r in _close_rows(db)] == []
+
+    # the failed / blocked tail was re-queued into the plan, not cancelled
+    assert rows[t_bad]["status"] == "failed"
+    assert rows[t_stranded]["status"] == "blocked"
+    assert [r["sequence_index"] for r in _rows(db, wf)] == [1, 2, 3]
+    result = json.loads(repo_commands.get(db, cid)["result"])
+    assert result["replanned"] == 3
+    assert result["tasks_reused"] == 3
+    assert result["tasks_created"] == 0
+    assert result["tasks_cancelled"] == 0
+    assert result["tasks_preserved"] == 1
+
+    # the workflow left blocked/failed and the planner loop will pick it up
+    assert repo_workflows.get_workflow(db, wf)["status"] == "planning"
+
+    messages = _messages(db, wf)
+    assert "replan requested by operator" in messages
+    assert any(m.startswith("workflow recovered:") for m in messages)
+    data = _last_data(db, wf, "workflow recovered:")
+    assert data["status"] == "planning"
+    assert data["tasks_preserved"] == 1
+    assert data["replanned"] == 3
+    assert data["orphans_closed"] == []
+    assert data["stale_success_closed"] == []
+
+
+def test_recover_twice_is_a_noop_with_zero_outbox_rows(db):
+    """Second ``recover`` on the now-clean workflow writes nothing at all."""
+    wf, (_t_ok, _t_bad, _t_stranded), gh = _success_plus_failed_tail(db)
+    repo_commands.insert_command(db, "recover", {}, "operator", target=wf)
+    assert commands.drain_commands(db, gh_client=gh) == 1
+
+    tasks_before = _snapshot(db)
+    outbox_before = _outbox_snapshot(db)
+    events_before = _event_count(db)
+
+    cid2 = repo_commands.insert_command(db, "recover", {}, "operator",
+                                        target=wf)
+    assert commands.drain_commands(db, gh_client=gh) == 1
+    assert repo_commands.get(db, cid2)["status"] == "applied"
+
+    # zero new outbox rows, and not one task column moved
+    assert _outbox_snapshot(db) == outbox_before
+    assert _snapshot(db) == tasks_before
+
+    result = json.loads(repo_commands.get(db, cid2)["result"])
+    assert result["noop"] is True
+    assert result["orphan_count"] == 0
+    assert result["stale_success_count"] == 0
+    assert result["status"] == "planning"
+
+    messages = _messages(db, wf)
+    assert messages.count("recovery: nothing to recover by operator") == 1
+    # that single noop line is the only thing the second run appended
+    assert _event_count(db) == events_before + 1
+    assert not [m for m in messages[messages.index(
+        "recovery: nothing to recover by operator") + 1:]
+        if m.startswith("workflow recovered:")]
+    assert repo_workflows.get_workflow(db, wf)["status"] == "planning"

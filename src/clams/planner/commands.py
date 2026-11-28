@@ -174,8 +174,15 @@ def _recover(conn, target: Optional[str], issuer: str,
     GitHub (invariant 3) and a re-run dedups on the idempotency key.
 
     After the sweep the plan tail is rebuilt from the surviving task rows and
-    reconciled (nothing is ever deleted), and the workflow is moved to
-    ``planning`` so the planner loop picks the replan up.
+    pushed through the identity-preserving reconciler (nothing is ever deleted,
+    and it runs even when there is nothing left to re-plan, so "identity
+    preserved" is proven on every recover), and the workflow is moved to
+    ``planning`` so the planner loop picks the replan up: that hand-back is the
+    retry-from-the-last-successful-step.
+
+    Re-running ``recover`` on a workflow that is already ``planning``/``running``
+    with empty sweeps is a no-op: one ``recovery: nothing to recover`` event and
+    zero writes (no outbox row, no task row, no status change).
 
     Deliberately *not* done here: deleting task rows, and anything that touches
     a git branch.
@@ -185,12 +192,30 @@ def _recover(conn, target: Optional[str], issuer: str,
     wf = repo_workflows.get_workflow(conn, target or "")
     if wf is None:
         raise ValueError(f"unknown workflow {target}")
-    if wf["status"] not in ("blocked", "failed"):
-        raise ValueError(
-            f"workflow {target} is {wf['status']}, not blocked/failed")
 
     wf_id = wf["workflow_id"]
+    status = wf["status"]
+    # read-only classification first: it decides both the sweeps and whether a
+    # re-run on an already-recovered workflow is a no-op.
     plan = recovery.plan_recovery(conn, wf_id, gh_client)
+
+    if status not in ("blocked", "failed"):
+        # Idempotent re-run. A workflow already handed back to the planner
+        # ('planning'/'running') whose sweeps come back empty has nothing left
+        # for recovery to do: it gets one noop line on the timeline and zero
+        # writes, instead of a rejected command.
+        if status in ("planning", "running") and plan["noop"]:
+            repo_events.append_event(
+                conn, "workflow", wf_id, "info",
+                f"recovery: nothing to recover by {issuer}",
+                {"noop": True, "orphan_count": 0, "stale_success_count": 0,
+                 "outbox_rows": 0, "status": status})
+            log.info("recovery on %s by %s: nothing to recover", wf_id, issuer)
+            return {"workflow": wf_id, "noop": True, "orphan_count": 0,
+                    "stale_success_count": 0, "outbox_rows": 0,
+                    "status": status}
+        raise ValueError(f"workflow {target} is {status}, not blocked/failed")
+
     repo_name = recovery.workflow_repo(conn, wf_id)
 
     orphans_closed: list[int] = []
@@ -235,9 +260,10 @@ def _recover(conn, target: Optional[str], issuer: str,
     # plan_key, so task_id / gh_issue_number / status survive and no row is
     # deleted; the ladder is re-numbered 1..N and dangling deps are dropped.
     tail = recovery.plan_tail(conn, wf_id)
-    recon = (reconcile.apply_replanned_plan(conn, wf_id, tail, actor=issuer)
-             if tail else {"created_count": 0, "reused_count": 0,
-                           "cancelled_count": 0})
+    # Always push the tail through the reconciler, even when it is empty: that
+    # is what proves identity preservation on every recover, not only the ones
+    # that happened to have work left to re-plan.
+    recon = reconcile.apply_replanned_plan(conn, wf_id, tail, actor=issuer)
 
     # hand the workflow back to the planner: 'planning' is what the loop picks up
     repo_workflows.set_status(conn, wf_id, "planning")
@@ -255,6 +281,9 @@ def _recover(conn, target: Optional[str], issuer: str,
         "tasks_created": recon["created_count"],
         "tasks_reused": recon["reused_count"],
         "tasks_cancelled": recon["cancelled_count"],
+        # the WorkflowIntegrated-style summary line
+        "tasks_preserved": len(recovery.success_task_ids(conn, wf_id)),
+        "replanned": len(tail),
         "status": "planning",
     }
     repo_events.append_event(
@@ -276,6 +305,8 @@ def _recover(conn, target: Optional[str], issuer: str,
         "tasks_created": recon["created_count"],
         "tasks_reused": recon["reused_count"],
         "tasks_cancelled": recon["cancelled_count"],
+        "tasks_preserved": data["tasks_preserved"],
+        "replanned": data["replanned"],
         "outbox_rows": outbox_rows,
         "noop": bool(plan["noop"]),
     }

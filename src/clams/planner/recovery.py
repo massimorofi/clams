@@ -49,6 +49,7 @@ __all__ = [
     "workflow_repo",
     "enqueue_close",
     "plan_tail",
+    "success_task_ids",
     "TAIL_STATUSES",
 ]
 
@@ -480,6 +481,16 @@ def enqueue_close(conn, *, repo: str, number: int, comment: str,
             f"cannot queue {GH_CLOSE_KIND} for issue #{number}: the outbox "
             f"schema rejects the kind ({exc}). Apply the recovery migration "
             f"that adds '{GH_CLOSE_KIND}' to outbox.kind.") from exc
+
+
+def success_task_ids(conn, workflow_id: str) -> list[str]:
+    """task_ids of the workflow's ``success`` tasks, in plan order.
+
+    Recovery never touches these: they are the "last successful step" the retry
+    restarts after, so the audit line reports how many were preserved.
+    """
+    return [str(_field(r, "task_id")) for r in _tasks_for_workflow(conn, workflow_id)
+            if str(_field(r, "status")) == SUCCESS]
 
 
 # ------------------------------------------------------------- plan-tail rebuild
