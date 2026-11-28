@@ -27,13 +27,14 @@ dev = [
 
 [project.scripts]
 clams = "clams.cli:main"
+clams-admin = "clams_admin.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-testpaths = ["tests/unit", "tests/contract", "tests/integration", "tests/chaos"]
+testpaths = ["tests/unit", "tests/contract", "tests/integration", "tests/chaos", "tests_admin"]
 addopts = "-q"
 markers = [
     "live: tests that hit real external services (GitHub/Redis/Claudio)",
