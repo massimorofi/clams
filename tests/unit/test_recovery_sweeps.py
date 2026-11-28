@@ -194,15 +194,15 @@ def test_recover_result_reports_numbers_and_counts(db):
     assert result["stale_success_count"] == 1
 
 
-def test_recover_uses_the_gh_client_and_leaves_status_and_tasks_alone(db):
+def test_recover_uses_the_gh_client_and_preserves_task_rows(db):
     wf, (t_ok, t_run), gh = _stale_and_orphan_fixture(db)
     commands._recover(db, wf, "operator", gh_client=gh)
 
     assert ("list_issues_by_label", "o/r", "clams:task") in gh.calls
     assert ("list_sub_issues", "o/r", WF_ISSUE) in gh.calls
-    # this task must not touch the workflow status (task 4 owns that)
-    assert repo_workflows.get_workflow(db, wf)["status"] == "blocked"
-    # ... and must not delete a task row
+    # recovery hands the workflow back to the planner
+    assert repo_workflows.get_workflow(db, wf)["status"] == "planning"
+    # ... and the plan rebuild must not delete or re-mint a task row
     assert [t["task_id"] for t in repo_tasks.list_tasks(db, wf)] == [t_ok, t_run]
 
 
@@ -210,11 +210,14 @@ def test_recover_is_idempotent_on_a_second_sweep(db):
     """A second recover dedups on the idempotency key: still 3 rows."""
     wf, _, gh = _stale_and_orphan_fixture(db)
     commands._recover(db, wf, "operator", gh_client=gh)
+    # recovery hands the workflow to 'planning'; re-open it to sweep again
+    repo_workflows.set_status(db, wf, "blocked")
     second = commands._recover(db, wf, "operator", gh_client=gh)
 
     assert len(_close_rows(db)) == 3
     assert second["orphan_count"] == 2   # classifier still reports the same plan
     assert second["stale_success_count"] == 1
+    assert second["outbox_rows"] == 0    # every close deduped
 
 
 def test_recover_appends_one_audit_event(db):
@@ -224,11 +227,10 @@ def test_recover_appends_one_audit_event(db):
     events = db.execute(
         "SELECT * FROM events WHERE scope='workflow' AND ref=?", (wf,)
     ).fetchall()
-    assert len(events) == 1
-    event = events[0]
+    assert [e["message"] for e in events][-1].startswith("workflow recovered:")
+    assert "replan requested by operator" in [e["message"] for e in events]
+    event = events[-1]
     assert event["level"] == "info"
-    assert event["message"] == (
-        "recovery by operator: closed 2 orphan(s), 1 stale-success sub-issue(s)")
     data = json.loads(event["data"])
     assert data["orphan_count"] == 2
     assert data["stale_success_count"] == 1
@@ -269,12 +271,12 @@ def test_recover_raises_directly_for_bad_targets(db):
 
 
 def test_noop_sweep_still_records_an_event(db):
-    """Nothing stale -> zero gh_close rows, but the audit line is still written."""
+    """Nothing stale -> zero gh_close rows, but the noop line is still written."""
     wf = _workflow(db)
     _task(db, wf, 1, "never published", status="success")
     commands._recover(db, wf, "operator", gh_client=FakeGH())
 
     assert _close_rows(db) == []
-    message = db.execute("SELECT message FROM events").fetchone()["message"]
-    assert message == ("recovery by operator: closed 0 orphan(s), "
-                       "0 stale-success sub-issue(s)")
+    messages = [r["message"] for r in
+                db.execute("SELECT message FROM events").fetchall()]
+    assert "nothing to recover by operator" in messages

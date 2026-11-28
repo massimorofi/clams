@@ -173,8 +173,12 @@ def _recover(conn, target: Optional[str], issuer: str,
     Both go out as ``gh_close`` outbox rows, so the relay stays the only path to
     GitHub (invariant 3) and a re-run dedups on the idempotency key.
 
-    Deliberately *not* done here: the workflow status transition (the follow-up
-    task owns it), deleting task rows, and anything that touches a git branch.
+    After the sweep the plan tail is rebuilt from the surviving task rows and
+    reconciled (nothing is ever deleted), and the workflow is moved to
+    ``planning`` so the planner loop picks the replan up.
+
+    Deliberately *not* done here: deleting task rows, and anything that touches
+    a git branch.
     """
     from . import recovery
 
@@ -190,26 +194,55 @@ def _recover(conn, target: Optional[str], issuer: str,
     repo_name = recovery.workflow_repo(conn, wf_id)
 
     orphans_closed: list[int] = []
-    for sub in plan["orphans"]:
-        number = sub.get("number")
-        if not number:
-            continue
-        recovery.enqueue_close(
-            conn, repo=repo_name, number=number,
-            comment=recovery.SUPERSEDED_COMMENT, reason="superseded",
-            idempotency_key=f"gh:gh_close:{wf_id}:{number}:orphan")
-        orphans_closed.append(int(number))
-
     stale_closed: list[int] = []
-    for sub in plan["stale_success"]:
-        number = sub.get("number")
-        if not number:
-            continue
-        recovery.enqueue_close(
-            conn, repo=repo_name, number=number,
-            comment=recovery.SUCCESS_CLOSE_COMMENT, reason="stale_success",
-            idempotency_key=f"gh:gh_close:{wf_id}:{number}:stale_success")
-        stale_closed.append(int(number))
+    outbox_rows = 0
+
+    if plan["noop"]:
+        # Idempotent path: both sweeps are empty, so recovery must queue
+        # *nothing*. A re-run on an already-swept workflow therefore adds zero
+        # outbox rows and says so on the timeline instead of staying silent.
+        repo_events.append_event(
+            conn, "workflow", wf_id, "info",
+            f"nothing to recover by {issuer}",
+            {"orphans_closed": [], "stale_success_closed": [],
+             "orphan_count": 0, "stale_success_count": 0, "outbox_rows": 0})
+    else:
+        for sub in plan["orphans"]:
+            number = sub.get("number")
+            if not number:
+                continue
+            if recovery.enqueue_close(
+                    conn, repo=repo_name, number=number,
+                    comment=recovery.SUPERSEDED_COMMENT, reason="superseded",
+                    idempotency_key=f"gh:gh_close:{wf_id}:{number}:orphan"):
+                outbox_rows += 1
+            orphans_closed.append(int(number))
+
+        for sub in plan["stale_success"]:
+            number = sub.get("number")
+            if not number:
+                continue
+            if recovery.enqueue_close(
+                    conn, repo=repo_name, number=number,
+                    comment=recovery.SUCCESS_CLOSE_COMMENT,
+                    reason="stale_success",
+                    idempotency_key=f"gh:gh_close:{wf_id}:{number}:stale_success"):
+                outbox_rows += 1
+            stale_closed.append(int(number))
+
+    # plan-tail rebuild: recovery has no LLM plan, so it reconciles the plan
+    # back from the task rows that still represent work. Matching is by
+    # plan_key, so task_id / gh_issue_number / status survive and no row is
+    # deleted; the ladder is re-numbered 1..N and dangling deps are dropped.
+    tail = recovery.plan_tail(conn, wf_id)
+    recon = (reconcile.apply_replanned_plan(conn, wf_id, tail, actor=issuer)
+             if tail else {"created_count": 0, "reused_count": 0,
+                           "cancelled_count": 0})
+
+    # hand the workflow back to the planner: 'planning' is what the loop picks up
+    repo_workflows.set_status(conn, wf_id, "planning")
+    repo_events.append_event(conn, "workflow", wf_id, "info",
+                             f"replan requested by {issuer}")
 
     data = {
         "orphans_closed": orphans_closed,
@@ -217,20 +250,34 @@ def _recover(conn, target: Optional[str], issuer: str,
         "orphan_count": plan["orphan_count"],
         "stale_success_count": plan["stale_success_count"],
         "preserved_success": list(plan.get("preserved_success") or []),
+        "outbox_rows": outbox_rows,
+        "noop": bool(plan["noop"]),
+        "tasks_created": recon["created_count"],
+        "tasks_reused": recon["reused_count"],
+        "tasks_cancelled": recon["cancelled_count"],
+        "status": "planning",
     }
     repo_events.append_event(
         conn, "workflow", wf_id, "info",
-        f"recovery by {issuer}: closed {len(orphans_closed)} orphan(s), "
-        f"{len(stale_closed)} stale-success sub-issue(s)", data)
-    log.info("recovery on %s by %s: %d orphan(s), %d stale-success sub-issue(s)",
-             wf_id, issuer, len(orphans_closed), len(stale_closed))
+        f"workflow recovered: {wf_id} by {issuer} \u2014 closed "
+        f"{len(orphans_closed)} orphan(s), {len(stale_closed)} stale-success "
+        f"sub-issue(s), replanned {len(tail)} task(s)", data)
+    log.info("recovery on %s by %s: %d orphan(s), %d stale-success "
+             "sub-issue(s), %d task(s) replanned", wf_id, issuer,
+             len(orphans_closed), len(stale_closed), len(tail))
 
     return {
         "workflow": wf_id,
+        "status": "planning",
         "orphans_closed": orphans_closed,
         "stale_success_closed": stale_closed,
         "orphan_count": plan["orphan_count"],
         "stale_success_count": plan["stale_success_count"],
+        "tasks_created": recon["created_count"],
+        "tasks_reused": recon["reused_count"],
+        "tasks_cancelled": recon["cancelled_count"],
+        "outbox_rows": outbox_rows,
+        "noop": bool(plan["noop"]),
     }
 
 

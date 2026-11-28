@@ -48,7 +48,14 @@ __all__ = [
     "SUCCESS_CLOSE_COMMENT",
     "workflow_repo",
     "enqueue_close",
+    "plan_tail",
+    "TAIL_STATUSES",
 ]
+
+#: statuses that still represent work: recovery rebuilds the plan from these and
+#: leaves finished (``success``) / abandoned (``cancelled``) rows out of the tail.
+TAIL_STATUSES = ("pending", "ready", "dispatched", "running", "waiting_input",
+                 "failed", "blocked")
 
 SUCCESS = "success"
 CANCELLED = "cancelled"
@@ -473,3 +480,63 @@ def enqueue_close(conn, *, repo: str, number: int, comment: str,
             f"cannot queue {GH_CLOSE_KIND} for issue #{number}: the outbox "
             f"schema rejects the kind ({exc}). Apply the recovery migration "
             f"that adds '{GH_CLOSE_KIND}' to outbox.kind.") from exc
+
+
+# ------------------------------------------------------------- plan-tail rebuild
+def plan_tail(conn, workflow_id: str) -> list[dict]:
+    """Rebuild planned-task entries from the workflow's own task rows.
+
+    Recovery has no LLM plan to apply, so the plan it reconciles is derived from
+    what already exists: every task row that is not ``cancelled``, in
+    ``sequence_index`` order, emitted in the plain-dict shape
+    ``planner.reconcile.apply_replanned_plan`` consumes (``title`` /
+    ``objective`` / ``acceptance`` / ``depends_on`` / ``max_attempts`` /
+    ``brief``).
+
+    Why this is safe to feed back through a replan:
+
+    * ``success`` rows stay in the list on purpose. A replan cancels every title
+      that disappears from the plan, so dropping finished work would cancel it.
+      Matched by ``plan_key`` they are updated in place and keep their status.
+    * ``depends_on`` values are *sequence indices*, and the reconciler re-ladders
+      the ladder to exactly ``1..N``. Dropping cancelled rows would therefore
+      shift every later dependency, so the old->new index map is applied here and
+      dependencies that pointed at dropped rows are removed rather than left to
+      dangle (a dangling dep can never be satisfied and would re-strand the task).
+    * ``brief_json`` is parsed back into ``brief`` so a rebuild is a fixed point:
+      rebuilding an already-rebuilt plan produces the same entries.
+
+    Read-only and stdlib-only, like the rest of this module.
+    """
+    rows = _tasks_for_workflow(conn, workflow_id)
+    kept = [r for r in rows
+            if str(_field(r, "status")) != CANCELLED]
+
+    old_to_new: dict[int, int] = {}
+    for i, row in enumerate(kept, start=1):
+        old = _as_int(_field(row, "sequence_index"))
+        old_to_new[old if old is not None else i] = i
+
+    entries: list[dict] = []
+    for row in kept:
+        try:
+            deps = json.loads(_field(row, "depends_on", "[]") or "[]")
+        except (TypeError, ValueError):
+            deps = []
+        try:
+            brief = json.loads(_field(row, "brief_json", "{}") or "{}")
+        except (TypeError, ValueError):
+            brief = {}
+        if not isinstance(brief, dict):
+            brief = {}
+        entries.append({
+            "title": str(_field(row, "title", "") or ""),
+            "objective": str(_field(row, "objective", "") or ""),
+            "acceptance": str(_field(row, "acceptance", "") or ""),
+            "depends_on": [old_to_new[d] for d in
+                           (_as_int(x) for x in deps)
+                           if d is not None and d in old_to_new],
+            "max_attempts": _as_int(_field(row, "max_attempts")) or 3,
+            "brief": brief,
+        })
+    return entries
