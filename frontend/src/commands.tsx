@@ -21,7 +21,8 @@ export type CommandKind =
   | 'adhoc'
   | 'config_patch'
   | 'settings_patch'
-  | 'prompt_patch';
+  | 'prompt_patch'
+  | 'recover';
 
 interface SubmitOptions {
   target?: string | null;

@@ -49,8 +49,31 @@ export interface TaskSummary {
   gh_issue_number: number | null;
 }
 
+/** Optional preview of what a `recover` command would sweep, as reported by the
+ * API. Every field is optional so the UI still compiles and renders against
+ * older payloads that predate the recovery endpoint. */
+export interface RecoveryPreview {
+  /** open sub-issues no live task owns; recovery closes them as superseded */
+  orphan_count?: number | null;
+  /** open sub-issues whose task already succeeded; recovery closes them */
+  stale_success_count?: number | null;
+  /** tasks already `success` that recovery leaves untouched */
+  preserved_success_count?: number | null;
+  /** tasks the plan tail will be rebuilt from */
+  replanned_count?: number | null;
+  /** true when there is nothing for recovery to do */
+  noop?: boolean | null;
+}
+
 export interface WorkflowDetail extends Workflow {
   tasks: TaskSummary[];
+  /** Server-side recovery preview; absent on older payloads. */
+  recovery?: RecoveryPreview | null;
+  /** Flat aliases of the preview counts, also optional. */
+  orphan_subissue_count?: number | null;
+  stale_success_subissue_count?: number | null;
+  open_subissue_count?: number | null;
+  replannable_task_count?: number | null;
 }
 
 export interface TaskBrief {
