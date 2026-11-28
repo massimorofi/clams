@@ -165,3 +165,10 @@ clams planner & clams executor & clams api     # three terminals, or & together
 
 The `.env` defaults (`127.0.0.1:1072/1073`, `./data`, `./work`) are made for
 this mode.
+
+## 7. Next steps
+
+- Operate the stack: [Deployment & state machines](deployment.md) (§8 operational
+  procedures), [clamsctl reference](clamsctl.md), [GitHub setup](github.md).
+- A workflow is stuck in `blocked`/`failed`? One command recovers it:
+  [Workflow recovery runbook](workflow-recovery.md).
