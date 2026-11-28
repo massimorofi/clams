@@ -142,7 +142,87 @@ def _apply(conn, row, *, adhoc_handler=None, gh_client=None,
     if kind == "apply_plan":
         return _apply_plan(conn, payload, issuer, target)
 
+    if kind == "recover":
+        return _recover(conn, target, issuer, gh_client=gh_client)
+
     raise ValueError(f"unhandled command kind {kind}")
+
+
+def _recover(conn, target: Optional[str], issuer: str,
+             *, gh_client=None) -> dict[str, Any]:
+    """Recovery sweep on a workflow that stalled (``recover`` command).
+
+    A blocked/failed workflow can leave two kinds of open sub-issue behind:
+
+    ``orphan``        still open on GitHub, no task owns it any more (a replan
+                      dropped the task, or the projection half-completed).
+                      Closed with a "superseded by recovery" comment.
+    ``stale success`` still open although its task reached ``success`` — created
+                      before auto-close-on-success existed. Closed with the
+                      standard "Task succeeded" comment.
+
+    Both go out as ``gh_close`` outbox rows, so the relay stays the only path to
+    GitHub (invariant 3) and a re-run dedups on the idempotency key.
+
+    Deliberately *not* done here: the workflow status transition (the follow-up
+    task owns it), deleting task rows, and anything that touches a git branch.
+    """
+    from . import recovery
+
+    wf = repo_workflows.get_workflow(conn, target or "")
+    if wf is None:
+        raise ValueError(f"unknown workflow {target}")
+    if wf["status"] not in ("blocked", "failed"):
+        raise ValueError(
+            f"workflow {target} is {wf['status']}, not blocked/failed")
+
+    wf_id = wf["workflow_id"]
+    plan = recovery.plan_recovery(conn, wf_id, gh_client)
+    repo_name = recovery.workflow_repo(conn, wf_id)
+
+    orphans_closed: list[int] = []
+    for sub in plan["orphans"]:
+        number = sub.get("number")
+        if not number:
+            continue
+        recovery.enqueue_close(
+            conn, repo=repo_name, number=number,
+            comment=recovery.SUPERSEDED_COMMENT, reason="superseded",
+            idempotency_key=f"gh:gh_close:{wf_id}:{number}:orphan")
+        orphans_closed.append(int(number))
+
+    stale_closed: list[int] = []
+    for sub in plan["stale_success"]:
+        number = sub.get("number")
+        if not number:
+            continue
+        recovery.enqueue_close(
+            conn, repo=repo_name, number=number,
+            comment=recovery.SUCCESS_CLOSE_COMMENT, reason="stale_success",
+            idempotency_key=f"gh:gh_close:{wf_id}:{number}:stale_success")
+        stale_closed.append(int(number))
+
+    data = {
+        "orphans_closed": orphans_closed,
+        "stale_success_closed": stale_closed,
+        "orphan_count": plan["orphan_count"],
+        "stale_success_count": plan["stale_success_count"],
+        "preserved_success": list(plan.get("preserved_success") or []),
+    }
+    repo_events.append_event(
+        conn, "workflow", wf_id, "info",
+        f"recovery by {issuer}: closed {len(orphans_closed)} orphan(s), "
+        f"{len(stale_closed)} stale-success sub-issue(s)", data)
+    log.info("recovery on %s by %s: %d orphan(s), %d stale-success sub-issue(s)",
+             wf_id, issuer, len(orphans_closed), len(stale_closed))
+
+    return {
+        "workflow": wf_id,
+        "orphans_closed": orphans_closed,
+        "stale_success_closed": stale_closed,
+        "orphan_count": plan["orphan_count"],
+        "stale_success_count": plan["stale_success_count"],
+    }
 
 
 def _settings_patch(conn, payload: dict, issuer: str) -> dict:

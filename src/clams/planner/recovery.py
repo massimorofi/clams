@@ -8,9 +8,13 @@ function that takes a client, so this module stays importable on its own
 merit. Note that ``clams.planner.__init__`` imports the planner loop, which
 pulls in pydantic; that is pre-existing and outside this file's control.
 
-Everything here is a pure function of its inputs (or of a read-only DB
-connection): nothing writes, nothing calls the network. The recovery command
-handler composes these to act; this module only classifies.
+The classifiers are pure functions of their inputs (or of a read-only DB
+connection): nothing calls the network. The recovery command handler composes
+them to decide what to sweep.
+
+The one writer lives at the bottom of this module (``enqueue_close``): it turns a
+decision into a ``gh_close`` outbox row on the caller's transaction. It still
+never touches GitHub directly — the outbox relay stays the only path out.
 
 Vocabulary
 ----------
@@ -28,6 +32,8 @@ stale success an OPEN sub-issue whose task already reached ``success``; created
 """
 from __future__ import annotations
 
+import json
+import sqlite3
 from collections.abc import Mapping
 from typing import Any, Iterable, Optional
 
@@ -37,11 +43,27 @@ __all__ = [
     "find_stale_success",
     "collect_open_subissues",
     "plan_recovery",
+    "GH_CLOSE_KIND",
+    "SUPERSEDED_COMMENT",
+    "SUCCESS_CLOSE_COMMENT",
+    "workflow_repo",
+    "enqueue_close",
 ]
 
 SUCCESS = "success"
 CANCELLED = "cancelled"
 OPEN_STATE = "open"
+
+#: outbox kind the relay turns into "comment + close" on a sub-issue.
+GH_CLOSE_KIND = "gh_close"
+
+#: body used when an orphan (no task owns it) is swept
+SUPERSEDED_COMMENT = ("Clams: superseded by recovery — no live task owns this "
+                      "sub-issue, so the recovery sweep closed it.")
+
+#: body used when a stale-success sub-issue is swept (the standard close note)
+SUCCESS_CLOSE_COMMENT = ("Clams: Task succeeded — closing this sub-issue "
+                         "(recovery sweep).")
 
 #: fields carried through when a sub-issue row is normalised to a plain dict
 _SUB_FIELDS = ("number", "title", "task_id", "state", "url", "html_url")
@@ -264,17 +286,82 @@ def _open_subissues_from_gh(conn, workflow_id: str, gh_client) -> list[dict]:
     return out
 
 
+def _numbers_owned_elsewhere(conn, workflow_id: str) -> set[int]:
+    """Issue numbers referenced by tasks of *other* workflows.
+
+    A sub-issue that another workflow's task points at is not this workflow's
+    orphan: it was adopted (or moved) deliberately. Excluding those here is what
+    lets ``plan_recovery`` call ``find_orphans`` without a ``live_tasks`` list.
+    """
+    rows = conn.execute(
+        "SELECT gh_issue_number FROM tasks WHERE workflow_id<>? "
+        "AND gh_issue_number IS NOT NULL", (workflow_id,)).fetchall()
+    return {n for n in (_as_int(_field(r, "gh_issue_number")) for r in rows) if n}
+
+
+def _linked_subissues_from_gh(conn, workflow_id: str, gh_client) -> list[dict]:
+    """Sub-issues GitHub links to the workflow's own issue, still open.
+
+    ``list_issues_by_label`` is repo-wide, so ``_open_subissues_from_gh`` can only
+    ever see issues a task row already points at — and an issue left behind by a
+    replan (the definition of an orphan) has no task row pointing at it. A client
+    that can list a parent's sub-issues gives us the workflow-scoped view where
+    orphans actually show up. Clients without ``list_sub_issues`` (and workflows
+    that were never published) contribute nothing, so the label view stays the
+    only source for them and behaviour is unchanged.
+    """
+    lister = getattr(gh_client, "list_sub_issues", None)
+    if lister is None:
+        return []
+    row = conn.execute(
+        "SELECT gh_issue_number FROM workflows WHERE workflow_id=?",
+        (workflow_id,)).fetchone()
+    parent = _as_int(_field(row, "gh_issue_number"))
+    repo = _repo_for_workflow(conn, workflow_id)
+    if not parent or not repo:
+        return []
+
+    task_id_by_number: dict[int, Any] = {}
+    for task in _tasks_for_workflow(conn, workflow_id):
+        number = _as_int(_field(task, "gh_issue_number"))
+        if number:
+            task_id_by_number[number] = _field(task, "task_id")
+    elsewhere = _numbers_owned_elsewhere(conn, workflow_id)
+
+    out: list[dict] = []
+    for issue in lister(repo, parent) or []:
+        if not _is_open(issue):
+            continue
+        number = _sub_number(issue)
+        if not number or number in elsewhere:
+            continue
+        item = _as_dict(issue)
+        item["number"] = number
+        item["task_id"] = task_id_by_number.get(number)
+        item["state"] = OPEN_STATE
+        out.append(item)
+    return out
+
+
 def collect_open_subissues(conn, workflow_id: str,
                            gh_client=None) -> list[dict]:
     """The workflow's currently-open sub-issues, as ``{number, title, task_id}``.
 
     ``gh_client=None`` -> derive from the DB (offline, no network). With a
     client -> ask GitHub for ``clams:task`` issues, keep only this workflow's
-    sub-issues that are still ``state == 'open'``.
+    sub-issues that are still ``state == 'open'``, and union in the sub-issues
+    linked to the workflow's own issue (the only view in which orphans appear).
     """
     if gh_client is None:
         return _open_subissues_from_db(conn, workflow_id)
-    return _open_subissues_from_gh(conn, workflow_id, gh_client)
+    subs = _open_subissues_from_gh(conn, workflow_id, gh_client)
+    seen = {n for n in (_sub_number(s) for s in subs) if n}
+    for item in _linked_subissues_from_gh(conn, workflow_id, gh_client):
+        number = _sub_number(item)
+        if number and number not in seen:
+            seen.add(number)
+            subs.append(item)
+    return subs
 
 
 
@@ -328,3 +415,61 @@ def plan_recovery(conn, workflow_id: str, gh_client=None) -> dict:
         "stale_success_count": len(stale_success),
         "noop": not orphans and not stale_success,
     }
+
+
+# ------------------------------------------------------------------- the sweep
+def workflow_repo(conn, workflow_id: str, default: str = "unknown/repo") -> str:
+    """``owner/name`` of the workflow's project, or ``default`` when absent.
+
+    Outbox payloads must name a repo, so the caller gets a placeholder rather
+    than ``None``; the relay will fail loudly on it instead of the sweep dying
+    silently.
+    """
+    return _repo_for_workflow(conn, workflow_id) or default
+
+
+def enqueue_close(conn, *, repo: str, number: int, comment: str,
+                  idempotency_key: str, reason: str = "") -> Optional[int]:
+    """Queue one ``gh_close`` outbox row. Returns outbox_id (None if dup).
+
+    Same transaction as the caller: the sweep's DB writes and its outbound
+    intents commit together (invariant 3 — nothing here talks to GitHub).
+
+    Two enqueue paths, in order of preference:
+
+    * ``repo_outbox.enqueue`` — used as soon as ``gh_close`` is a declared outbox
+      kind in the repository layer.
+    * a direct INSERT — used while the kind is not declared yet, keeping the
+      dedup contract (``idempotency_key`` is UNIQUE) identical to ``enqueue``.
+
+    A schema whose ``outbox.kind`` CHECK does not list ``gh_close`` raises a
+    clear ValueError instead of an opaque IntegrityError: the recovery migration
+    that widens that list is a separate change, and until it lands the sweep
+    must say so rather than half-apply.
+    """
+    from ..db import repo_outbox  # lazy: keeps this module stdlib-only at import
+
+    payload = {"repo": repo, "issue": int(number), "comment": comment,
+               "state": "closed", "idempotency_key": idempotency_key}
+    if reason:
+        payload["reason"] = reason
+
+    try:
+        return repo_outbox.enqueue(conn, GH_CLOSE_KIND, payload, idempotency_key)
+    except ValueError:
+        pass  # kind not declared in repo_outbox.OUTBOX_KINDS yet -> insert below
+
+    try:
+        with conn.execute(
+            "INSERT INTO outbox(kind, payload, idempotency_key) "
+            "VALUES(?,?,?) RETURNING outbox_id",
+            (GH_CLOSE_KIND, json.dumps(payload), idempotency_key)) as cur:
+            row = cur.fetchone()
+        return row["outbox_id"] if row else None
+    except sqlite3.IntegrityError as exc:
+        if "idempotency_key" in str(exc):
+            return None  # already queued: the sweep is idempotent
+        raise ValueError(
+            f"cannot queue {GH_CLOSE_KIND} for issue #{number}: the outbox "
+            f"schema rejects the kind ({exc}). Apply the recovery migration "
+            f"that adds '{GH_CLOSE_KIND}' to outbox.kind.") from exc
