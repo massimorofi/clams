@@ -23,7 +23,7 @@ import pytest
 
 from clams.db import (connect, migrate, repo_commands, repo_projects,
                       repo_tasks, repo_workflows)
-from clams.planner import commands
+from clams.planner import commands, reconcile
 
 BRIEF = {"objective": "o", "acceptance": "a", "run": ["echo x"],
          "writable": ["*.py"], "repo": "o/r"}
@@ -494,3 +494,127 @@ def test_recover_twice_is_a_noop_with_zero_outbox_rows(db):
         "recovery: nothing to recover by operator") + 1:]
         if m.startswith("workflow recovered:")]
     assert repo_workflows.get_workflow(db, wf)["status"] == "planning"
+
+
+
+# --------------------------- the reconcile call is provably exercised (req. 1)
+def test_reconcile_runs_even_with_nothing_to_replan(db, monkeypatch):
+    """Requirement 1: *every* recover goes through the identity-preserving
+    reconcile, including one with an empty plan tail."""
+    calls: list[tuple] = []
+    real = reconcile.apply_replanned_plan
+
+    def spy(conn, workflow_id, planned, actor=None):
+        calls.append((workflow_id, list(planned), actor))
+        return real(conn, workflow_id, planned, actor=actor)
+
+    monkeypatch.setattr(reconcile, "apply_replanned_plan", spy)
+
+    wf = _workflow(db)                      # a workflow with zero tasks
+    res = commands._recover(db, wf, "operator")
+
+    assert len(calls) == 1, "reconcile must run even with nothing to re-plan"
+    called_wf, planned, actor = calls[0]
+    assert called_wf == wf
+    assert actor == "operator", "the issuer is recorded on the reconcile"
+    assert planned == []
+    assert res["replanned"] == 0 and res["tasks_reused"] == 0
+    assert repo_workflows.get_workflow(db, wf)["status"] == "planning"
+
+
+def test_reconcile_receives_the_planned_tail_with_the_success_step_in_it(
+        db, monkeypatch):
+    """The planned list is built from the workflow's own rows: the finished
+    step stays in it on purpose (a replan cancels every title the plan omits),
+    and the failed/blocked tail follows in ladder order."""
+    calls: list[list] = []
+    real = reconcile.apply_replanned_plan
+
+    def spy(conn, workflow_id, planned, actor=None):
+        calls.append([dict(e) for e in planned])
+        return real(conn, workflow_id, planned, actor=actor)
+
+    monkeypatch.setattr(reconcile, "apply_replanned_plan", spy)
+
+    wf = _workflow(db)
+    _task(db, wf, 1, "step one", status="success", gh_issue_number=201)
+    _task(db, wf, 2, "step two", status="failed", depends_on=[1],
+          gh_issue_number=202)
+    _task(db, wf, 3, "step three", status="blocked", depends_on=[2],
+          gh_issue_number=203)
+
+    commands._recover(db, wf, "operator")
+
+    assert len(calls) == 1
+    planned = calls[0]
+    assert [e["title"] for e in planned] == \
+        ["step one", "step two", "step three"]
+    assert [e["depends_on"] for e in planned] == [[], [1], [2]]
+    assert all(e.get("objective") and e.get("acceptance") for e in planned)
+    assert all(isinstance(e.get("brief"), dict) for e in planned)
+
+
+def test_noop_path_never_reconciles_and_never_touches_tasks(db, monkeypatch):
+    """Requirement 3, structurally: the planning/running noop writes nothing,
+    so the reconciler is not even called."""
+    calls: list[tuple] = []
+    monkeypatch.setattr(reconcile, "apply_replanned_plan",
+                        lambda *a, **k: calls.append(a))
+
+    wf = _workflow(db, status="planning")
+    _task(db, wf, 1, "alpha", status="success", gh_issue_number=201)
+    gh = FakeGH(labelled=[_issue(201, "alpha", state="closed")], subissues=[])
+    tasks_before, outbox_before = _snapshot(db), _outbox_snapshot(db)
+
+    res = commands._recover(db, wf, "operator", gh_client=gh)
+
+    assert calls == [], "the noop path must not reconcile"
+    assert res["noop"] is True and res["status"] == "planning"
+    assert _snapshot(db) == tasks_before
+    assert _outbox_snapshot(db) == outbox_before
+
+
+# ------------------------- the audit line is a real workflow event row (req. 4)
+def test_final_event_row_is_a_workflow_scoped_info_line(db):
+    wf = _workflow(db)
+    _task(db, wf, 1, "alpha", status="failed")
+
+    commands._recover(db, wf, "operator")
+
+    row = db.execute(
+        "SELECT * FROM events WHERE scope='workflow' AND ref=? "
+        "ORDER BY event_id DESC LIMIT 1", (wf,)).fetchone()
+    assert row["scope"] == "workflow"
+    assert row["level"] == "info"
+    assert row["message"].startswith("workflow recovered:")
+    data = json.loads(row["data"])
+    for key in ("orphans_closed", "stale_success_closed", "tasks_preserved",
+                "replanned", "status"):
+        assert key in data, f"missing {key} in {sorted(data)}"
+
+
+def test_success_task_identity_survives_a_real_sweep(db):
+    """The sweep and the replan together must not disturb the finished step:
+    same row, same issue number, still ``success``."""
+    wf = _workflow(db)
+    t_ok = _task(db, wf, 1, "done, issue still open", status="success",
+                 gh_issue_number=201)
+    t_run = _task(db, wf, 2, "still running", status="running",
+                  gh_issue_number=202)
+    gh = FakeGH(
+        labelled=[_issue(201, "done, issue still open"),
+                  _issue(202, "still running")],
+        subissues=[_issue(201, "done, issue still open"),
+                   _issue(202, "still running"),
+                   _issue(900, "left behind by a replan")])
+
+    res = commands._recover(db, wf, "operator", gh_client=gh)
+
+    rows = {r["task_id"]: r for r in _rows(db, wf)}
+    assert set(rows) == {t_ok, t_run}, "no row minted, none dropped"
+    assert rows[t_ok]["gh_issue_number"] == 201
+    assert rows[t_ok]["status"] == "success"
+    assert res["orphans_closed"] == [900]
+    assert res["stale_success_closed"] == [201]
+    assert res["tasks_preserved"] == 1
+    assert _last_data(db, wf, "workflow recovered:")["tasks_preserved"] == 1
