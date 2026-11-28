@@ -51,6 +51,14 @@ class IllegalTransition(Exception):
 #: work and must survive a replan untouched.
 SUPERSEDE_TERMINAL = ("failed", "blocked")
 
+#: The statuses :func:`workflow_outcome` may *skip* when the row is no longer
+#: part of the workflow's current plan (see :func:`is_superseded_row`). Same set
+#: as ``SUPERSEDE_TERMINAL``: the write side *rewrites* such rows to 'cancelled'
+#: on a replan, the read side only *ignores* them, so that rows which went
+#: terminal before that write-side fix landed cannot poison the outcome.
+#: 'success' is excluded for the same reason as above - it is delivered work.
+SUPERSEDEABLE_STATUSES = ("failed", "blocked")
+
 
 def normalize_plan_key(title: str) -> str:
     """Canonical identity of a planned task, derived from its title.
@@ -401,6 +409,14 @@ def reconcile_plan(conn: sqlite3.Connection, workflow_id: str,
             [as_int(d, 0) for d in (entry.get("depends_on") or [])],
             as_int(entry.get("max_attempts"), 3)))
 
+    # 5. the applied plan is now the plan in force. ``workflow_outcome`` reads
+    # ``workflows.plan_json`` to decide which terminal failed/blocked rows are
+    # superseded, so an in-place (re)plan has to be recorded here too - the
+    # planner's own paths do it via ``set_plan``.
+    from . import repo_workflows          # local: keeps the repo layer acyclic
+    repo_workflows.set_plan_json(conn, workflow_id,
+                                 {"tasks": list(planned or [])})
+
     return {"created": created, "reused": reused, "stale": stale,
             "superseded_terminal": superseded_terminal}
 
@@ -697,13 +713,123 @@ def workflow_tasks_all_terminal(conn: sqlite3.Connection, workflow_id: str) -> b
     return row["n"] == 0
 
 
+def current_plan_keys(conn: sqlite3.Connection,
+                      workflow_id: str) -> Optional[frozenset[str]]:
+    """Plan keys of the workflow's CURRENT stored plan (``workflows.plan_json``).
+
+    ``plan_json`` is written by ``repo_workflows.set_plan`` on every
+    (re)plan - both ``planner.plan.plan_workflow`` and the ``apply_plan``
+    command - so it is the authoritative record of what the workflow is
+    *supposed* to contain right now.
+
+    Returns ``None`` (meaning "no usable plan", NOT "empty plan") when the
+    workflow row is missing, the column is absent on an old schema, the JSON is
+    malformed, or the plan carries no task entries. The caller then falls back
+    to the replan-event rule in :func:`is_superseded_row`.
+    """
+    try:
+        row = conn.execute(
+            "SELECT plan_json FROM workflows WHERE workflow_id=?",
+            (workflow_id,)).fetchone()
+    except sqlite3.OperationalError:       # schema without workflows.plan_json
+        return None
+    if row is None:
+        return None
+    return _plan_keys_from_json(row["plan_json"])
+
+
+def _plan_keys_from_json(raw: Any) -> Optional[frozenset[str]]:
+    """Parse ``workflows.plan_json`` into a set of plan keys (see above)."""
+    if not raw:
+        return None
+    try:
+        plan = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    tasks = plan.get("tasks") if isinstance(plan, dict) else plan
+    if not isinstance(tasks, list) or not tasks:
+        return None
+    keys: set[str] = set()
+    for entry in tasks:
+        if isinstance(entry, dict):
+            title = entry.get("title") or entry.get("plan_key") or ""
+        else:
+            title = entry
+        key = normalize_plan_key(str(title))
+        if key:
+            keys.add(key)
+    return frozenset(keys) if keys else None
+
+
+def last_replan_ts(conn: sqlite3.Connection,
+                   workflow_id: str) -> Optional[str]:
+    """``ts`` of the newest replan event of a workflow, or None if never replanned.
+
+    Sanctioned fallback for workflows with no stored plan: a replan appended
+    *after* a row went terminal means the plan that produced that row is gone.
+    There is no ``kind`` column on ``events``; every replan path writes a
+    workflow-scoped message that starts with 'replan' ("replan 1/3",
+    "replan requested by ...", "replan: replaced N superseded tasks ..."), so
+    that prefix is the marker. ``ts`` and ``tasks.updated_at`` are both
+    UTC 'YYYY-MM-DD HH:MM:SS' text, so MAX()/comparison are chronological.
+    """
+    try:
+        row = conn.execute(
+            "SELECT MAX(ts) ts FROM events WHERE scope='workflow' AND ref=? "
+            "AND message LIKE 'replan%'", (workflow_id,)).fetchone()
+    except sqlite3.OperationalError:       # schema without events
+        return None
+    if row is None or not row["ts"]:
+        return None
+    return str(row["ts"])
+
+
+def is_superseded_row(row: Any, plan_keys: Optional[frozenset[str]],
+                      last_replan: Optional[str]) -> bool:
+    """True when a terminal failed/blocked row is stale bookkeeping, not live work.
+
+    * With a stored plan: the row is superseded iff its plan key (``plan_key``,
+      else ``normalize_plan_key(title)``) is absent from the current plan.
+    * Without one: superseded iff the workflow replanned strictly *after* the
+      row went terminal (``events.ts`` > ``tasks.updated_at``, both UTC text
+      timestamps so the comparison is chronological). A missing timestamp or
+      a tie is treated as NOT superseded, i.e. the pre-fix behaviour (report
+      'failed'/'blocked') is kept - the conservative direction.
+    """
+    if _field(row, "status") not in SUPERSEDEABLE_STATUSES:
+        return False
+    if plan_keys is not None:
+        return row_key(row) not in plan_keys
+    if not last_replan:
+        return False
+    updated = _field(row, "updated_at")
+    if not updated:
+        return False
+    return str(updated) < str(last_replan)
+
+
 def workflow_outcome(conn: sqlite3.Connection, workflow_id: str) -> str:
     """'done' all success | 'failed' any failed | 'blocked' any blocked and
-    none failed (stranded work needs a human, not a replan) | 'cancelled'."""
-    rows = conn.execute(
-        "SELECT status, COUNT(*) n FROM tasks WHERE workflow_id=? GROUP BY status",
-        (workflow_id,)).fetchall()
-    counts = {r["status"]: r["n"] for r in rows}
+    none failed (stranded work needs a human, not a replan) | 'cancelled'.
+
+    Supersede-aware (cadfa395 / claudio#58). A terminal ``failed``/``blocked``
+    row that is *absent from the workflow's current plan* records work the
+    planner no longer wants, so it cannot by itself hold the workflow at
+    'failed'/'blocked'. ``reconcile_plan`` already cancels such rows when a
+    replan runs through it; this is the read-side mirror for rows that went
+    terminal *before* that fix landed, and for workflows replanned by
+    delete-and-reinsert. Everything else is unchanged: a failed row that IS in
+    the current plan still yields 'failed', and in-plan 'blocked',
+    'cancelled' and 'success' rows keep their old rules.
+    """
+    rows = list_tasks(conn, workflow_id)
+    plan_keys = current_plan_keys(conn, workflow_id)
+    last_replan = None if plan_keys is not None else last_replan_ts(conn, workflow_id)
+    counts: dict[str, int] = {}
+    for r in rows:
+        if is_superseded_row(r, plan_keys, last_replan):
+            continue
+        counts[r["status"]] = counts.get(r["status"], 0) + 1
     if counts.get("failed", 0):
         return "failed"
     if counts.get("blocked", 0):

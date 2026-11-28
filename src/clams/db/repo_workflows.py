@@ -55,6 +55,22 @@ def set_plan(conn: sqlite3.Connection, workflow_id: str, plan: dict[str, Any],
         (json.dumps(plan), status, utcnow_s(), workflow_id))
 
 
+def set_plan_json(conn: sqlite3.Connection, workflow_id: str,
+                  plan: dict[str, Any]) -> None:
+    """Record the plan in force WITHOUT touching the workflow status.
+
+    ``set_plan`` is the planner's entry point (it also flips the workflow to
+    'running'); this is the narrow write for a plan applied in place, where the
+    status is the caller's business. It matters because
+    ``repo_tasks.workflow_outcome`` reads ``plan_json`` to decide which terminal
+    failed/blocked rows are superseded, so the column has to track the plan that
+    is actually in force wherever a plan is written.
+    """
+    conn.execute(
+        "UPDATE workflows SET plan_json=?, updated_at=? WHERE workflow_id=?",
+        (json.dumps(plan), utcnow_s(), workflow_id))
+
+
 def bump_replans(conn: sqlite3.Connection, workflow_id: str) -> int:
     with conn.execute(
         "UPDATE workflows SET replans=replans+1, updated_at=? WHERE workflow_id=? "
