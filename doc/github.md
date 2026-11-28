@@ -198,4 +198,17 @@ Guarantees this buys:
 
 Enforced by `tests/unit/test_replan_no_duplicate_issues.py` (regression test for
 issue #133, where a parent issue accumulated ~27 mostly-duplicated children).
+
+### Retired manual recipe
+
+The old hand procedure for a stuck workflow — list the open `clams:task` children,
+close the orphans and the stale-success ones one by one with `gh issue close`
+(claudio#58: 8 orphans + 1 stale success), then `POST` a `replan` command — is
+**no longer the supported path**. It is retired: it was manual, unaudited and easy
+to half-do.
+
+One `recover` command now does the orphan sweep, the stale-success sweep and the
+replan through `reconcile` in a single idempotent transaction, and the workflow
+moves to `planning`. Runbook:
+**[Workflow recovery runbook](workflow-recovery.md)**.
 See `reports/replan_duplicate_issues_fix.md`.
